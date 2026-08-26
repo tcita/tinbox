@@ -1,0 +1,13 @@
+# 构建产物
+/target
+src-tauri/target
+
+# 编译好的可执行文件（git 里存源码，不存二进制）
+tinbox.exe
+
+# 运行时数据（应用自己生成，不入库）
+catalog.json
+inbox/
+
+# 前端依赖（如有）
+frontend/node_modules/

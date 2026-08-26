@@ -1,0 +1,766 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="tinbox">
+<title>tinbox</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f5f7;
+    --card: #ffffff;
+    --text: #1d1d1f;
+    --sub: #86868b;
+    --line: #d2d2d7;
+    --accent: #0a84ff;
+    --bubble-me: #0a84ff;
+    --bubble-them: #e9e9eb;
+    --bubble-them-text: #1d1d1f;
+    --danger: #ff3b30;
+    --ok: #34c759;
+    --radius: 14px;
+  }
+  @media (prefers-color-scheme: dark) {
+    --bg: #000000;
+    --card: #1c1c1e;
+    --text: #f5f5f7;
+    --sub: #98989d;
+    --line: #38383a;
+    --bubble-them: #2c2c2e;
+    --bubble-them-text: #f5f5f7;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    background: var(--bg); color: var(--text);
+    -webkit-font-smoothing: antialiased;
+    display: flex; flex-direction: column; height: 100vh; height: 100dvh;
+    overflow: hidden;
+  }
+
+  /* 顶部:标题 + 二维码 */
+  .head {
+    display: flex; align-items: center; gap: 14px;
+    padding: 10px 16px; flex: none;
+    border-bottom: 1px solid var(--line);
+    background: var(--bg);
+  }
+  h1 { font-size: 17px; font-weight: 600; margin: 0; flex: 1; letter-spacing: -0.3px; }
+  .badge {
+    font-size: 11px; font-weight: 500; color: var(--sub);
+    padding: 4px 9px; border: 1px solid var(--line); border-radius: 999px; flex: none;
+    display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+  }
+  #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; }
+  .badge.off #dot { background: var(--danger); }
+  /* PC 徽标:无移动设备在线时灰点(有设备在线恢复绿点) */
+  .badge.wait #dot { background: var(--sub); }
+  #qr {
+    width: 72px; height: 72px; border-radius: 10px; background: #fff;
+    padding: 4px; flex: none; box-shadow: 0 1px 4px rgba(0,0,0,.08);
+  }
+  @media (prefers-color-scheme: dark) { #qr { box-shadow: 0 2px 8px rgba(0,0,0,.4); } }
+  @media (pointer: coarse) { #qr { display: none; } }
+
+  /* 收件箱快捷入口(仅 PC 端):打开 inbox 文件夹,用户自己管理收到的文件 */
+  #inboxBtn {
+    border: 1px solid var(--line); background: transparent; color: var(--text);
+    font-size: 15px; line-height: 1; padding: 7px 10px; border-radius: 9px;
+    cursor: pointer; flex: none;
+  }
+  #inboxBtn:active { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  @media (pointer: coarse) { #inboxBtn { display: none; } }
+  /* 手机端:二维码隐藏;连接状态徽标保留,手机也要看到 */
+  @media (pointer: coarse) { #qr { display: none; } }
+
+  /* 断线提示条:PC 端(服务器)关闭后,手机页面提示连接已断开 */
+  #offBanner {
+    flex: none; display: none;
+    padding: 7px 16px; font-size: 12px; text-align: center;
+    background: #b3261e; color: #fff;
+  }
+  #offBanner.show { display: block; }
+
+  /* 对话区 */
+  #chat {
+    flex: 1; overflow-y: auto; padding: 16px 12px 8px;
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .msg { display: flex; gap: 8px; align-items: flex-end; animation: in .22s ease; }
+  @keyframes in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .msg.me { flex-direction: row-reverse; }
+  .avatar {
+    width: 30px; height: 30px; flex: none; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px; background: var(--card); border: 1px solid var(--line);
+  }
+  .bubble {
+    max-width: 78%; padding: 9px 12px; border-radius: 16px;
+    font-size: 15px; line-height: 1.4; word-break: break-word;
+    position: relative;
+  }
+  .msg.me .bubble { background: var(--bubble-me); color: #fff; border-bottom-right-radius: 4px; }
+  .msg.them .bubble { background: var(--bubble-them); color: var(--bubble-them-text); border-bottom-left-radius: 4px; }
+  .bubble.text {
+    white-space: pre-wrap; cursor: default;
+    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+  }
+  .bubble.text:active { opacity: .7; }
+  .meta-line {
+    font-size: 10px; color: var(--sub); margin-top: 4px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .msg.me .meta-line { justify-content: flex-end; }
+
+  /* 文件卡片(气泡内) */
+  .file-card { display: flex; align-items: center; gap: 10px; min-width: 180px; cursor: pointer; }
+  .file-card:active { opacity: .7; }
+  .fc-ico {
+    width: 36px; height: 36px; flex: none; border-radius: 9px;
+    display: flex; align-items: center; justify-content: center; font-size: 19px;
+    background: color-mix(in srgb, var(--accent) 14%, transparent);
+  }
+  .msg.me .fc-ico { background: rgba(255,255,255,.22); }
+  .fc-info { min-width: 0; }
+  .fc-name {
+    font-size: 14px; font-weight: 500; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; max-width: 160px;
+  }
+  .fc-size { font-size: 11px; opacity: .75; margin-top: 2px; }
+
+  /* 图片/视频预览:原图内联渲染限高;视频 preload=metadata 只拉首帧不下载整段 */
+  .file-card.has-preview {
+    flex-direction: column; align-items: flex-start; gap: 8px; min-width: 200px;
+  }
+  .file-card.has-preview img,
+  .file-card.has-preview video {
+    display: block; width: 100%; max-height: 220px; object-fit: cover;
+    border-radius: 10px; background: #000; pointer-events: none;
+  }
+  .msg.me .file-card.has-preview img,
+  .msg.me .file-card.has-preview video { background: rgba(255,255,255,.14); }
+  .file-card.has-preview .fc-info { width: 100%; }
+  .file-card.has-preview .fc-name { max-width: none; }
+
+  /* 下载进度:气泡内条 */
+  .dltrack {
+    height: 3px; background: rgba(0,0,0,.12); border-radius: 999px; overflow: hidden; margin-top: 6px;
+  }
+  .msg.me .dltrack { background: rgba(255,255,255,.25); }
+  .dlfill { height: 100%; width: 0; background: #fff; border-radius: 999px; transition: width .15s ease; }
+  .msg.them .dlfill { background: var(--accent); }
+  .dlrow.hidden { display: none; }
+  .dltext { font-size: 10px; opacity: .8; margin-top: 4px; display: flex; justify-content: space-between; }
+
+  /* 空态 */
+  .empty {
+    text-align: center; color: var(--sub); padding: 48px 16px; font-size: 14px;
+    margin: auto;
+  }
+  .empty .e-icon { font-size: 40px; opacity: .35; margin-bottom: 12px; }
+
+  /* 底部输入栏 */
+  .composer {
+    flex: none; display: flex; align-items: flex-end; gap: 8px;
+    padding: 8px 10px 10px; border-top: 1px solid var(--line); background: var(--bg);
+  }
+  .plus-btn {
+    flex: none; width: 36px; height: 36px; border-radius: 50%;
+    border: 0; background: var(--card); color: var(--text); font-size: 20px;
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    border: 1px solid var(--line); transition: background .15s;
+  }
+  .plus-btn:active { background: color-mix(in srgb, var(--accent) 12%, var(--card)); }
+  #txt {
+    flex: 1; resize: none; max-height: 96px; min-height: 36px;
+    border: 1px solid var(--line); border-radius: 18px; padding: 8px 14px;
+    font-size: 15px; font-family: inherit; background: var(--card); color: var(--text);
+    line-height: 1.4;
+  }
+  #txt:focus { outline: none; border-color: var(--accent); }
+  .send-btn {
+    flex: none; width: 36px; height: 36px; border-radius: 50%; border: 0;
+    background: var(--accent); color: #fff; font-size: 16px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center; transition: opacity .15s;
+  }
+  .send-btn:disabled { opacity: .35; }
+  .send-btn:active { transform: scale(.94); }
+
+  /* Toast */
+  .toast {
+    position: fixed; bottom: 72px; left: 50%; transform: translateX(-50%) translateY(20px);
+    background: var(--text); color: var(--bg); padding: 10px 20px; border-radius: 10px;
+    font-size: 13px; font-weight: 500; opacity: 0;
+    transition: opacity .25s, transform .25s; pointer-events: none;
+    box-shadow: 0 8px 24px rgba(0,0,0,.2); z-index: 100; max-width: 80%; text-align: center;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  /* 上传进度:底部条 */
+  .progress {
+    position: fixed; left: 0; bottom: 0; height: 2px; width: 0;
+    background: var(--accent); transition: width .2s; box-shadow: 0 0 8px var(--accent); z-index: 100;
+  }
+
+  input[type=file] { display: none; }
+
+  /* 防火墙修复浮层:挡住整个界面,逼用户处理(修复/退出) */
+  .fw-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.55);
+    display: none; align-items: center; justify-content: center; z-index: 200;
+    backdrop-filter: blur(4px);
+  }
+  .fw-overlay.show { display: flex; }
+  .fw-card {
+    background: var(--card); border-radius: 18px; padding: 26px 24px 20px;
+    max-width: 340px; width: calc(100% - 48px); text-align: center;
+    box-shadow: 0 12px 40px rgba(0,0,0,.3);
+  }
+  .fw-icon { font-size: 40px; margin-bottom: 12px; }
+  .fw-title { font-size: 17px; font-weight: 600; margin: 0 0 8px; }
+  .fw-desc { font-size: 13px; color: var(--sub); line-height: 1.5; margin: 0 0 20px; }
+  .fw-btns { display: flex; gap: 10px; }
+  .fw-btn {
+    flex: 1; border: 0; border-radius: 12px; padding: 12px 0; font-size: 15px;
+    font-weight: 600; cursor: pointer; transition: opacity .15s, transform .1s;
+  }
+  .fw-btn:active { transform: scale(.97); }
+  .fw-btn.repair { background: var(--accent); color: #fff; }
+  .fw-btn.quit { background: color-mix(in srgb, var(--sub) 20%, transparent); color: var(--text); }
+  .fw-btn:disabled { opacity: .5; pointer-events: none; }
+  .fw-hint { font-size: 11px; color: var(--sub); margin-top: 12px; }
+
+  /* 上下文菜单(文本长按/右键:复制/删除) */
+  .ctx-menu {
+    position: fixed; display: none; z-index: 150;
+    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+    padding: 4px; box-shadow: 0 6px 20px rgba(0,0,0,.18); min-width: 120px;
+  }
+  .ctx-menu.show { display: block; }
+  .ctx-menu button {
+    display: block; width: 100%; border: 0; background: transparent; color: var(--text);
+    cursor: pointer; padding: 9px 14px; border-radius: 7px; font-size: 14px; text-align: left;
+  }
+  .ctx-menu button:active { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .ctx-menu button.danger { color: var(--danger); }
+</style>
+</head>
+<body>
+
+<div class="head">
+  <h1>📁 tinbox</h1>
+  <span class="badge" id="badge"><i id="dot"></i><span id="badgeTxt">已连接</span></span>
+  <button id="inboxBtn" title="打开收件箱文件夹">📥</button>
+  <img id="qr" src="/qr" alt="">
+</div>
+
+<div id="offBanner">⚠️ 连接已断开 · 等待重新连接…</div>
+
+<div id="chat">
+  <div class="empty" id="empty">
+    <div class="e-icon">💬</div>
+    <div>还没有消息 · 发个文件或文字试试</div>
+  </div>
+</div>
+
+<div class="composer">
+  <div style="position:relative">
+    <button class="plus-btn" id="plus" title="选择文件">＋</button>
+  </div>
+  <textarea id="txt" rows="1" placeholder="发消息…"></textarea>
+  <button class="send-btn" id="send" disabled>➤</button>
+</div>
+<input type="file" id="fileInput" multiple>
+
+<div class="fw-overlay" id="fwOverlay">
+  <div class="fw-card">
+    <div class="fw-icon">🛡️</div>
+    <div class="fw-title">允许 tinbox 联网</div>
+    <div class="fw-desc">手机无法连接到本机。点「允许」并在弹出的 UAC 窗口再次确认,授予 tinbox 联网权限。</div>
+    <div class="fw-btns">
+      <button class="fw-btn quit" id="fwQuit">退出</button>
+      <button class="fw-btn repair" id="fwRepair">允许</button>
+    </div>
+    <div class="fw-hint" id="fwHint"></div>
+  </div>
+</div>
+
+<div class="ctx-menu" id="ctxMenu"></div>
+
+<div class="toast" id="toast"></div>
+<div class="progress" id="bar"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+// 本端身份:PC 窗口加载 localhost,手机加载 LAN IP。
+const isPC = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+const me = isPC ? 'pc' : 'phone';
+let busy = false;
+
+function toast(msg){
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._t); t._t = setTimeout(()=>t.classList.remove('show'), 1600);
+}
+
+function fmtSize(n){
+  if(n<1024) return n+' B';
+  const u=['KB','MB','GB']; let i=-1;
+  do { n/=1024; i++; } while(n>=1024 && i<u.length-1);
+  return n.toFixed(1)+' '+u[i];
+}
+function fmtTime(unix){
+  if(!unix) return '';
+  const d = new Date(Number(unix)*1000);
+  const p = n => String(n).padStart(2,'0');
+  return `${d.getMonth()+1}-${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function iconFor(name){
+  const ext = (name.split('.').pop()||'').toLowerCase();
+  if(['jpg','jpeg','png','gif','webp','heic','bmp','svg'].includes(ext)) return '🖼️';
+  if(['mp4','mov','avi','mkv','webm'].includes(ext)) return '🎬';
+  if(['mp3','m4a','wav','flac','aac','ogg'].includes(ext)) return '🎵';
+  if(['pdf'].includes(ext)) return '📕';
+  if(['doc','docx','rtf'].includes(ext)) return '📄';
+  if(['xls','xlsx','csv'].includes(ext)) return '📊';
+  if(['ppt','pptx'].includes(ext)) return '📑';
+  if(['zip','rar','7z','tar','gz'].includes(ext)) return '🗜️';
+  if(['txt','md','log'].includes(ext)) return '📝';
+  if(['js','ts','rs','go','py','java','c','cpp','json','xml','html','css'].includes(ext)) return '⚙️';
+  return '📦';
+}
+
+// 上下文菜单:长按(手机)/右键(PC)弹操作菜单,文本与文件统一。
+//   text:复制 / 删除(PC);file:下载 / 打开位置 / 删除(PC),手机只有下载。
+// 单击是主操作(PC 打开 / 手机下载),长按/右键才是菜单,避免误触。
+let ctxTarget = null;   // 当前菜单作用的消息 item
+let ctxBubble = null;   // 对应气泡(文件下载进度要用)
+let ctxTimer = null;
+let suppressClick = false; // 长按松手后的合成 click 会立刻关菜单,需吞掉一次
+function attachMenu(el, it, bubble){
+  // 右键(桌面)
+  el.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    showCtxMenu(e.clientX, e.clientY, it, bubble);
+  });
+  // 长按(移动):touchstart 开始计时,~500ms 触发;移动/松手取消。
+  el.addEventListener('touchstart', (e) => {
+    const t = e.touches[0];
+    ctxTimer = setTimeout(() => {
+      ctxTimer = null;
+      suppressClick = true; // 吞掉松手后浏览器补发的 click,防止菜单刚弹出就被关
+      showCtxMenu(t.clientX, t.clientY, it, bubble);
+    }, 500);
+  }, {passive: true});
+  el.addEventListener('touchend', () => { if(ctxTimer){ clearTimeout(ctxTimer); ctxTimer = null; } });
+  el.addEventListener('touchmove', () => { if(ctxTimer){ clearTimeout(ctxTimer); ctxTimer = null; } });
+}
+function showCtxMenu(x, y, it, bubble){
+  ctxTarget = it;
+  ctxBubble = bubble;
+  const m = $('ctxMenu');
+  // 按类型动态构建菜单项(手机端无权删除,不渲染删除)。
+  m.innerHTML = '';
+  const add = (label, cls, fn) => {
+    const b = document.createElement('button');
+    if(cls) b.className = cls;
+    b.textContent = label;
+    b.onclick = (e) => { e.stopPropagation(); hideCtxMenu(); fn(); };
+    m.appendChild(b);
+  };
+  if(it.kind === 'text'){
+    add('复制', '', () => copyText(ctxTarget));
+    if(isPC) add('删除', 'danger', () => delItem(ctxTarget));
+  } else {
+    if(isPC){
+      // PC 端无需下载(本地文件在本地,手机传来已在收件箱)。
+      add('打开位置', '', () => revealItem(ctxTarget));
+      add('删除', 'danger', () => delItem(ctxTarget));
+    } else {
+      add('下载', '', () => downloadFile(ctxTarget, ctxBubble));
+    }
+  }
+  // 定位:避免超出视口右/下边界。
+  const w = 130, h = 90;
+  const left = Math.min(x, window.innerWidth - w - 8);
+  const top = Math.min(y, window.innerHeight - h - 8);
+  m.style.left = left + 'px';
+  m.style.top = top + 'px';
+  m.classList.add('show');
+}
+async function copyText(it){
+  try { await navigator.clipboard.writeText(it.text); toast('已复制'); }
+  catch { toast('复制失败'); }
+}
+async function delItem(it){
+  const msgtxt = it.kind === 'text'
+    ? '删除这条消息?'
+    : '从记录移除「'+it.name+'」?\n(文件不会删除)';
+  if(!confirm(msgtxt)) return;
+  const res = await fetch('/rm?id='+encodeURIComponent(it.id), {method:'POST'});
+  if(res.ok) toast(it.kind === 'text' ? '已删除' : '已移除');
+  else toast('删除失败');
+  refresh();
+}
+async function revealItem(it){
+  const res = await fetch('/reveal?id='+encodeURIComponent(it.id), {method:'POST'});
+  if(!res.ok) toast('文件已不在原位置');
+}
+function hideCtxMenu(){ $('ctxMenu').classList.remove('show'); }
+// 点别处或滚动时关菜单(长按松手后的合成 click 用 suppressClick 吞掉)
+document.addEventListener('click', () => {
+  if(suppressClick){ suppressClick = false; return; }
+  hideCtxMenu();
+});
+document.addEventListener('scroll', hideCtxMenu, true);
+
+let lastList = ''; // 上次渲染的列表快照;一致则不重渲染(轮询不打断滚动)
+async function refresh(){
+  try {
+    const r = await fetch('/list');
+    const items = await r.json();
+    const key = JSON.stringify(items);
+    if(key === lastList) return;
+    lastList = key;
+    render(items);
+  } catch { /* 断线/超时静默;离线状态由 SSE/轮询里的 setOffline 管 */ }
+}
+function render(items){
+  const chat = $('chat');
+  const prev = chat.scrollTop;
+  const wasAtBottom = prev + chat.clientHeight >= chat.scrollHeight - 24;
+  chat.innerHTML = '';
+  const has = items.length > 0;
+  if(!has){
+    const e = document.createElement('div');
+    e.className = 'empty'; e.id = 'empty';
+    e.innerHTML = '<div class="e-icon">💬</div><div>还没有消息 · 发个文件或文字试试</div>';
+    chat.appendChild(e);
+    return;
+  }
+  for(const it of items){
+    const mine = it.from === me;
+    const msg = document.createElement('div');
+    msg.className = 'msg ' + (mine ? 'me' : 'them');
+    msg.dataset.id = it.id;
+
+    const avatar = document.createElement('div');
+    avatar.className = 'avatar';
+    avatar.textContent = it.from === 'pc' ? '💻' : '📱';
+    msg.appendChild(avatar);
+
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+
+    if(it.kind === 'text'){
+      bubble.classList.add('text');
+      bubble.textContent = it.text;
+      // 长按/右键弹菜单:复制 / 删除(手机只有复制)。点一下不触发,避免误触。
+      attachMenu(bubble, it, null);
+    } else {
+      // 文件卡片:图片/视频内联预览,其它类型图标。
+      const card = document.createElement('div');
+      card.className = 'file-card';
+      const ext = (it.name.split('.').pop()||'').toLowerCase();
+      const isImg = ['jpg','jpeg','png','gif','webp','heic','bmp','svg'].includes(ext);
+      const isVid = ['mp4','mov','avi','mkv','webm'].includes(ext);
+      if(isImg){
+        card.classList.add('has-preview');
+        const img = document.createElement('img');
+        img.src = '/view?id='+encodeURIComponent(it.id);
+        img.alt = it.name;
+        img.loading = 'lazy';
+        img.onerror = () => { img.remove(); card.classList.remove('has-preview'); };
+        card.appendChild(img);
+      } else if(isVid){
+        card.classList.add('has-preview');
+        const v = document.createElement('video');
+        v.src = '/view?id='+encodeURIComponent(it.id);
+        v.muted = true; v.playsInline = true; v.preload = 'metadata';
+        v.onloadedmetadata = () => { try { v.currentTime = 0.01; } catch {} };
+        v.onerror = () => { v.remove(); card.classList.remove('has-preview'); };
+        card.appendChild(v);
+      } else {
+        card.innerHTML = `<div class="fc-ico">${iconFor(it.name)}</div>`;
+      }
+      const info = document.createElement('div');
+      info.className = 'fc-info';
+      info.innerHTML = '<div class="fc-name"></div><div class="fc-size"></div>';
+      info.querySelector('.fc-name').textContent = it.name;
+      info.querySelector('.fc-size').textContent = fmtSize(it.size);
+      card.appendChild(info);
+      // 单击:PC → 系统默认查看器打开;手机 → 触发下载。
+      card.onclick = () => {
+        if(isPC) openDefault(it);
+        else downloadFile(it, bubble);
+      };
+      // 长按/右键:下载 / 打开位置 / 删除(手机只有下载)。
+      attachMenu(card, it, bubble);
+      bubble.appendChild(card);
+
+      // 下载进度条(手机端下载时显示)
+      const dlrow = document.createElement('div');
+      dlrow.className = 'dlrow hidden';
+      dlrow.innerHTML = `
+        <div class="dltrack"><div class="dlfill"></div></div>
+        <div class="dltext"><span class="dl-pct"></span><span class="dl-spd"></span></div>`;
+      bubble.appendChild(dlrow);
+    }
+
+    // 时间戳
+    const meta = document.createElement('div');
+    meta.className = 'meta-line';
+    meta.textContent = fmtTime(it.ts);
+    bubble.appendChild(meta);
+
+    msg.appendChild(bubble);
+    chat.appendChild(msg);
+  }
+  // 在底部 → 跟着新消息滚到底;用户往上翻 → 保持位置不拽下去。
+  if(wasAtBottom) chat.scrollTop = chat.scrollHeight;
+  else chat.scrollTop = prev;
+}
+
+// PC 端单击文件卡片:用系统默认查看器打开。
+async function openDefault(it){
+  const res = await fetch('/open?id='+encodeURIComponent(it.id), {method:'POST'});
+  if(!res.ok) toast('文件已不在原位置');
+}
+
+// 下载:XHR 取 blob 跟进度/速度,完成后触发浏览器下载。
+function downloadFile(it, bubble){
+  const row = bubble.querySelector('.dlrow');
+  if(!row) return;
+  const fill = bubble.querySelector('.dlfill');
+  const pctEl = bubble.querySelector('.dl-pct');
+  const spdEl = bubble.querySelector('.dl-spd');
+  const show = (on) => row.classList.toggle('hidden', !on);
+  show(true);
+  fill.style.width = '0'; pctEl.textContent = '0%'; spdEl.textContent = fmtSize(0)+'/s';
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('GET', '/dl?id='+encodeURIComponent(it.id), true);
+  xhr.responseType = 'blob';
+  let t0 = 0, lastT = 0, lastLoaded = 0;
+  xhr.onprogress = e => {
+    const now = performance.now();
+    if(!t0){ t0 = now; lastT = now; lastLoaded = 0; }
+    const total = e.lengthComputable ? e.total : it.size;
+    const pct = total ? (e.loaded/total*100) : 0;
+    fill.style.width = pct + '%';
+    pctEl.textContent = pct.toFixed(0)+'% · '+fmtSize(e.loaded)+'/'+fmtSize(total);
+    if(now - lastT > 250){
+      const speed = (e.loaded - lastLoaded) / ((now - lastT)/1000);
+      spdEl.textContent = fmtSize(speed)+'/s';
+      lastT = now; lastLoaded = e.loaded;
+    }
+  };
+  xhr.onload = () => {
+    if(xhr.status === 200){
+      const url = URL.createObjectURL(xhr.response);
+      const a = document.createElement('a');
+      a.href = url; a.download = it.name;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      toast('下载完成 ✓');
+    } else { toast('下载失败 ✕'); }
+    show(false);
+  };
+  xhr.onerror = () => { toast('网络错误 ✕'); show(false); };
+  xhr.send();
+}
+
+// 文本发送
+function sendText(){
+  const t = $('txt');
+  const text = t.value.trim();
+  if(!text || busy) return;
+  busy = true;
+  fetch('/send-text', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ text })
+  }).then(r => {
+    busy = false;
+    if(r.ok){ t.value = ''; autoSize(); updateSendBtn(); }
+    else toast('发送失败 ✕');
+  }).catch(() => { busy = false; toast('网络错误 ✕'); });
+}
+
+function autoSize(){
+  const t = $('txt');
+  t.style.height = 'auto';
+  t.style.height = Math.min(t.scrollHeight, 96) + 'px';
+}
+function updateSendBtn(){
+  $('send').disabled = $('txt').value.trim().length === 0;
+}
+
+// 文件上传(手机端 / 拖拽):走 /upload
+function uploadFiles(files){
+  if(!files.length || busy) return;
+  busy = true;
+  const fd = new FormData();
+  for(const f of files) fd.append('file', f);
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/upload');
+  xhr.upload.onprogress = e => {
+    if(e.lengthComputable) $('bar').style.width = (e.loaded/e.total*100)+'%';
+  };
+  xhr.onload = () => {
+    busy = false; $('bar').style.width = '0';
+    if(xhr.status===200){ toast('已发送 ✓'); }
+    else toast('发送失败 ✕');
+  };
+  xhr.onerror = () => { busy=false; $('bar').style.width='0'; toast('网络错误 ✕'); };
+  xhr.send(fd);
+}
+
+// 输入框
+$('txt').addEventListener('input', () => { autoSize(); updateSendBtn(); });
+$('txt').addEventListener('keydown', e => {
+  if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendText(); }
+});
+$('send').onclick = sendText;
+
+// 收件箱入口(仅 PC):打开 inbox 文件夹,收到的文件由用户在这里自行管理。
+$('inboxBtn').onclick = () => {
+  fetch('/open-dir', {method:'POST'}).catch(()=>toast('无法打开收件箱'));
+};
+
+// 加号:直接弹系统文件选择器(不再有子菜单)。
+// PC 端:Tauri dialog(拿真实路径,零拷贝引用)→ POST /add-local 登记。
+// 手机端:浏览器 <input type=file multiple>(上传文件内容)。
+$('plus').onclick = () => {
+  if(isPC){ pickLocal(); return; }
+  $('fileInput').click();
+};
+async function pickLocal(){
+  const T = window.__TAURI__;
+  if(!T || !T.dialog || !T.dialog.open){
+    toast('当前环境不支持'); return;
+  }
+  try {
+    // multiple 多选文件;不限定 directory(文件夹场景以后再说)。
+    const picked = await T.dialog.open({ multiple: true, title: '选择文件' });
+    if(!picked) return;
+    let paths = [];
+    if(Array.isArray(picked)) paths = picked.map(p => typeof p === 'string' ? p : p.path);
+    else if(typeof picked === 'string') paths = [picked];
+    else if(picked && picked.path) paths = [picked.path];
+    if(!paths.length) return;
+    const r = await fetch('/add-local', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ paths })
+    });
+    if(!r.ok){
+      toast('登记失败');
+      fetch('/log', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({msg:'add-local HTTP '+r.status})});
+    }
+    // 成功后 /add-local 广播 /events,本端 SSE 自动刷新。
+  } catch(e) {
+    toast('添加失败');
+    fetch('/log', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({msg:'dialog/add-local 异常: '+e})});
+  }
+}
+$('fileInput').addEventListener('change', e => {
+  if(e.target.files.length) uploadFiles([...e.target.files]);
+  e.target.value = '';
+});
+
+// 拖拽上传(桌面端)
+document.body.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect='copy'; });
+document.body.addEventListener('drop', e => {
+  e.preventDefault();
+  if(e.dataTransfer.files.length) uploadFiles([...e.dataTransfer.files]);
+});
+
+// 连接状态:PC 端一关,SSE 断开、/fw-status 轮询也失败 → 显示断线提示条;
+// 恢复后自动隐藏,并补刷一次列表(重连会漏掉断线期间的变更)。
+let offline = false;
+function setOffline(v){
+  if(offline === v) return;
+  offline = v;
+  $('offBanner').classList.toggle('show', v);
+  // 顶部状态徽标只对手机(客户端)有意义;PC 是服务器本体,徽标固定显示地址。
+  if(isPC) return;
+  $('badge').classList.toggle('off', v);
+  $('badgeTxt').textContent = v ? '未连接' : '已连接';
+}
+// 服务器推送:任何一端发送/删除后,本端自动刷新(跨设备同步)。
+const es = new EventSource('/events');
+es.onmessage = () => refresh();
+es.onerror = () => setOffline(true);
+es.onopen = () => { setOffline(false); refresh(); };
+// 兜底轮询(真正的服务器思路):手机浏览器会掐断 SSE(切网/锁屏/后台),
+// 4s 主动问服务器要一次状态,保证最终一致。refresh 内部做了变更检测,
+// 列表没变时不重渲染,不会打断滚动/闪烁。
+setInterval(refresh, 4000);
+
+// 防火墙修复浮层:轮询 /fw-status,需修复时显示(窗口已被 Rust 侧置顶)。
+let fwChecking = false;
+let fwWasShown = false;
+async function checkFwStatus(){
+  if(fwChecking) return;
+  fwChecking = true;
+  try {
+    const r = await fetch('/fw-status');
+    const s = await r.json();
+    setOffline(false); // 轮询成功 → 在线
+    const show = !!s.needRepair;
+    $('fwOverlay').classList.toggle('show', show);
+    // 从"需修复"变为"已修复":取消窗口置顶,恢复正常。
+    if(fwWasShown && !show){
+      fetch('/untop', {method:'POST'}).catch(()=>{});
+    }
+    fwWasShown = show;
+  } catch { setOffline(true); } // 轮询失败 → PC 端已关/网络断开
+  fwChecking = false;
+}
+$('fwRepair').onclick = async () => {
+  $('fwRepair').disabled = true;
+  $('fwQuit').disabled = true;
+  $('fwHint').textContent = '请在弹出的 UAC 窗口点「是」…';
+  try {
+    const r = await fetch('/repair', {method:'POST'});
+    const txt = await r.text();
+    if(txt.trim() === 'ok'){
+      // /repair 阻塞到 Block 真删才返回,此时已修复。
+      $('fwOverlay').classList.remove('show');
+      fetch('/untop', {method:'POST'}).catch(()=>{});
+      fwWasShown = false;
+      toast('已允许联网 ✓');
+    } else {
+      $('fwHint').textContent = '未完成(可能取消了 UAC),可再点「允许」重试';
+    }
+  } catch(e) {
+    $('fwHint').textContent = '请求失败,可重试';
+  }
+  $('fwRepair').disabled = false;
+  $('fwQuit').disabled = false;
+};
+$('fwQuit').onclick = () => { fetch('/quit', {method:'POST'}).catch(()=>{}); };
+checkFwStatus();
+setInterval(checkFwStatus, 2000);
+
+// PC 端:服务器本体,徽标显示是否有移动设备在线——灰点"等待移动设备连接",有设备就绿点"已连接"。
+if(isPC){
+  const updateMobile = () => {
+    fetch('/info').then(r=>r.json()).then(d => {
+      if(!d) return;
+      const on = !!d.mobileConnected;
+      $('badge').classList.toggle('wait', !on);
+      $('badgeTxt').textContent = on ? '已连接' : '等待移动设备连接';
+    }).catch(()=>{});
+  };
+  updateMobile();
+  setInterval(updateMobile, 3000);
+}
+
+refresh();
+</script>
+</body>
+</html>
