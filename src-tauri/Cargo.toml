@@ -26,7 +26,7 @@ open = "5"
 qrcode = "0.14"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
-# 编译优化 + 体积小,便携常驻用
+# Compile optimizations + small binary, for portable long-running use
 [profile.release]
 opt-level = "z"
 lto = true

@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "remote-localhost",
-  "description": "允许 localhost 页面(外部 URL)调用 Tauri IPC:dialog 插件弹原生文件选择器(PC 端加号添加本地文件引用)",
+  "description": "allows the localhost page (external URL) to call Tauri IPC: the dialog plugin opens the native file picker (PC plus button adds local file references)",
   "windows": ["main"],
   "remote": {
     "urls": ["http://localhost:*"]

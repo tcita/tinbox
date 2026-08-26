@@ -1,5 +1,6 @@
-// 极简文件日志:写到 exe 旁边的 tinbox.log。
-// release 构建 windows_subsystem=windows 无控制台,所以日志落盘才能看到。
+// Minimal file logger: writes to tinbox.log next to the exe.
+// Release builds use windows_subsystem=windows with no console, so logs are
+// written to disk to be inspectable.
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
@@ -15,7 +16,8 @@ fn log_path() -> PathBuf {
 
 static F: Mutex<()> = Mutex::new(());
 
-/// 把一行追加到日志文件,同时打到 stderr(debug 有控制台时可见)。
+/// Append one line to the log file and also print it to stderr (visible when a
+/// debug console is attached).
 pub fn logf(msg: &str) {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)

@@ -1,10 +1,14 @@
-// Catalog 索引层:统一管理"消息条目"(文件与文本)。
-//   文件消息:复用 Source(Local=PC 本地引用零拷贝 / Remote=手机推来物化到 inbox)。
-//   文本消息:内容直接内联,无 source。
-// 每条消息带 from("pc"/"phone")与 ts,前端按时间线渲染、左右气泡区分发送方。
+// Catalog index layer: uniformly manages "message entries" (files and text).
+//   File messages: reuse Source (Local = zero-copy reference to a PC-local
+//     file / Remote = pushed from the phone, materialized into inbox).
+//   Text messages: content inlined directly, no source.
+// Each message carries from("pc"/"phone") and ts; the frontend renders them
+// on a timeline with left/right bubbles per sender.
 //
-// 状态全局共享(`CATALOG`),供 axum handler(server 线程 runtime)与
-// Tauri 命令(主 runtime)共用同一份。条目量小,临界区短,用 std Mutex + 全量持久化。
+// State is shared globally (`CATALOG`) so axum handlers (server thread
+// runtime) and Tauri commands (main runtime) use the same instance. The entry
+// count is small and critical sections are short, so std Mutex + full
+// persistence is enough.
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -19,7 +23,7 @@ pub enum Source {
 }
 
 impl Source {
-    /// 不论来源,实际要读/写的磁盘路径。
+    /// The actual disk path to read/write, regardless of source.
     pub fn path(&self) -> &str {
         match self {
             Source::Local { path } => path,
@@ -29,7 +33,7 @@ impl Source {
     pub fn is_remote(&self) -> bool {
         matches!(self, Source::Remote { .. })
     }
-    /// 给前端的来源标签:"local" / "remote"。
+    /// Source label for the frontend: "local" / "remote".
     pub fn kind_str(&self) -> &'static str {
         match self {
             Source::Local { .. } => "local",
@@ -53,18 +57,19 @@ pub struct Entry {
     pub body: MsgBody,
 }
 
-/// 给前端的列表项;按 kind 携带不同字段,前端按 kind 渲染。
+/// List item for the frontend; carries different fields per kind, which the
+/// frontend renders according to kind.
 #[derive(Serialize)]
 pub struct MsgItem {
     pub id: String,
     pub ts: String,
     pub from: String,
     pub kind: String, // "file" | "text"
-    // file 时有效:
+    // valid for file:
     pub name: String,
     pub size: u64,
-    pub source_kind: String, // "local" | "remote";text 时为空
-    // text 时有效:
+    pub source_kind: String, // "local" | "remote"; empty for text
+    // valid for text:
     pub text: String,
 }
 
@@ -97,7 +102,8 @@ impl Entry {
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-/// 零依赖 id:纳秒 + 自增计数,避免同毫秒碰撞。
+/// Zero-dependency id: nanoseconds + incrementing counter, avoiding collisions
+/// within the same millisecond.
 pub fn new_id() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -107,7 +113,7 @@ pub fn new_id() -> String {
     format!("{nanos}-{c}")
 }
 
-/// 当前秒级时间戳字符串(消息发送时刻)。
+/// Current second-resolution timestamp string (message send time).
 pub fn now_ts() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -115,7 +121,8 @@ pub fn now_ts() -> String {
         .unwrap_or_default()
 }
 
-/// exe 所在目录:便携版基准(无论从哪启动,数据都落同一处)。
+/// Directory of the exe: portable base (data always lands in the same place,
+/// no matter where the app is launched from).
 fn exe_parent() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
     exe.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
@@ -129,7 +136,7 @@ pub fn catalog_path() -> PathBuf {
     exe_parent().join("catalog.json")
 }
 
-/// 旧的 shared 目录(仅用于一次性迁移)。
+/// Legacy shared directory (only used for a one-time migration).
 pub fn legacy_shared_dir() -> PathBuf {
     exe_parent().join("shared")
 }
@@ -140,10 +147,12 @@ pub fn catalog() -> &'static Arc<Mutex<Vec<Entry>>> {
     CATALOG.get_or_init(|| Arc::new(Mutex::new(Vec::new())))
 }
 
-/// 旧格式条目(顶层 source/size/name/mtime,无 body/from)→ 新格式 Entry。
-/// Local→from="pc",Remote→from="phone";ts 取旧 mtime。
+/// Convert a legacy entry (top-level source/size/name/mtime, no body/from) to
+/// a new-format Entry. Local -> from="pc", Remote -> from="phone"; ts takes the
+/// legacy mtime.
 fn migrate_old_entry(v: &serde_json::Value) -> Option<Entry> {
-    // 新格式有 body 字段,旧格式没有。有 body 的直接走正常反序列化。
+    // New format has a body field, legacy format does not. Entries with a body
+    // go straight through normal deserialization.
     if v.get("body").is_some() {
         return serde_json::from_value(v.clone()).ok();
     }
@@ -186,7 +195,7 @@ pub fn save() {
     let _ = std::fs::write(catalog_path(), json);
 }
 
-/// 递归收集目录下所有文件到 out。
+/// Recursively collect every file under a directory into `out`.
 pub fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
@@ -201,13 +210,14 @@ pub fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// 把若干 PC 本地路径登记为 from="pc" 的文件消息(零拷贝)。返回新增条数。
-/// 若传入目录,递归收集其下所有文件。
+/// Register several PC-local paths as from="pc" file messages (zero-copy).
+/// Returns the number of newly added entries. If a directory is passed in, all
+/// files under it are collected recursively.
 pub fn add_local(paths: Vec<PathBuf>) -> usize {
     if paths.is_empty() {
         return 0;
     }
-    // 展开目录为文件列表。
+    // Expand directories into a flat file list.
     let mut all = Vec::new();
     for p in paths {
         if p.is_dir() {
@@ -252,7 +262,7 @@ pub fn add_local(paths: Vec<PathBuf>) -> usize {
     added
 }
 
-/// 把一个已写入 inbox 的文件登记为 from="phone" 的文件消息。
+/// Register a file already written to inbox as a from="phone" file message.
 pub fn add_remote(id: &str, inbox_path: &Path, display_name: &str) -> Entry {
     let size = std::fs::metadata(inbox_path).map(|m| m.len()).unwrap_or(0);
     let entry = Entry {
@@ -274,7 +284,8 @@ pub fn add_remote(id: &str, inbox_path: &Path, display_name: &str) -> Entry {
     entry
 }
 
-/// 登记一条文本消息(from 由调用方按来源 IP 判定后传入)。
+/// Register a text message (the caller passes the `from` value determined from
+/// the source IP).
 pub fn add_text(from: &str, text: &str) -> Entry {
     let entry = Entry {
         id: new_id(),
@@ -295,7 +306,9 @@ pub fn find(id: &str) -> Option<Entry> {
     catalog().lock().unwrap().iter().find(|e| e.id == id).cloned()
 }
 
-/// 按 id 从索引移除(不碰物理文件)。返回被移除条目,由调用方决定是否删盘上文件。
+/// Remove an entry from the index by id (does not touch the physical file).
+/// Returns the removed entry; the caller decides whether to delete the file on
+/// disk.
 pub fn remove(id: &str) -> Option<Entry> {
     let mut v = catalog().lock().unwrap();
     if let Some(pos) = v.iter().position(|e| e.id == id) {
@@ -308,7 +321,7 @@ pub fn remove(id: &str) -> Option<Entry> {
     }
 }
 
-/// 按 ts 升序的消息列表(时间线)。
+/// Message list sorted by ts ascending (timeline order).
 pub fn all_items() -> Vec<MsgItem> {
     let mut v = catalog().lock().unwrap();
     v.sort_by(|a, b| a.ts.cmp(&b.ts));

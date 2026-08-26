@@ -9,7 +9,8 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 pub fn run() {
     let mut builder = tauri::Builder::default();
 
-    // 单实例:已有实例在跑时,第二次启动只把旧窗口前置,不重复起服务。
+    // Single instance: if one is already running, a second launch only brings
+    // the old window to the front instead of starting a new server.
     #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -23,16 +24,19 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            // 先起 axum,等端口 bind 成功,再创建窗口加载该页面,
-            // 否则窗口先于服务器加载会出空白/连接错误。
-            // channel 传回实际端口(8765 被占用时会顺延),窗口用它拼 URL。
+            // Start axum first and wait for the port to bind before creating the
+            // window that loads that page; otherwise the window shows a blank
+            // page / connection error because it loads before the server is up.
+            // The channel carries back the actual port (falls forward when 8765
+            // is taken), and the window uses it to build the URL.
             let ready = server::spawn(app.handle().clone());
             let port = ready.blocking_recv().ok().flatten().unwrap_or_else(|| {
-                crate::logger::logf("本地服务器启动失败,退出");
+                crate::logger::logf("local server failed to start, exiting");
                 std::process::exit(1);
             });
 
-            // 防火墙检测放后台线程,不阻塞窗口创建(powershell 冷启动会卡数秒)。
+            // Run the firewall check on a background thread so it does not block
+            // window creation (a cold powershell start can hang for seconds).
             firewall::ensure_background(app.handle().clone());
 
             WebviewWindowBuilder::new(
@@ -44,7 +48,7 @@ pub fn run() {
             .inner_size(520.0, 720.0)
             .min_inner_size(360.0, 480.0)
             .center()
-            .disable_drag_drop_handler() // 让 HTML5 拖拽上传生效,不经 Tauri 拦截
+            .disable_drag_drop_handler() // let HTML5 drag-and-drop upload work, not intercepted by Tauri
             .build()?;
 
             Ok(())

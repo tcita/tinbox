@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
@@ -42,7 +42,7 @@
     overflow: hidden;
   }
 
-  /* 顶部:标题 + 二维码 */
+  /* Header: title + QR code */
   .head {
     display: flex; align-items: center; gap: 14px;
     padding: 10px 16px; flex: none;
@@ -57,7 +57,7 @@
   }
   #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; }
   .badge.off #dot { background: var(--danger); }
-  /* PC 徽标:无移动设备在线时灰点(有设备在线恢复绿点) */
+  /* PC badge: gray dot when no mobile device is online (turns green when one is) */
   .badge.wait #dot { background: var(--sub); }
   #qr {
     width: 72px; height: 72px; border-radius: 10px; background: #fff;
@@ -66,7 +66,8 @@
   @media (prefers-color-scheme: dark) { #qr { box-shadow: 0 2px 8px rgba(0,0,0,.4); } }
   @media (pointer: coarse) { #qr { display: none; } }
 
-  /* 收件箱快捷入口(仅 PC 端):打开 inbox 文件夹,用户自己管理收到的文件 */
+  /* Inbox shortcut (PC only): opens the inbox folder so the user can manage
+     received files themselves */
   #inboxBtn {
     border: 1px solid var(--line); background: transparent; color: var(--text);
     font-size: 15px; line-height: 1; padding: 7px 10px; border-radius: 9px;
@@ -74,10 +75,12 @@
   }
   #inboxBtn:active { background: color-mix(in srgb, var(--accent) 12%, transparent); }
   @media (pointer: coarse) { #inboxBtn { display: none; } }
-  /* 手机端:二维码隐藏;连接状态徽标保留,手机也要看到 */
+  /* Phone: QR code hidden; the connection-status badge stays so the phone can
+     see it too */
   @media (pointer: coarse) { #qr { display: none; } }
 
-  /* 断线提示条:PC 端(服务器)关闭后,手机页面提示连接已断开 */
+  /* Disconnect banner: shown on the phone page once the PC side (server) is
+     closed */
   #offBanner {
     flex: none; display: none;
     padding: 7px 16px; font-size: 12px; text-align: center;
@@ -85,7 +88,7 @@
   }
   #offBanner.show { display: block; }
 
-  /* 对话区 */
+  /* Chat area */
   #chat {
     flex: 1; overflow-y: auto; padding: 16px 12px 8px;
     display: flex; flex-direction: column; gap: 10px;
@@ -116,7 +119,7 @@
   }
   .msg.me .meta-line { justify-content: flex-end; }
 
-  /* 文件卡片(气泡内) */
+  /* File card (inside a bubble) */
   .file-card { display: flex; align-items: center; gap: 10px; min-width: 180px; cursor: pointer; }
   .file-card:active { opacity: .7; }
   .fc-ico {
@@ -132,7 +135,8 @@
   }
   .fc-size { font-size: 11px; opacity: .75; margin-top: 2px; }
 
-  /* 图片/视频预览:原图内联渲染限高;视频 preload=metadata 只拉首帧不下载整段 */
+  /* Image/video preview: inline-rendered original capped in height; video uses
+     preload=metadata so only the first frame is fetched, not the whole file */
   .file-card.has-preview {
     flex-direction: column; align-items: flex-start; gap: 8px; min-width: 200px;
   }
@@ -146,7 +150,7 @@
   .file-card.has-preview .fc-info { width: 100%; }
   .file-card.has-preview .fc-name { max-width: none; }
 
-  /* 下载进度:气泡内条 */
+  /* Download progress: bar inside the bubble */
   .dltrack {
     height: 3px; background: rgba(0,0,0,.12); border-radius: 999px; overflow: hidden; margin-top: 6px;
   }
@@ -156,14 +160,14 @@
   .dlrow.hidden { display: none; }
   .dltext { font-size: 10px; opacity: .8; margin-top: 4px; display: flex; justify-content: space-between; }
 
-  /* 空态 */
+  /* Empty state */
   .empty {
     text-align: center; color: var(--sub); padding: 48px 16px; font-size: 14px;
     margin: auto;
   }
   .empty .e-icon { font-size: 40px; opacity: .35; margin-bottom: 12px; }
 
-  /* 底部输入栏 */
+  /* Bottom composer */
   .composer {
     flex: none; display: flex; align-items: flex-end; gap: 8px;
     padding: 8px 10px 10px; border-top: 1px solid var(--line); background: var(--bg);
@@ -200,7 +204,7 @@
   }
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
-  /* 上传进度:底部条 */
+  /* Upload progress: bottom bar */
   .progress {
     position: fixed; left: 0; bottom: 0; height: 2px; width: 0;
     background: var(--accent); transition: width .2s; box-shadow: 0 0 8px var(--accent); z-index: 100;
@@ -208,7 +212,8 @@
 
   input[type=file] { display: none; }
 
-  /* 防火墙修复浮层:挡住整个界面,逼用户处理(修复/退出) */
+  /* Firewall repair overlay: covers the whole UI, forcing the user to handle
+     it (repair / quit) */
   .fw-overlay {
     position: fixed; inset: 0; background: rgba(0,0,0,.55);
     display: none; align-items: center; justify-content: center; z-index: 200;
@@ -234,7 +239,7 @@
   .fw-btn:disabled { opacity: .5; pointer-events: none; }
   .fw-hint { font-size: 11px; color: var(--sub); margin-top: 12px; }
 
-  /* 上下文菜单(文本长按/右键:复制/删除) */
+  /* Context menu (text long-press / right-click: copy/delete) */
   .ctx-menu {
     position: fixed; display: none; z-index: 150;
     background: var(--card); border: 1px solid var(--line); border-radius: 10px;
@@ -253,25 +258,25 @@
 
 <div class="head">
   <h1>📁 tinbox</h1>
-  <span class="badge" id="badge"><i id="dot"></i><span id="badgeTxt">已连接</span></span>
-  <button id="inboxBtn" title="打开收件箱文件夹">📥</button>
+  <span class="badge" id="badge"><i id="dot"></i><span id="badgeTxt">Connected</span></span>
+  <button id="inboxBtn" title="Open inbox folder">📥</button>
   <img id="qr" src="/qr" alt="">
 </div>
 
-<div id="offBanner">⚠️ 连接已断开 · 等待重新连接…</div>
+<div id="offBanner">⚠️ Connection lost · Reconnecting…</div>
 
 <div id="chat">
   <div class="empty" id="empty">
     <div class="e-icon">💬</div>
-    <div>还没有消息 · 发个文件或文字试试</div>
+    <div>No messages yet · Try sending a file or text</div>
   </div>
 </div>
 
 <div class="composer">
   <div style="position:relative">
-    <button class="plus-btn" id="plus" title="选择文件">＋</button>
+    <button class="plus-btn" id="plus" title="Select files">+</button>
   </div>
-  <textarea id="txt" rows="1" placeholder="发消息…"></textarea>
+  <textarea id="txt" rows="1" placeholder="Type a message…"></textarea>
   <button class="send-btn" id="send" disabled>➤</button>
 </div>
 <input type="file" id="fileInput" multiple>
@@ -279,11 +284,11 @@
 <div class="fw-overlay" id="fwOverlay">
   <div class="fw-card">
     <div class="fw-icon">🛡️</div>
-    <div class="fw-title">允许 tinbox 联网</div>
-    <div class="fw-desc">手机无法连接到本机。点「允许」并在弹出的 UAC 窗口再次确认,授予 tinbox 联网权限。</div>
+    <div class="fw-title">Allow tinbox network access</div>
+    <div class="fw-desc">The phone can't reach this PC. Click "Allow" and confirm again in the UAC dialog to grant tinbox network access.</div>
     <div class="fw-btns">
-      <button class="fw-btn quit" id="fwQuit">退出</button>
-      <button class="fw-btn repair" id="fwRepair">允许</button>
+      <button class="fw-btn quit" id="fwQuit">Quit</button>
+      <button class="fw-btn repair" id="fwRepair">Allow</button>
     </div>
     <div class="fw-hint" id="fwHint"></div>
   </div>
@@ -297,7 +302,7 @@
 <script>
 const $ = id => document.getElementById(id);
 
-// 本端身份:PC 窗口加载 localhost,手机加载 LAN IP。
+// Local identity: the PC window loads localhost, the phone loads the LAN IP.
 const isPC = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
 const me = isPC ? 'pc' : 'phone';
 let busy = false;
@@ -334,25 +339,31 @@ function iconFor(name){
   return '📦';
 }
 
-// 上下文菜单:长按(手机)/右键(PC)弹操作菜单,文本与文件统一。
-//   text:复制 / 删除(PC);file:下载 / 打开位置 / 删除(PC),手机只有下载。
-// 单击是主操作(PC 打开 / 手机下载),长按/右键才是菜单,避免误触。
-let ctxTarget = null;   // 当前菜单作用的消息 item
-let ctxBubble = null;   // 对应气泡(文件下载进度要用)
+// Context menu: long-press (phone) / right-click (PC) pops up an action menu,
+// unified for text and files.
+//   text: Copy / Delete (PC); file: Download / Reveal / Delete (PC), phone only
+//   has Download.
+// Single-click is the primary action (open on PC / download on phone); the menu
+// needs long-press/right-click, to avoid accidental triggers.
+let ctxTarget = null;   // message item the current menu acts on
+let ctxBubble = null;   // the matching bubble (needed for file download progress)
 let ctxTimer = null;
-let suppressClick = false; // 长按松手后的合成 click 会立刻关菜单,需吞掉一次
+let suppressClick = false; // the synthetic click fired after a long-press would
+                           // close the menu immediately, so swallow one
 function attachMenu(el, it, bubble){
-  // 右键(桌面)
+  // Right-click (desktop)
   el.addEventListener('contextmenu', (e) => {
     e.preventDefault();
     showCtxMenu(e.clientX, e.clientY, it, bubble);
   });
-  // 长按(移动):touchstart 开始计时,~500ms 触发;移动/松手取消。
+  // Long-press (mobile): start a timer on touchstart, fire at ~500ms; cancel on
+  // move/release.
   el.addEventListener('touchstart', (e) => {
     const t = e.touches[0];
     ctxTimer = setTimeout(() => {
       ctxTimer = null;
-      suppressClick = true; // 吞掉松手后浏览器补发的 click,防止菜单刚弹出就被关
+      suppressClick = true; // swallow the click the browser synthesizes on
+                            // release so the menu isn't closed right after opening
       showCtxMenu(t.clientX, t.clientY, it, bubble);
     }, 500);
   }, {passive: true});
@@ -363,7 +374,8 @@ function showCtxMenu(x, y, it, bubble){
   ctxTarget = it;
   ctxBubble = bubble;
   const m = $('ctxMenu');
-  // 按类型动态构建菜单项(手机端无权删除,不渲染删除)。
+  // Build the menu items dynamically by type (the phone has no delete rights,
+  // so Delete is not rendered there).
   m.innerHTML = '';
   const add = (label, cls, fn) => {
     const b = document.createElement('button');
@@ -373,18 +385,19 @@ function showCtxMenu(x, y, it, bubble){
     m.appendChild(b);
   };
   if(it.kind === 'text'){
-    add('复制', '', () => copyText(ctxTarget));
-    if(isPC) add('删除', 'danger', () => delItem(ctxTarget));
+    add('Copy', '', () => copyText(ctxTarget));
+    if(isPC) add('Delete', 'danger', () => delItem(ctxTarget));
   } else {
     if(isPC){
-      // PC 端无需下载(本地文件在本地,手机传来已在收件箱)。
-      add('打开位置', '', () => revealItem(ctxTarget));
-      add('删除', 'danger', () => delItem(ctxTarget));
+      // No download needed on the PC (local files are local, and phone-sent
+      // files are already in the inbox).
+      add('Reveal in Explorer', '', () => revealItem(ctxTarget));
+      add('Delete', 'danger', () => delItem(ctxTarget));
     } else {
-      add('下载', '', () => downloadFile(ctxTarget, ctxBubble));
+      add('Download', '', () => downloadFile(ctxTarget, ctxBubble));
     }
   }
-  // 定位:避免超出视口右/下边界。
+  // Position: avoid overflowing the viewport's right/bottom edges.
   const w = 130, h = 90;
   const left = Math.min(x, window.innerWidth - w - 8);
   const top = Math.min(y, window.innerHeight - h - 8);
@@ -393,32 +406,34 @@ function showCtxMenu(x, y, it, bubble){
   m.classList.add('show');
 }
 async function copyText(it){
-  try { await navigator.clipboard.writeText(it.text); toast('已复制'); }
-  catch { toast('复制失败'); }
+  try { await navigator.clipboard.writeText(it.text); toast('Copied'); }
+  catch { toast('Copy failed'); }
 }
 async function delItem(it){
   const msgtxt = it.kind === 'text'
-    ? '删除这条消息?'
-    : '从记录移除「'+it.name+'」?\n(文件不会删除)';
+    ? 'Delete this message?'
+    : 'Remove "'+it.name+'" from the record?\n(The file won\'t be deleted)';
   if(!confirm(msgtxt)) return;
   const res = await fetch('/rm?id='+encodeURIComponent(it.id), {method:'POST'});
-  if(res.ok) toast(it.kind === 'text' ? '已删除' : '已移除');
-  else toast('删除失败');
+  if(res.ok) toast(it.kind === 'text' ? 'Deleted' : 'Removed');
+  else toast('Delete failed');
   refresh();
 }
 async function revealItem(it){
   const res = await fetch('/reveal?id='+encodeURIComponent(it.id), {method:'POST'});
-  if(!res.ok) toast('文件已不在原位置');
+  if(!res.ok) toast('The file is no longer at its original location');
 }
 function hideCtxMenu(){ $('ctxMenu').classList.remove('show'); }
-// 点别处或滚动时关菜单(长按松手后的合成 click 用 suppressClick 吞掉)
+// Close the menu when clicking elsewhere or scrolling (the synthetic click
+// after a long-press is swallowed via suppressClick)
 document.addEventListener('click', () => {
   if(suppressClick){ suppressClick = false; return; }
   hideCtxMenu();
 });
 document.addEventListener('scroll', hideCtxMenu, true);
 
-let lastList = ''; // 上次渲染的列表快照;一致则不重渲染(轮询不打断滚动)
+let lastList = ''; // snapshot of the last rendered list; skip re-rendering when
+                   // unchanged (polling does not interrupt scrolling)
 async function refresh(){
   try {
     const r = await fetch('/list');
@@ -427,7 +442,8 @@ async function refresh(){
     if(key === lastList) return;
     lastList = key;
     render(items);
-  } catch { /* 断线/超时静默;离线状态由 SSE/轮询里的 setOffline 管 */ }
+  } catch { /* silent on disconnect/timeout; offline state is handled by
+               setOffline in the SSE/poll paths */ }
 }
 function render(items){
   const chat = $('chat');
@@ -438,7 +454,7 @@ function render(items){
   if(!has){
     const e = document.createElement('div');
     e.className = 'empty'; e.id = 'empty';
-    e.innerHTML = '<div class="e-icon">💬</div><div>还没有消息 · 发个文件或文字试试</div>';
+    e.innerHTML = '<div class="e-icon">💬</div><div>No messages yet · Try sending a file or text</div>';
     chat.appendChild(e);
     return;
   }
@@ -459,10 +475,11 @@ function render(items){
     if(it.kind === 'text'){
       bubble.classList.add('text');
       bubble.textContent = it.text;
-      // 长按/右键弹菜单:复制 / 删除(手机只有复制)。点一下不触发,避免误触。
+      // Long-press/right-click menu: Copy / Delete (phone only has Copy). A
+      // single tap does nothing, to avoid accidental triggers.
       attachMenu(bubble, it, null);
     } else {
-      // 文件卡片:图片/视频内联预览,其它类型图标。
+      // File card: inline preview for images/videos, an icon for other types.
       const card = document.createElement('div');
       card.className = 'file-card';
       const ext = (it.name.split('.').pop()||'').toLowerCase();
@@ -493,16 +510,18 @@ function render(items){
       info.querySelector('.fc-name').textContent = it.name;
       info.querySelector('.fc-size').textContent = fmtSize(it.size);
       card.appendChild(info);
-      // 单击:PC → 系统默认查看器打开;手机 → 触发下载。
+      // Single click: PC -> open with the system default viewer; phone ->
+      // trigger a download.
       card.onclick = () => {
         if(isPC) openDefault(it);
         else downloadFile(it, bubble);
       };
-      // 长按/右键:下载 / 打开位置 / 删除(手机只有下载)。
+      // Long-press/right-click: Download / Reveal / Delete (phone only has
+      // Download).
       attachMenu(card, it, bubble);
       bubble.appendChild(card);
 
-      // 下载进度条(手机端下载时显示)
+      // Download progress bar (shown on the phone while downloading)
       const dlrow = document.createElement('div');
       dlrow.className = 'dlrow hidden';
       dlrow.innerHTML = `
@@ -511,7 +530,7 @@ function render(items){
       bubble.appendChild(dlrow);
     }
 
-    // 时间戳
+    // Timestamp
     const meta = document.createElement('div');
     meta.className = 'meta-line';
     meta.textContent = fmtTime(it.ts);
@@ -520,18 +539,20 @@ function render(items){
     msg.appendChild(bubble);
     chat.appendChild(msg);
   }
-  // 在底部 → 跟着新消息滚到底;用户往上翻 → 保持位置不拽下去。
+  // At the bottom -> scroll down with new messages; scrolled up -> keep the
+  // position instead of yanking the view down.
   if(wasAtBottom) chat.scrollTop = chat.scrollHeight;
   else chat.scrollTop = prev;
 }
 
-// PC 端单击文件卡片:用系统默认查看器打开。
+// PC side single-click on a file card: open with the system default viewer.
 async function openDefault(it){
   const res = await fetch('/open?id='+encodeURIComponent(it.id), {method:'POST'});
-  if(!res.ok) toast('文件已不在原位置');
+  if(!res.ok) toast('The file is no longer at its original location');
 }
 
-// 下载:XHR 取 blob 跟进度/速度,完成后触发浏览器下载。
+// Download: XHR fetches a blob with progress/speed tracking, then triggers the
+// browser download when done.
 function downloadFile(it, bubble){
   const row = bubble.querySelector('.dlrow');
   if(!row) return;
@@ -566,15 +587,15 @@ function downloadFile(it, bubble){
       a.href = url; a.download = it.name;
       document.body.appendChild(a); a.click(); a.remove();
       URL.revokeObjectURL(url);
-      toast('下载完成 ✓');
-    } else { toast('下载失败 ✕'); }
+      toast('Download complete ✓');
+    } else { toast('Download failed ✕'); }
     show(false);
   };
-  xhr.onerror = () => { toast('网络错误 ✕'); show(false); };
+  xhr.onerror = () => { toast('Network error ✕'); show(false); };
   xhr.send();
 }
 
-// 文本发送
+// Text send
 function sendText(){
   const t = $('txt');
   const text = t.value.trim();
@@ -586,8 +607,8 @@ function sendText(){
   }).then(r => {
     busy = false;
     if(r.ok){ t.value = ''; autoSize(); updateSendBtn(); }
-    else toast('发送失败 ✕');
-  }).catch(() => { busy = false; toast('网络错误 ✕'); });
+    else toast('Send failed ✕');
+  }).catch(() => { busy = false; toast('Network error ✕'); });
 }
 
 function autoSize(){
@@ -599,7 +620,7 @@ function updateSendBtn(){
   $('send').disabled = $('txt').value.trim().length === 0;
 }
 
-// 文件上传(手机端 / 拖拽):走 /upload
+// File upload (phone / drag-and-drop): goes through /upload
 function uploadFiles(files){
   if(!files.length || busy) return;
   busy = true;
@@ -612,28 +633,29 @@ function uploadFiles(files){
   };
   xhr.onload = () => {
     busy = false; $('bar').style.width = '0';
-    if(xhr.status===200){ toast('已发送 ✓'); }
-    else toast('发送失败 ✕');
+    if(xhr.status===200){ toast('Sent ✓'); }
+    else toast('Send failed ✕');
   };
-  xhr.onerror = () => { busy=false; $('bar').style.width='0'; toast('网络错误 ✕'); };
+  xhr.onerror = () => { busy=false; $('bar').style.width='0'; toast('Network error ✕'); };
   xhr.send(fd);
 }
 
-// 输入框
+// Input field
 $('txt').addEventListener('input', () => { autoSize(); updateSendBtn(); });
 $('txt').addEventListener('keydown', e => {
   if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendText(); }
 });
 $('send').onclick = sendText;
 
-// 收件箱入口(仅 PC):打开 inbox 文件夹,收到的文件由用户在这里自行管理。
+// Inbox entry (PC only): open the inbox folder, where received files are
+// managed by the user.
 $('inboxBtn').onclick = () => {
-  fetch('/open-dir', {method:'POST'}).catch(()=>toast('无法打开收件箱'));
+  fetch('/open-dir', {method:'POST'}).catch(()=>toast('Could not open inbox'));
 };
 
-// 加号:直接弹系统文件选择器(不再有子菜单)。
-// PC 端:Tauri dialog(拿真实路径,零拷贝引用)→ POST /add-local 登记。
-// 手机端:浏览器 <input type=file multiple>(上传文件内容)。
+// Plus button: opens the system file picker directly (no submenu anymore).
+// PC: Tauri dialog (real paths, zero-copy references) -> POST /add-local to
+// register. Phone: browser <input type=file multiple> (uploads file content).
 $('plus').onclick = () => {
   if(isPC){ pickLocal(); return; }
   $('fileInput').click();
@@ -641,11 +663,12 @@ $('plus').onclick = () => {
 async function pickLocal(){
   const T = window.__TAURI__;
   if(!T || !T.dialog || !T.dialog.open){
-    toast('当前环境不支持'); return;
+    toast('Not supported in this environment'); return;
   }
   try {
-    // multiple 多选文件;不限定 directory(文件夹场景以后再说)。
-    const picked = await T.dialog.open({ multiple: true, title: '选择文件' });
+    // multiple: multi-file selection; no directory (folder selection can come
+    // later).
+    const picked = await T.dialog.open({ multiple: true, title: 'Select files' });
     if(!picked) return;
     let paths = [];
     if(Array.isArray(picked)) paths = picked.map(p => typeof p === 'string' ? p : p.path);
@@ -657,13 +680,14 @@ async function pickLocal(){
       body: JSON.stringify({ paths })
     });
     if(!r.ok){
-      toast('登记失败');
+      toast('Registration failed');
       fetch('/log', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({msg:'add-local HTTP '+r.status})});
     }
-    // 成功后 /add-local 广播 /events,本端 SSE 自动刷新。
+    // On success /add-local broadcasts /events, and this side's SSE refreshes
+    // automatically.
   } catch(e) {
-    toast('添加失败');
-    fetch('/log', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({msg:'dialog/add-local 异常: '+e})});
+    toast('Add failed');
+    fetch('/log', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({msg:'dialog/add-local error: '+e})});
   }
 }
 $('fileInput').addEventListener('change', e => {
@@ -671,36 +695,42 @@ $('fileInput').addEventListener('change', e => {
   e.target.value = '';
 });
 
-// 拖拽上传(桌面端)
+// Drag-and-drop upload (desktop)
 document.body.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect='copy'; });
 document.body.addEventListener('drop', e => {
   e.preventDefault();
   if(e.dataTransfer.files.length) uploadFiles([...e.dataTransfer.files]);
 });
 
-// 连接状态:PC 端一关,SSE 断开、/fw-status 轮询也失败 → 显示断线提示条;
-// 恢复后自动隐藏,并补刷一次列表(重连会漏掉断线期间的变更)。
+// Connection state: when the PC side closes, SSE disconnects and /fw-status
+// polling fails -> show the disconnect banner; once recovered, hide it and
+// refresh the list once (changes during the disconnect would otherwise be
+// missed).
 let offline = false;
 function setOffline(v){
   if(offline === v) return;
   offline = v;
   $('offBanner').classList.toggle('show', v);
-  // 顶部状态徽标只对手机(客户端)有意义;PC 是服务器本体,徽标固定显示地址。
+  // The header status badge only matters for the phone (client); the PC is the
+  // server itself, so its badge always shows the address.
   if(isPC) return;
   $('badge').classList.toggle('off', v);
-  $('badgeTxt').textContent = v ? '未连接' : '已连接';
+  $('badgeTxt').textContent = v ? 'Disconnected' : 'Connected';
 }
-// 服务器推送:任何一端发送/删除后,本端自动刷新(跨设备同步)。
+// Server push: whenever either end sends/deletes, this side refreshes
+// automatically (cross-device sync).
 const es = new EventSource('/events');
 es.onmessage = () => refresh();
 es.onerror = () => setOffline(true);
 es.onopen = () => { setOffline(false); refresh(); };
-// 兜底轮询(真正的服务器思路):手机浏览器会掐断 SSE(切网/锁屏/后台),
-// 4s 主动问服务器要一次状态,保证最终一致。refresh 内部做了变更检测,
-// 列表没变时不重渲染,不会打断滚动/闪烁。
+// Fallback polling (a true server: phone browsers kill SSE on network
+// switch/lock-screen/background). Every 4s, proactively ask the server for
+// status for eventual consistency. refresh does change detection, so it skips
+// re-rendering when the list is unchanged - no scroll interruption or flashing.
 setInterval(refresh, 4000);
 
-// 防火墙修复浮层:轮询 /fw-status,需修复时显示(窗口已被 Rust 侧置顶)。
+// Firewall repair overlay: poll /fw-status, show when repair is needed (the
+// window has already been pinned by the Rust side).
 let fwChecking = false;
 let fwWasShown = false;
 async function checkFwStatus(){
@@ -709,35 +739,36 @@ async function checkFwStatus(){
   try {
     const r = await fetch('/fw-status');
     const s = await r.json();
-    setOffline(false); // 轮询成功 → 在线
+    setOffline(false); // poll succeeded -> online
     const show = !!s.needRepair;
     $('fwOverlay').classList.toggle('show', show);
-    // 从"需修复"变为"已修复":取消窗口置顶,恢复正常。
+    // Transition from "needs repair" to "repaired": un-pin the window and
+    // return to normal.
     if(fwWasShown && !show){
       fetch('/untop', {method:'POST'}).catch(()=>{});
     }
     fwWasShown = show;
-  } catch { setOffline(true); } // 轮询失败 → PC 端已关/网络断开
+  } catch { setOffline(true); } // poll failed -> PC side closed / network down
   fwChecking = false;
 }
 $('fwRepair').onclick = async () => {
   $('fwRepair').disabled = true;
   $('fwQuit').disabled = true;
-  $('fwHint').textContent = '请在弹出的 UAC 窗口点「是」…';
+  $('fwHint').textContent = 'Please click "Yes" in the UAC dialog that pops up…';
   try {
     const r = await fetch('/repair', {method:'POST'});
     const txt = await r.text();
     if(txt.trim() === 'ok'){
-      // /repair 阻塞到 Block 真删才返回,此时已修复。
+      // /repair blocks until the Block is really removed, so it is fixed now.
       $('fwOverlay').classList.remove('show');
       fetch('/untop', {method:'POST'}).catch(()=>{});
       fwWasShown = false;
-      toast('已允许联网 ✓');
+      toast('Network access granted ✓');
     } else {
-      $('fwHint').textContent = '未完成(可能取消了 UAC),可再点「允许」重试';
+      $('fwHint').textContent = 'Not finished (UAC may have been cancelled). Click "Allow" to retry';
     }
   } catch(e) {
-    $('fwHint').textContent = '请求失败,可重试';
+    $('fwHint').textContent = 'Request failed, please retry';
   }
   $('fwRepair').disabled = false;
   $('fwQuit').disabled = false;
@@ -746,14 +777,15 @@ $('fwQuit').onclick = () => { fetch('/quit', {method:'POST'}).catch(()=>{}); };
 checkFwStatus();
 setInterval(checkFwStatus, 2000);
 
-// PC 端:服务器本体,徽标显示是否有移动设备在线——灰点"等待移动设备连接",有设备就绿点"已连接"。
+// PC: the server itself. The badge shows whether a mobile device is online -
+// gray "Waiting for mobile device", or green "Connected" when one is online.
 if(isPC){
   const updateMobile = () => {
     fetch('/info').then(r=>r.json()).then(d => {
       if(!d) return;
       const on = !!d.mobileConnected;
       $('badge').classList.toggle('wait', !on);
-      $('badgeTxt').textContent = on ? '已连接' : '等待移动设备连接';
+      $('badgeTxt').textContent = on ? 'Connected' : 'Waiting for mobile device';
     }).catch(()=>{});
   };
   updateMobile();
