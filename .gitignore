@@ -11,3 +11,4 @@ inbox/
 
 # Frontend dependencies (if any)
 frontend/node_modules/
+tinbox.log
