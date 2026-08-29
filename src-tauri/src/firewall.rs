@@ -13,11 +13,13 @@
 //      and triggers Start-Process -Verb RunAs to elevate and execute it:
 //      delete all Block rules for our exe and add one Allow rule. Rule changes
 //      take effect immediately, so the phone connects within the same session.
-//   3. schedule_post_startup_check(): poll for ~30s after startup - because
-//      the Windows firewall dialog only appears at bind time, and ensure() runs
-//      before bind, it cannot detect a block created "this run". Polling lets
-//      us pop the repair dialog within seconds of the user creating a block
-//      with a Cancel click, so the session is not wasted.
+//   3. schedule_post_startup_check(): poll for ~45s after startup (~1.5s
+//      cadence) - because the Windows firewall dialog only appears at bind
+//      time, and ensure() runs before bind, it cannot detect a block created
+//      "this run". Polling lets us pop the repair dialog within a second or
+//      two of the user creating a block with a Cancel click, so the session is
+//      not wasted. The flag is also pushed over the SSE channel so the
+//      frontend overlay appears immediately.
 //
 // A temp .ps1 file is used instead of passing the script via -ArgumentList to
 // avoid quotes/braces being mangled while being passed on the command line.
@@ -54,11 +56,17 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 /// Run a PowerShell snippet, returning (success, stdout). Uses
 /// CREATE_NO_WINDOW to avoid flashing a terminal.
 #[cfg(windows)]
-fn run_ps(script: &str) -> Option<(bool, String)> {
+pub(crate) fn run_ps(script: &str) -> Option<(bool, String)> {
     use std::os::windows::process::CommandExt;
     use std::process::Command;
+    // Force UTF-8 stdout: on localized Windows (e.g. Chinese) PowerShell's
+    // default output encoding is the legacy ANSI codepage, which garbles
+    // non-ASCII output like NIC names once decoded as UTF-8.
+    let script = format!(
+        "$OutputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); {script}"
+    );
     let out = Command::new("powershell.exe")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
     match out {
@@ -77,16 +85,32 @@ fn run_ps(script: &str) -> Option<(bool, String)> {
     }
 }
 
-/// Whether a Block inbound rule exists for our own exe; returns the matched
-/// rule name.
+/// Outcome of looking for a Block rule that targets our own exe. "Absent" and
+/// "Unknown" must not be conflated: hiding the repair overlay because a check
+/// failed (powershell unavailable, script error) would leave the phone blocked
+/// with the UI claiming everything is fine.
 #[cfg(windows)]
-fn find_block_rule(exe: &str) -> Option<String> {
+enum BlockCheck {
+    /// Confirmed: no such Block rule exists.
+    Absent,
+    /// Confirmed: a Block rule exists, with its display name.
+    Present(String),
+    /// The check itself failed; no conclusion either way.
+    Unknown,
+}
+
+/// Look for a Block inbound rule for our own exe. Filters by program first
+/// (one indexed query) instead of walking every inbound Block rule and
+/// fetching its filter one by one — the latter takes seconds, which directly
+/// adds to the detection latency.
+#[cfg(windows)]
+fn find_block_rule(exe: &str) -> BlockCheck {
     let ps = format!(
         r#"$exe = '{exe}'
 $name = ''
-Get-NetFirewallRule -Direction Inbound -Action Block -ErrorAction SilentlyContinue | ForEach-Object {{
-  $f = $_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
-  if ($f -and $f.Program -ieq $exe) {{ $name = $_.DisplayName }}
+Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue | ForEach-Object {{
+  $r = $_ | Get-NetFirewallRule -ErrorAction SilentlyContinue
+  if ($r -and $r.Direction -eq 'Inbound' -and $r.Action -eq 'Block') {{ $name = $r.DisplayName }}
 }}
 $name"#
     );
@@ -94,25 +118,68 @@ $name"#
         Some((true, out)) => {
             let s = out.trim();
             if s.is_empty() {
+                BlockCheck::Absent
+            } else {
+                BlockCheck::Present(s.to_string())
+            }
+        }
+        _ => BlockCheck::Unknown,
+    }
+}
+
+/// The Program path our Allow inbound rule points at, if the rule exists.
+/// Comparing this against the current exe path catches the "exe was moved or
+/// renamed after the rule was created" case: the rule still shows up in the
+/// firewall UI but no longer matches this binary, so the phone stays blocked
+/// with no visible reason.
+#[cfg(windows)]
+fn allow_rule_program() -> Option<String> {
+    let ps = format!(
+        r#"$r = Get-NetFirewallRule -DisplayName '{RULE_ALLOW}' -ErrorAction SilentlyContinue
+if ($r) {{ ($r | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue).Program }}"#
+    );
+    match run_ps(&ps) {
+        Some((true, out)) => {
+            let s = out.trim().to_string();
+            if s.is_empty() {
                 None
             } else {
-                Some(s.to_string())
+                Some(s)
             }
         }
         _ => None,
     }
 }
 
-/// Whether our own Allow inbound rule exists (read-only).
+/// Log the active network profile(s) (Private/Public/Domain). A Public profile
+/// combined with stricter inbound handling is one of the most common reasons a
+/// phone cannot connect while the PC's own browser (loopback) works fine.
 #[cfg(windows)]
-fn has_allow_rule() -> bool {
-    let ps = format!(
-        "[bool](Get-NetFirewallRule -DisplayName '{RULE_ALLOW}' -ErrorAction SilentlyContinue)"
-    );
-    matches!(run_ps(&ps), Some((true, ref s)) if s.trim().eq_ignore_ascii_case("true"))
+fn log_network_profile() {
+    let ps = "(Get-NetConnectionProfile | ForEach-Object { $_.InterfaceAlias + '=' + $_.NetworkCategory }) -join ', '";
+    if let Some((true, out)) = run_ps(ps) {
+        let s = out.trim();
+        if !s.is_empty() {
+            logf(&format!(
+                "firewall: active network profile(s): {s} (a Public profile is a common cause of blocked inbound)"
+            ));
+        }
+    }
 }
 
 static PENDING_REPAIR: AtomicBool = AtomicBool::new(false);
+
+/// Rate limit for the confirmatory rule re-checks in need_repair(): while the
+/// repair overlay is up, the frontend polls /fw-status every 2s; re-running
+/// powershell on every poll is wasteful.
+static LAST_RULE_CHECK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
 
 /// Entry point: run the firewall check in the background, without blocking
 /// setup/window creation (otherwise a cold powershell start can hang for
@@ -128,24 +195,56 @@ pub fn ensure_background(app: AppHandle) {
                 logf("firewall: could not get exe path, skipping");
                 return;
             };
+            log_network_profile();
             // First check whether a Block already exists before startup
             // (left over from last time).
-            if let Some(name) = find_block_rule(&exe) {
-                let has_allow = has_allow_rule();
-                logf(&format!(
-                    "firewall needs repair: found Block inbound rule name={name} (allow coexists={has_allow})"
-                ));
-                mark_need_repair(&app);
-                return; // pre-existing block: the frontend shows the overlay, stop polling.
+            match find_block_rule(&exe) {
+                BlockCheck::Present(name) => {
+                    let allow = allow_rule_program();
+                    logf(&format!(
+                        "firewall needs repair: found Block inbound rule name={name} (allow rule present={}{})",
+                        allow.is_some(),
+                        allow.map(|p| format!(", program={p}")).unwrap_or_default()
+                    ));
+                    mark_need_repair(&app);
+                    return; // pre-existing block: the frontend shows the overlay, stop polling.
+                }
+                BlockCheck::Unknown => {
+                    // Cannot inspect rules; do not guess. The repair overlay
+                    // stays off, and a phone actually connecting remains the
+                    // only (and sufficient) signal that inbound works.
+                    logf("firewall: could not inspect rules (powershell failed), relying on connection evidence");
+                    return;
+                }
+                BlockCheck::Absent => {}
             }
-            if has_allow_rule() {
-                logf("firewall OK: Allow exists, no Block");
-                return;
+            match allow_rule_program() {
+                Some(prog) => {
+                    if prog.eq_ignore_ascii_case(&exe) {
+                        logf("firewall OK: Allow rule covers this exe, no Block");
+                    } else {
+                        // The rule exists but was created for another copy of
+                        // tinbox (exe moved/renamed). This alone is not "the
+                        // phone is blocked": Windows re-prompts for the new
+                        // path at bind time, and if the user clicks Allow a
+                        // rule for this path appears; if they cancel, a Block
+                        // rule appears and the poll below flags it — which the
+                        // need_repair() Block check then confirms. So: log it,
+                        // keep watching, do not raise the overlay on a guess.
+                        logf(&format!(
+                            "firewall: Allow rule points at a different exe (rule={prog}, current={exe}); watching for a Block rule"
+                        ));
+                        post_startup_poll(&app, &exe);
+                    }
+                }
+                None => {
+                    // No Allow and no Block: Windows only asks at bind time, so
+                    // poll after startup waiting for the user's answer to the
+                    // dialog.
+                    logf("firewall: no Allow rule yet, polling after startup for the Windows dialog");
+                    post_startup_poll(&app, &exe);
+                }
             }
-            // No Allow and no Block: Windows only asks at bind time, so poll
-            // after startup waiting for the user's answer to the dialog.
-            logf("firewall: no Allow rule yet, polling after startup for the Windows dialog");
-            post_startup_poll(&app, &exe);
         });
     }
     #[cfg(not(windows))]
@@ -155,28 +254,27 @@ pub fn ensure_background(app: AppHandle) {
 }
 
 /// Poll after startup: the Windows firewall dialog only appears at bind time,
-/// so a block created this run cannot be detected up front. Check every 3s for
-/// ~30s; as soon as a block appears, flag that repair is needed (the frontend
-/// shows the overlay).
+/// so a block created this run cannot be detected up front. Check every ~1.5s
+/// (1s sleep + the powershell run itself) for ~45s; as soon as a block
+/// appears, flag that repair is needed and push an event so the frontend shows
+/// the overlay immediately instead of waiting for its next poll.
 #[cfg(windows)]
 fn post_startup_poll(app: &AppHandle, exe: &str) {
-    // Give the Windows dialog a moment to appear and be answered.
-    std::thread::sleep(std::time::Duration::from_secs(2));
-    for _ in 0..10 {
+    for _ in 0..30 {
         if PENDING_REPAIR.load(Ordering::SeqCst) {
             return;
         }
-        if let Some(name) = find_block_rule(exe) {
+        if let BlockCheck::Present(name) = find_block_rule(exe) {
             logf(&format!(
                 "post-startup poll found Block inbound rule name={name}, flagging repair"
             ));
             mark_need_repair(app);
             return;
         }
-        std::thread::sleep(std::time::Duration::from_secs(3));
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
-    // No block within 30s: the user most likely clicked Allow or no dialog
-    // appeared, which is fine.
+    // No block within the window: the user most likely clicked Allow or no
+    // dialog appeared, which is fine.
 }
 
 /// Flag that repair is needed and bring the window to the front so the user is
@@ -185,6 +283,9 @@ fn post_startup_poll(app: &AppHandle, exe: &str) {
 #[cfg(windows)]
 fn mark_need_repair(app: &AppHandle) {
     PENDING_REPAIR.store(true, Ordering::SeqCst);
+    // Push through the existing SSE channel so the frontend re-checks
+    // /fw-status right now instead of waiting up to its full 2s poll interval.
+    let _ = crate::server::notifier().send(());
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
         let _ = w.set_focus();
@@ -193,24 +294,49 @@ fn mark_need_repair(app: &AppHandle) {
 }
 
 /// Queried by the frontend: whether the firewall repair overlay should be
-/// shown. Actually re-checks whether the Block rule still exists (instead of
-/// relying on a cached flag), so the overlay correctly disappears after a
-/// successful repair.
+/// shown.
+///
+/// Two signals decide this, in order of trustworthiness:
+///   1. Positive evidence: a LAN device's requests still arriving is proof
+///      that inbound is open, whatever the rules say. It clears the flag and
+///      closes the overlay — including after a repair whose result could not
+///      be confirmed by inspection.
+///   2. Rule inspection: a confirmed Block keeps the overlay up; a confirmed
+///      Absent clears it. An Unknown check (powershell failed) does NOT clear
+///      the flag — the overlay stays until positive evidence arrives, because
+///      "could not verify" is not "verified fine".
 pub fn need_repair() -> bool {
     #[cfg(windows)]
     {
-        let Some(exe) = exe_path() else { return false; };
+        if crate::server::lan_seen_recently(30) {
+            PENDING_REPAIR.store(false, Ordering::SeqCst);
+            return false;
+        }
+        let Some(exe) = exe_path() else {
+            return PENDING_REPAIR.load(Ordering::SeqCst);
+        };
         // A false flag returns immediately (avoids invoking powershell every
         // time); when true, confirm with a real check.
         if !PENDING_REPAIR.load(Ordering::SeqCst) {
             return false;
         }
-        let still_blocked = find_block_rule(&exe).is_some();
-        if !still_blocked {
-            // Block is gone (repair succeeded): clear the flag.
-            PENDING_REPAIR.store(false, Ordering::SeqCst);
+        // Throttle: the frontend polls every 2s; one check per 4s is plenty.
+        let now = now_unix();
+        let last = LAST_RULE_CHECK.load(Ordering::SeqCst);
+        if now.saturating_sub(last) < 4 {
+            return true;
         }
-        still_blocked
+        LAST_RULE_CHECK.store(now, Ordering::SeqCst);
+        match find_block_rule(&exe) {
+            BlockCheck::Absent => {
+                // Block is gone (repair succeeded): clear the flag.
+                PENDING_REPAIR.store(false, Ordering::SeqCst);
+                false
+            }
+            // Still blocked, or cannot verify: keep the overlay. In the
+            // Unknown case a phone connecting remains the way out.
+            _ => true,
+        }
     }
     #[cfg(not(windows))]
     {
@@ -303,15 +429,20 @@ Remove-Item $MyInvocation.MyCommand.Path -ErrorAction SilentlyContinue"#
         .is_ok();
     // If the launch failed (user cancelled UAC), the launcher's Start-Process
     // errors and output is still returned but non-zero. The real success
-    // criterion: whether the Block still exists. If it does, the repair failed
-    // (UAC cancelled or script failed).
-    let fixed = find_block_rule(exe).is_none();
+    // criterion: whether the Block is really gone. An unverifiable outcome is
+    // reported as not fixed — the repair may still have worked, and the
+    // overlay will close by itself once a device actually connects.
+    let fixed = match find_block_rule(exe) {
+        BlockCheck::Absent => "yes (success)",
+        BlockCheck::Present(_) => "no (still blocked)",
+        BlockCheck::Unknown => "unverifiable (check failed)",
+    };
     logf(&format!(
         "repair: launched={}, Block removed={}",
         if launched { "yes" } else { "no" },
-        if fixed { "yes (success)" } else { "no (not fixed)" }
+        fixed
     ));
-    fixed
+    fixed == "yes (success)"
 }
 
 // Suppress unused warnings on non-Windows.

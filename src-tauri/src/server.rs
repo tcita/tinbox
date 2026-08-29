@@ -13,10 +13,11 @@ use axum::{
     Router,
 };
 use axum::extract::DefaultBodyLimit;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt as _;
@@ -68,6 +69,16 @@ fn from_by_peer(peer: SocketAddr) -> &'static str {
 /// requests go over loopback and never update it, so the PC never counts itself.
 static LAST_PHONE_ACT: AtomicU64 = AtomicU64::new(0);
 
+/// Last non-local peer seen, so the online/offline transition lines can name
+/// which device came and went.
+static LAST_PHONE_PEER: Mutex<String> = Mutex::new(String::new());
+
+/// Phone online state as of the last /info poll, for logging transitions.
+static PHONE_ONLINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Peers already warned about coming from a different subnet than the QR IP.
+static SUBNET_WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
 fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -75,25 +86,78 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether a non-loopback (LAN) device has made a request within the last
+/// `secs` seconds. This is positive proof that inbound traffic is not blocked:
+/// rule inspection can be wrong or unavailable, but packets arriving are
+/// packets arriving. The firewall module uses it as the ground truth to clear
+/// the repair flag; mobile_connected() is the 8s variant for the online badge.
+pub(crate) fn lan_seen_recently(secs: u64) -> bool {
+    now_unix().saturating_sub(LAST_PHONE_ACT.load(Ordering::Relaxed)) < secs
+}
+
 /// Whether a phone is online: a non-local request within the last 8 seconds
 /// (the phone polls fw-status every 2s and pulls the list every 4s, which is
 /// plenty).
 fn mobile_connected() -> bool {
-    now_unix().saturating_sub(LAST_PHONE_ACT.load(Ordering::Relaxed)) < 8
+    lan_seen_recently(8)
 }
 
 /// Log every incoming HTTP request and its source IP (key diagnostic: if a
-/// phone request never shows up here, the firewall is blocking it).
+/// phone request never shows up here, the request never reached this machine —
+/// firewall, wrong IP, AP isolation, or the phone is not on this network at
+/// all). Responses with status >= 400 get a second line, since a request that
+/// arrives and then fails server-side is a different failure mode than one
+/// that never arrives.
 async fn log_requests(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request,
     next: Next,
 ) -> Response {
-    if !peer.ip().is_loopback() {
+    let is_lan = !peer.ip().is_loopback();
+    if is_lan {
         LAST_PHONE_ACT.store(now_unix(), Ordering::Relaxed);
+        *LAST_PHONE_PEER.lock().unwrap() = peer.to_string();
+        note_foreign_subnet(&peer);
     }
-    logf(&format!("{} {} <- {}", req.method(), req.uri().path(), peer));
-    next.run(req).await
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    logf(&format!("{} {} <- {}", method, path, peer));
+    let resp = next.run(req).await;
+    if resp.status().as_u16() >= 400 {
+        logf(&format!(
+            "{} {} <- {} -> error response {}",
+            method,
+            path,
+            peer,
+            resp.status().as_u16()
+        ));
+    }
+    resp
+}
+
+/// A LAN peer whose /24 differs from the address the QR code points at is the
+/// classic "phone joined the guest network / the other band" symptom: packets
+/// still arrive but the user thinks they scanned the right URL. Warn once per
+/// peer.
+fn note_foreign_subnet(peer: &SocketAddr) {
+    let IpAddr::V4(peer_v4) = peer.ip() else { return };
+    let Some(qr_ip) = collect_ips().first().cloned() else { return };
+    let Ok(qr_v4) = qr_ip.parse::<Ipv4Addr>() else { return };
+    let same = qr_v4.octets()[..3] == peer_v4.octets()[..3];
+    if same {
+        return;
+    }
+    let key = peer.ip().to_string();
+    let set = SUBNET_WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let mut set = set.lock().unwrap();
+    if set.contains(&key) {
+        return;
+    }
+    set.insert(key);
+    logf(&format!(
+        "warning: request from {} is in a different subnet than the QR IP {} (phone may be on a guest network or another WiFi band)",
+        peer.ip(), qr_ip
+    ));
 }
 
 /// Find an available port starting from the preferred one: try 8765..8780 one
@@ -119,7 +183,16 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
-            logf(&format!("tinbox started, log file at tinbox.log next to the exe"));
+            // Exe path matters for diagnosis: Windows Firewall rules are keyed
+            // to it, so a moved/renamed exe silently loses its Allow rule.
+            let exe = std::env::current_exe()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| "<unknown>".to_string());
+            logf(&format!(
+                "tinbox v{} starting; exe={}; log file at tinbox.log next to the exe",
+                env!("CARGO_PKG_VERSION"),
+                exe
+            ));
 
             // Inbox directory (next to the exe); ensure it exists on first run.
             std::fs::create_dir_all(catalog::inbox_dir()).ok();
@@ -172,10 +245,16 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
             let ips = collect_ips();
             let ip = ips.first().cloned().unwrap_or_else(|| "127.0.0.1".to_string());
             logf(&format!(
-                "listening on 0.0.0.0:{}  QR URL http://{}:{}  candidate IPs={:?}",
+                "listening on 0.0.0.0:{}; QR code points at http://{}:{}; candidate IPs={:?}",
                 actual, ip, actual, ips
             ));
-            logf("if the phone cannot scan it: check that Windows Firewall allows tinbox.exe inbound (clicking Cancel on the first prompt blocks it)");
+            logf(
+                "phone cannot connect? (1) if NO '<phone-ip>' request line appears below when \
+                 the phone tries, the request never reached this machine: firewall block, \
+                 wrong QR IP, or router AP isolation / different WiFi; (2) if a request line \
+                 DOES appear, the network path is fine and any failure will show as an \
+                 'error response' line",
+            );
             let _ = tx.send(Some(actual));
             if let Err(e) = axum::serve(
                 listener,
@@ -253,34 +332,71 @@ async fn list() -> impl IntoResponse {
 }
 
 async fn upload(mut multipart: Multipart) -> impl IntoResponse {
-    while let Ok(Some(field)) = multipart.next_field().await {
-        if field.name() == Some("file") {
-            let filename = safe_name(field.file_name().unwrap_or("unnamed"));
-            if filename.is_empty() {
-                return (StatusCode::BAD_REQUEST, "bad filename").into_response();
-            }
-            // Write to inbox, prefixing the filename with the id to prevent
-            // same-name overwrites; the catalog id matches this prefix.
-            let id = catalog::new_id();
-            let stored = catalog::inbox_dir().join(format!("{id}__{filename}"));
-            let data = match field.bytes().await {
-                Ok(d) => d,
-                Err(e) => {
-                    return (StatusCode::BAD_REQUEST, format!("read: {e}")).into_response()
-                }
-            };
-            if let Err(e) = std::fs::write(&stored, &data) {
-                logf(&format!("upload write failed {}: {}", filename, e));
+    loop {
+        let mut field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => return (StatusCode::BAD_REQUEST, "no file field").into_response(),
+            Err(e) => return (StatusCode::BAD_REQUEST, format!("read: {e}")).into_response(),
+        };
+        if field.name() != Some("file") {
+            continue;
+        }
+        let filename = safe_name(field.file_name().unwrap_or("unnamed"));
+        if filename.is_empty() {
+            return (StatusCode::BAD_REQUEST, "bad filename").into_response();
+        }
+        // Write to inbox, prefixing the filename with the id to prevent
+        // same-name overwrites; the catalog id matches this prefix.
+        let id = catalog::new_id();
+        let stored = catalog::inbox_dir().join(format!("{id}__{filename}"));
+        // Stream the body straight to disk instead of buffering it whole in
+        // memory: a phone can send multi-GB videos, and buffering those would
+        // spike RSS to the file size. The 512 KiB BufWriter coalesces the
+        // small chunks the HTTP layer delivers (like LocalSend's save path).
+        let file = match tokio::fs::File::create(&stored).await {
+            Ok(f) => tokio::io::BufWriter::with_capacity(512 * 1024, f),
+            Err(e) => {
+                logf(&format!("upload create failed {}: {}", filename, e));
                 return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}"))
                     .into_response();
             }
-            catalog::add_remote(&id, &stored, &filename);
-            logf(&format!("upload done: {} ({} bytes) -> inbox", filename, data.len()));
-            let _ = notifier().send(());
-            return (StatusCode::OK, format!("uploaded: {filename}")).into_response();
+        };
+        let mut file = file;
+        let mut total: u64 = 0;
+        let write_result: Result<(), String> = loop {
+            match field.next().await {
+                Some(Ok(chunk)) => {
+                    total += chunk.len() as u64;
+                    if let Err(e) = file.write_all(&chunk).await {
+                        break Err(format!("write: {e}"));
+                    }
+                }
+                Some(Err(e)) => break Err(format!("read: {e}")),
+                None => {
+                    break match file.flush().await {
+                        Ok(()) => Ok(()),
+                        Err(e) => Err(format!("flush: {e}")),
+                    }
+                }
+            }
+        };
+        match write_result {
+            Ok(()) => {
+                catalog::add_remote(&id, &stored, &filename);
+                logf(&format!("upload done: {} ({} bytes) -> inbox", filename, total));
+                let _ = notifier().send(());
+                return (StatusCode::OK, format!("uploaded: {filename}")).into_response();
+            }
+            Err(e) => {
+                // Aborted or failed mid-transfer: the partial file is garbage,
+                // remove it and do NOT register the catalog entry.
+                drop(file);
+                let _ = std::fs::remove_file(&stored);
+                logf(&format!("upload failed {} after {} bytes: {}", filename, total, e));
+                return (StatusCode::BAD_REQUEST, e).into_response();
+            }
         }
     }
-    (StatusCode::BAD_REQUEST, "no file field").into_response()
 }
 
 /// Send a text message. The sender is determined from the source IP (loopback
@@ -335,10 +451,33 @@ async fn fw_status() -> impl IntoResponse {
 }
 
 /// Basic server info: LAN IP + whether a mobile device is online (the PC badge
-/// shows green/gray accordingly).
+/// shows green/gray accordingly). The PC polls this every couple of seconds, so
+/// it is the natural place to log online/offline transitions and build a
+/// timeline of whether the phone ever actually reached the server.
 async fn info() -> impl IntoResponse {
+    let online = mobile_connected();
+    let prev = PHONE_ONLINE.swap(online, std::sync::atomic::Ordering::Relaxed);
+    if online != prev {
+        if online {
+            logf(&format!(
+                "phone came online: LAN request seen from {} within the last 8s",
+                LAST_PHONE_PEER.lock().unwrap()
+            ));
+        } else {
+            logf(&format!(
+                "phone went offline: no LAN request for over 8s (last seen from {})",
+                LAST_PHONE_PEER.lock().unwrap()
+            ));
+        }
+    }
     let ip = collect_ips().first().cloned().unwrap_or_else(|| "127.0.0.1".to_string());
-    Json(serde_json::json!({ "ip": ip, "mobileConnected": mobile_connected() }))
+    let port = BOUND_PORT.get().copied().unwrap_or(PORT);
+    Json(serde_json::json!({
+        "ip": ip,
+        "port": port,
+        "url": format!("http://{}:{}", ip, port),
+        "mobileConnected": online
+    }))
 }
 
 /// Frontend "Repair" click: launch elevated UAC to delete the Block and add an
@@ -585,8 +724,10 @@ async fn events() -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::con
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-/// Return a QR code PNG whose content is http://<local-WiFi-IP>:<port>. The
-/// page shows it via <img src="/qr">; the phone scans it to open this page.
+/// Return a QR code PNG whose content is http://<best-LAN-IP>:<port>. The IP
+/// is picked by the scoring in collect_ips (gateway-in-subnet evidence), which
+/// stays correct even with TUN-mode VPNs or virtual adapters active. The page
+/// shows it via <img src="/qr">; the phone scans it to open this page.
 async fn qr() -> impl IntoResponse {
     let ips = collect_ips();
     let ip = ips.first().cloned().unwrap_or_else(|| "127.0.0.1".to_string());
@@ -600,7 +741,8 @@ async fn qr() -> impl IntoResponse {
         }
     };
     let modules = qr.width();
-    let scale = 8u32;
+    // Scale 10 keeps the PNG crisp when the frontend displays it at ~104 CSS px.
+    let scale = 10u32;
     let border = 4 * scale;
     let size = modules as u32 * scale + border * 2;
     let mut img = image::GrayImage::new(size, size);
@@ -631,27 +773,182 @@ async fn qr() -> impl IntoResponse {
         .into_response()
 }
 
-/// Enumerate all NICs' IPv4 addresses, sorted with WiFi preferred.
+/// Enumerate this machine's IPv4 candidates for the QR code, best first.
+///
+/// Ranking is the crux: with a TUN-mode VPN or Docker/WSL installed, the
+/// kernel's default route points at a virtual adapter, so "my outbound IP"
+/// probes return an address (172.18.0.1 etc.) that lives on a network which
+/// only exists inside this machine — the phone cannot route to it at all.
+/// The reliable signal for the real LAN adapter is a default gateway in the
+/// same /24 (a DHCP router), which virtual adapters don't have; virtual
+/// keyword matches on name/description are a second filter. LAN subnet routes
+/// are more specific than the TUN default route, so the chosen address stays
+/// reachable while the VPN is on — no need to disable it.
 fn collect_ips() -> Vec<String> {
-    let mut ips: Vec<(u8, String)> = Vec::new();
+    /// Private-range addresses only: loopback, link-local (169.254/16) and
+    /// public addresses can never be reached from the phone's browser.
+    fn is_private(v4: Ipv4Addr) -> bool {
+        match v4.octets() {
+            [10, ..] | [192, 168, ..] => true,
+            [172, b, ..] => (16..=31).contains(&b),
+            _ => false,
+        }
+    }
+
+    // All private IPv4s with their interface names, deduplicated.
+    let mut cands: Vec<(String, Ipv4Addr)> = Vec::new();
     if let Ok(ifaces) = local_ip_address::list_afinet_netifas() {
-        for (_name, ip) in ifaces {
+        for (name, ip) in ifaces {
             if let IpAddr::V4(v4) = ip {
-                let octets = v4.octets();
-                if octets[0] == 127 || (octets[0] == 169 && octets[1] == 254) {
-                    continue;
+                if is_private(v4) && !cands.iter().any(|(_, v)| *v == v4) {
+                    cands.push((name, v4));
                 }
-                let prio = match octets[0] {
-                    192 => 0,
-                    10 => 1,
-                    172 => 2,
-                    _ => 3,
-                };
-                ips.push((prio, v4.to_string()));
             }
         }
     }
-    ips.sort();
-    ips.dedup_by(|a, b| a.1 == b.1);
-    ips.into_iter().map(|(_, ip)| ip).collect()
+    if cands.is_empty() {
+        return vec![];
+    }
+
+    let facts = adapter_facts();
+    if facts.is_empty() {
+        // Facts unavailable (powershell failed / non-Windows): fall back to
+        // the old heuristic — default-route IP first, then numeric order.
+        let mut ips: Vec<String> = Vec::new();
+        if let Ok(IpAddr::V4(v4)) = local_ip_address::local_ip() {
+            if is_private(v4) {
+                ips.push(v4.to_string());
+            }
+        }
+        cands.sort_by_key(|(_, v4)| v4.octets());
+        for (_, v4) in cands {
+            let s = v4.to_string();
+            if !ips.contains(&s) {
+                ips.push(s);
+            }
+        }
+        return ips;
+    }
+
+    fn virtual_adapter(s: &str) -> bool {
+        const KW: &[&str] = &[
+            "tun", "tap", "vpn", "docker", "wsl", "vmware", "virtual", "hyper-v", "vethernet",
+            "loopback", "clash", "xray", "sing-box", "wireguard", "zerotier", "tailscale",
+            "wi-fi direct", "bluetooth",
+        ];
+        let l = s.to_lowercase();
+        KW.iter().any(|k| l.contains(k))
+    }
+
+    let mut scored: Vec<(i32, [u8; 4], String, String)> = Vec::new();
+    for (name, v4) in cands {
+        let mut score = 0;
+        let mut why = String::from("no gateway info");
+        if let Some((desc, gw)) = facts.get(&name) {
+            match gw
+                .as_deref()
+                .and_then(|g| g.parse::<Ipv4Addr>().ok())
+            {
+                Some(g) if g.octets()[..3] == v4.octets()[..3] => {
+                    score += 4;
+                    why = format!("gateway {g} in same subnet");
+                }
+                Some(g) => {
+                    score += 2;
+                    why = format!("gateway {g} elsewhere");
+                }
+                None => why = "no default gateway".to_string(),
+            }
+            if virtual_adapter(&name) {
+                score -= 3;
+                why.push_str(", virtual name");
+            }
+            if virtual_adapter(desc) {
+                score -= 3;
+                why.push_str(", virtual description");
+            }
+        }
+        scored.push((score, v4.octets(), v4.to_string(), why));
+    }
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+
+    // Log the decision only when the winner changes, to keep the log quiet
+    // while /info is polled every few seconds.
+    let best = scored[0].2.clone();
+    {
+        let mut last = LAST_CHOSEN_IP.lock().unwrap();
+        if *last != best {
+            let detail = scored
+                .iter()
+                .map(|(s, _, ip, why)| format!("{ip}({s:+}, {why})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            logf(&format!("LAN IP selection: using {best}; candidates: {detail}"));
+            *last = best;
+        }
+    }
+    scored.into_iter().map(|(_, _, ip, _)| ip).collect()
+}
+
+/// Adapter metadata used for ranking: interface name -> (description, default
+/// gateway if any). Gathered by one powershell call, cached 30s — /info is
+/// polled every few seconds and must not spawn a process each time.
+#[cfg(windows)]
+type AdapterFacts = std::collections::HashMap<String, (String, Option<String>)>;
+
+#[cfg(not(windows))]
+type AdapterFacts = std::collections::HashMap<String, (String, Option<String>)>;
+
+static ADAPTER_FACTS: OnceLock<Mutex<(u64, AdapterFacts)>> = OnceLock::new();
+static LAST_CHOSEN_IP: Mutex<String> = Mutex::new(String::new());
+
+fn adapter_facts() -> AdapterFacts {
+    let cache = ADAPTER_FACTS.get_or_init(|| Mutex::new((0, Default::default())));
+    let mut g = cache.lock().unwrap();
+    let now = now_unix();
+    if now.saturating_sub(g.0) < 30 {
+        return g.1.clone();
+    }
+    let facts = gather_adapter_facts();
+    if !facts.is_empty() {
+        g.0 = now;
+        g.1 = facts.clone();
+    }
+    facts
+}
+
+/// One read-only powershell query: for every adapter, its name, description,
+/// IPv4 addresses and default gateway, tab-separated per address.
+#[cfg(windows)]
+fn gather_adapter_facts() -> AdapterFacts {
+    let ps = r#"Get-NetAdapter | Where-Object Status -eq 'Up' | ForEach-Object {
+  $n = $_.Name; $d = $_.InterfaceDescription; $i = $_.ifIndex
+  Get-NetIPAddress -InterfaceIndex $i -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {
+    $g = (Get-NetRoute -InterfaceIndex $i -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1).NextHop
+    "{0}`t{1}`t{2}`t{3}" -f $n, $d, $_.IPAddress, $g
+  }
+}"#;
+    let mut map = AdapterFacts::new();
+    if let Some((true, out)) = crate::firewall::run_ps(ps) {
+        for line in out.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            if parts.len() != 4 {
+                continue;
+            }
+            let gw = parts[3].trim();
+            map.insert(
+                parts[0].trim().to_string(),
+                (
+                    parts[1].trim().to_string(),
+                    if gw.is_empty() { None } else { Some(gw.to_string()) },
+                ),
+            );
+        }
+    }
+    map
+}
+
+#[cfg(not(windows))]
+fn gather_adapter_facts() -> AdapterFacts {
+    AdapterFacts::new()
 }

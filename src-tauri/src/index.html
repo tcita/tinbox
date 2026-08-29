@@ -59,12 +59,22 @@
   .badge.off #dot { background: var(--danger); }
   /* PC badge: gray dot when no mobile device is online (turns green when one is) */
   .badge.wait #dot { background: var(--sub); }
-  #qr {
-    width: 72px; height: 72px; border-radius: 10px; background: #fff;
-    padding: 4px; flex: none; box-shadow: 0 1px 4px rgba(0,0,0,.08);
+  /* QR + its address: the URL below the code lets the user verify what the
+     phone should open, or type it manually when scanning fails */
+  #qrBox {
+    display: flex; flex-direction: column; align-items: center; gap: 4px; flex: none;
   }
+  #qr {
+    width: 104px; height: 104px; border-radius: 10px; background: #fff;
+    padding: 4px; box-shadow: 0 1px 4px rgba(0,0,0,.08);
+  }
+  #qrUrl {
+    font-size: 10.5px; font-weight: 500; color: var(--sub); cursor: pointer;
+    max-width: 136px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #qrUrl:hover { color: var(--accent); }
   @media (prefers-color-scheme: dark) { #qr { box-shadow: 0 2px 8px rgba(0,0,0,.4); } }
-  @media (pointer: coarse) { #qr { display: none; } }
+  @media (pointer: coarse) { #qrBox { display: none; } }
 
   /* Inbox shortcut (PC only): opens the inbox folder so the user can manage
      received files themselves */
@@ -212,6 +222,33 @@
 
   input[type=file] { display: none; }
 
+  /* Connect gate (PC only): until a device is actually connected, the whole
+     UI is covered by a big QR code — the transfer screen is meaningless with
+     nobody on the other end. Sits below the firewall overlay (repair first),
+     above everything else. */
+  #gate {
+    position: fixed; inset: 0; z-index: 80; background: var(--bg);
+    display: none; align-items: center; justify-content: center;
+  }
+  #gate.show { display: flex; }
+  .g-card { text-align: center; padding: 24px; max-width: 360px; }
+  .g-icon { font-size: 42px; }
+  .g-title { font-size: 18px; font-weight: 600; margin: 10px 0 20px; }
+  #gateQr {
+    width: 240px; height: 240px; background: #fff; border-radius: 18px;
+    padding: 12px; box-shadow: 0 6px 28px rgba(0,0,0,.14);
+  }
+  @media (prefers-color-scheme: dark) { #gateQr { box-shadow: 0 6px 28px rgba(0,0,0,.5); } }
+  #gateUrl {
+    margin-top: 16px; font-size: 14px; font-weight: 600; color: var(--accent);
+    background: transparent; border: 1px dashed var(--line); border-radius: 10px;
+    padding: 9px 16px; cursor: pointer; max-width: 320px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  #gateUrl:hover { border-color: var(--accent); }
+  .g-desc { font-size: 12px; color: var(--sub); margin-top: 14px; line-height: 1.6; }
+  @media (pointer: coarse) { #gate { display: none !important; } }
+
   /* Firewall repair overlay: covers the whole UI, forcing the user to handle
      it (repair / quit) */
   .fw-overlay {
@@ -220,6 +257,19 @@
     backdrop-filter: blur(4px);
   }
   .fw-overlay.show { display: flex; }
+
+  /* Superseded-page overlay: once a freshly scanned page takes over, older
+     tabs stop all traffic and show this instead */
+  #deadOverlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,.55);
+    display: none; align-items: center; justify-content: center;
+    z-index: 300; backdrop-filter: blur(4px); padding: 24px;
+  }
+  #deadOverlay.show { display: flex; }
+  #deadOverlay .fw-card { max-width: 300px; }
+  #deadOverlay .fw-icon { font-size: 40px; margin-bottom: 10px; }
+  #deadOverlay .fw-title { font-size: 17px; font-weight: 600; margin-bottom: 6px; }
+  #deadOverlay .fw-desc { font-size: 13px; color: #ddd; line-height: 1.5; }
   .fw-card {
     background: var(--card); border-radius: 18px; padding: 26px 24px 20px;
     max-width: 340px; width: calc(100% - 48px); text-align: center;
@@ -260,7 +310,10 @@
   <h1>📁 tinbox</h1>
   <span class="badge" id="badge"><i id="dot"></i><span id="badgeTxt">Connected</span></span>
   <button id="inboxBtn" title="Open inbox folder">📥</button>
-  <img id="qr" src="/qr" alt="">
+  <div id="qrBox">
+    <img id="qr" src="/qr" alt="">
+    <span id="qrUrl" title="Click to copy the address">…</span>
+  </div>
 </div>
 
 <div id="offBanner">⚠️ Connection lost · Reconnecting…</div>
@@ -281,6 +334,16 @@
 </div>
 <input type="file" id="fileInput" multiple>
 
+<div id="gate">
+  <div class="g-card">
+    <div class="g-icon">📱</div>
+    <div class="g-title" id="gateTitle">Scan to start</div>
+    <img id="gateQr" src="/qr" alt="QR code">
+    <div><button id="gateUrl" title="Click to copy the address">…</button></div>
+    <div class="g-desc" id="gateDesc">Scan with your phone camera, or type the address in your phone's browser. This screen stays until a device connects.</div>
+  </div>
+</div>
+
 <div class="fw-overlay" id="fwOverlay">
   <div class="fw-card">
     <div class="fw-icon">🛡️</div>
@@ -291,6 +354,14 @@
       <button class="fw-btn repair" id="fwRepair">Allow</button>
     </div>
     <div class="fw-hint" id="fwHint"></div>
+  </div>
+</div>
+
+<div id="deadOverlay">
+  <div class="fw-card">
+    <div class="fw-icon">📡</div>
+    <div class="fw-title">tinbox opened in another tab</div>
+    <div class="fw-desc">This page was replaced by a newly scanned one and is no longer connected. You can close this tab.</div>
   </div>
 </div>
 
@@ -718,16 +789,18 @@ function setOffline(v){
   $('badgeTxt').textContent = v ? 'Disconnected' : 'Connected';
 }
 // Server push: whenever either end sends/deletes, this side refreshes
-// automatically (cross-device sync).
+// automatically (cross-device sync). Also re-check firewall status: the Rust
+// side pushes on this channel the moment a Block rule is detected, so the
+// repair overlay appears immediately instead of waiting for the next poll.
 const es = new EventSource('/events');
-es.onmessage = () => refresh();
+es.onmessage = () => { refresh(); checkFwStatus(); };
 es.onerror = () => setOffline(true);
 es.onopen = () => { setOffline(false); refresh(); };
 // Fallback polling (a true server: phone browsers kill SSE on network
 // switch/lock-screen/background). Every 4s, proactively ask the server for
 // status for eventual consistency. refresh does change detection, so it skips
 // re-rendering when the list is unchanged - no scroll interruption or flashing.
-setInterval(refresh, 4000);
+const refreshTimer = setInterval(refresh, 4000);
 
 // Firewall repair overlay: poll /fw-status, show when repair is needed (the
 // window has already been pinned by the Rust side).
@@ -765,7 +838,7 @@ $('fwRepair').onclick = async () => {
       fwWasShown = false;
       toast('Network access granted ✓');
     } else {
-      $('fwHint').textContent = 'Not finished (UAC may have been cancelled). Click "Allow" to retry';
+      $('fwHint').textContent = 'Not finished (UAC may have been cancelled). Click "Allow" to retry — or this closes itself once a device connects';
     }
   } catch(e) {
     $('fwHint').textContent = 'Request failed, please retry';
@@ -775,21 +848,79 @@ $('fwRepair').onclick = async () => {
 };
 $('fwQuit').onclick = () => { fetch('/quit', {method:'POST'}).catch(()=>{}); };
 checkFwStatus();
-setInterval(checkFwStatus, 2000);
+const fwTimer = setInterval(checkFwStatus, 2000);
+
+// Single-live-page takeover: scanning the QR again opens a new tab, and old
+// tabs would otherwise keep an SSE connection plus two polling loops alive
+// forever. The browser gives a page no way to reuse an existing tab for a new
+// navigation (Service Workers could, but require HTTPS, which a plain-HTTP
+// LAN page can't have). The closest equivalent: same-origin tabs announce
+// themselves on a BroadcastChannel and every older tab stands down —
+// connection closed, timers cleared, overlay shown. Net effect: only one
+// live page at a time. BroadcastChannel never delivers to the sender, so the
+// newly opened page is unaffected by its own hello.
+function supersede(){
+  if(superseded) return;
+  superseded = true;
+  try { es.close(); } catch {}
+  clearInterval(refreshTimer);
+  clearInterval(fwTimer);
+  $('deadOverlay').classList.add('show');
+  // Best effort only: most mobile browsers ignore window.close() for tabs
+  // the user opened themselves; the overlay above is the real UI.
+  setTimeout(() => window.close(), 300);
+}
+let superseded = false;
+const takeover = 'BroadcastChannel' in window ? new BroadcastChannel('tinbox-page') : null;
+if(takeover){
+  takeover.onmessage = e => { if(e.data === 'hello') supersede(); };
+  takeover.postMessage('hello');
+}
 
 // PC: the server itself. The badge shows whether a mobile device is online -
 // gray "Waiting for mobile device", or green "Connected" when one is online.
+// /info also carries the LAN URL the QR encodes; showing it as text lets the
+// user verify the detected IP or type it manually when scanning fails.
+//
+// Connect gate: the transfer UI is only shown while a device is actually
+// connected. "Connected" is sticky — a phone that locks its screen or
+// backgroundes its browser stops polling for a while, so after the first
+// connect it takes ~60s (20 missed polls) to flip back to the gate. Otherwise
+// the UI would flicker to the QR page on every screen lock mid-conversation.
+function copyUrl(){
+  const fromGate = $('gate').classList.contains('show');
+  const u = fromGate ? $('gateUrl').textContent : $('qrUrl').textContent;
+  if(!u.startsWith('http')) return;
+  navigator.clipboard.writeText(u)
+    .then(()=>toast('Address copied: ' + u))
+    .catch(()=>toast('Copy failed, please copy manually: ' + u));
+}
 if(isPC){
+  let everConnected = false;
+  let missedPolls = 0;
   const updateMobile = () => {
     fetch('/info').then(r=>r.json()).then(d => {
-      if(!d) return;
-      const on = !!d.mobileConnected;
-      $('badge').classList.toggle('wait', !on);
-      $('badgeTxt').textContent = on ? 'Connected' : 'Waiting for mobile device';
+      if(!d) return; // transient failure: neither connect nor disconnect
+      if(d.mobileConnected){
+        if(!everConnected) toast('Device connected ✓');
+        everConnected = true;
+        missedPolls = 0;
+        $('gateTitle').textContent = 'Scan to start';
+      } else if(everConnected && ++missedPolls >= 20){
+        everConnected = false;
+        $('gateTitle').textContent = 'Connection lost — scan again';
+      }
+      $('gate').classList.toggle('show', !everConnected);
+      $('badge').classList.toggle('wait', !d.mobileConnected);
+      $('badgeTxt').textContent = d.mobileConnected ? 'Connected' : 'Waiting for mobile device';
+      if(d.url){ $('qrUrl').textContent = d.url; $('gateUrl').textContent = d.url; }
     }).catch(()=>{});
   };
+  $('gate').classList.add('show'); // start behind the gate until a device proves itself
   updateMobile();
   setInterval(updateMobile, 3000);
+  $('qrUrl').onclick = copyUrl;
+  $('gateUrl').onclick = copyUrl;
 }
 
 refresh();
