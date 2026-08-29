@@ -1,0 +1,17 @@
+# Normalize all text files to LF, in the repository and in the working tree.
+# LF is the standard for the Rust and web ecosystems this project uses, and it
+# makes checkouts identical on every platform regardless of each machine's
+# core.autocrlf setting.
+* text=auto eol=lf
+
+# Windows-specific scripts stay CRLF, since cmd.exe breaks on LF-only files.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Binary assets: never touch.
+*.png binary
+*.ico binary
+*.icns binary
+*.exe binary
+*.dll binary
