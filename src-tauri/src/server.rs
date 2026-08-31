@@ -773,28 +773,19 @@ async fn qr() -> impl IntoResponse {
         .into_response()
 }
 
-/// Enumerate this machine's IPv4 candidates for the QR code, best first.
+/// Enumerate this machine's IPv4 candidates for the QR code.
 ///
-/// Ranking is the crux: with a TUN-mode VPN or Docker/WSL installed, the
-/// kernel's default route points at a virtual adapter, so "my outbound IP"
-/// probes return an address (172.18.0.1 etc.) that lives on a network which
-/// only exists inside this machine — the phone cannot route to it at all.
-/// The reliable signal for the real LAN adapter is a default gateway in the
-/// same /24 (a DHCP router), which virtual adapters don't have; virtual
-/// keyword matches on name/description are a second filter. LAN subnet routes
-/// are more specific than the TUN default route, so the chosen address stays
-/// reachable while the VPN is on — no need to disable it.
+/// Deliberately no scoring. The real-world cases are (a) a single real
+/// adapter and (b) a real adapter plus virtual noise (Docker/WSL/VPN), and
+/// both are resolved by two deterministic filters. First, adapters whose
+/// name/description matches a virtual keyword are excluded outright — their
+/// "gateway" is an in-machine vswitch that answers probes, so liveness
+/// cannot tell them apart. Second, the rest are probed by pinging their
+/// default gateway with their own address as source; no reply means the
+/// network is gone (stale DHCP lease, cable pulled) and the candidate is
+/// dropped. If that leaves nothing — e.g. an enterprise network that blocks
+/// ICMP — fall back to the unfiltered list so the QR never goes blank.
 fn collect_ips() -> Vec<String> {
-    /// Private-range addresses only: loopback, link-local (169.254/16) and
-    /// public addresses can never be reached from the phone's browser.
-    fn is_private(v4: Ipv4Addr) -> bool {
-        match v4.octets() {
-            [10, ..] | [192, 168, ..] => true,
-            [172, b, ..] => (16..=31).contains(&b),
-            _ => false,
-        }
-    }
-
     // All private IPv4s with their interface names, deduplicated.
     let mut cands: Vec<(String, Ipv4Addr)> = Vec::new();
     if let Ok(ifaces) = local_ip_address::list_afinet_netifas() {
@@ -812,87 +803,205 @@ fn collect_ips() -> Vec<String> {
 
     let facts = adapter_facts();
     if facts.is_empty() {
-        // Facts unavailable (powershell failed / non-Windows): fall back to
-        // the old heuristic — default-route IP first, then numeric order.
-        let mut ips: Vec<String> = Vec::new();
-        if let Ok(IpAddr::V4(v4)) = local_ip_address::local_ip() {
-            if is_private(v4) {
-                ips.push(v4.to_string());
-            }
-        }
-        cands.sort_by_key(|(_, v4)| v4.octets());
-        for (_, v4) in cands {
-            let s = v4.to_string();
-            if !ips.contains(&s) {
-                ips.push(s);
-            }
-        }
-        return ips;
+        // Facts unavailable (powershell failed / non-Windows): nothing to
+        // filter on — default-route IP first, then numeric order.
+        return fallback_order(&cands);
     }
 
-    fn virtual_adapter(s: &str) -> bool {
-        const KW: &[&str] = &[
-            "tun", "tap", "vpn", "docker", "wsl", "vmware", "virtual", "hyper-v", "vethernet",
-            "loopback", "clash", "xray", "sing-box", "wireguard", "zerotier", "tailscale",
-            "wi-fi direct", "bluetooth",
-        ];
-        let l = s.to_lowercase();
-        KW.iter().any(|k| l.contains(k))
+    // Filter 1: known virtual adapters out.
+    let mut real: Vec<(String, Ipv4Addr)> = Vec::new();
+    let mut dropped_virtual: Vec<String> = Vec::new();
+    for (name, v4) in &cands {
+        let desc = facts.get(name).map(|(d, _)| d.as_str()).unwrap_or("");
+        if virtual_adapter(name) || virtual_adapter(desc) {
+            dropped_virtual.push(format!("{name} {v4}"));
+        } else {
+            real.push((name.clone(), *v4));
+        }
     }
 
-    let mut scored: Vec<(i32, [u8; 4], String, String)> = Vec::new();
-    for (name, v4) in cands {
-        let mut score = 0;
-        let mut why = String::from("no gateway info");
-        if let Some((desc, gw)) = facts.get(&name) {
-            match gw
-                .as_deref()
+    // Filter 2: gateway reachability, probed with the candidate's own
+    // address as source so the answer is per-interface, not whatever the
+    // default route happens to pick. No gateway configured -> cannot probe,
+    // kept last instead of dropped.
+    let probes: Vec<(Ipv4Addr, Ipv4Addr)> = real
+        .iter()
+        .filter_map(|(name, v4)| {
+            facts
+                .get(name)
+                .and_then(|(_, gw)| gw.as_deref())
                 .and_then(|g| g.parse::<Ipv4Addr>().ok())
-            {
-                Some(g) if g.octets()[..3] == v4.octets()[..3] => {
-                    score += 4;
-                    why = format!("gateway {g} in same subnet");
-                }
-                Some(g) => {
-                    score += 2;
-                    why = format!("gateway {g} elsewhere");
-                }
-                None => why = "no default gateway".to_string(),
-            }
-            if virtual_adapter(&name) {
-                score -= 3;
-                why.push_str(", virtual name");
-            }
-            if virtual_adapter(desc) {
-                score -= 3;
-                why.push_str(", virtual description");
-            }
-        }
-        scored.push((score, v4.octets(), v4.to_string(), why));
-    }
-    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+                .map(|g| (*v4, g))
+        })
+        .collect();
+    let probed = probe_gateways(&probes);
 
-    // Log the decision only when the winner changes, to keep the log quiet
-    // while /info is polled every few seconds.
-    let best = scored[0].2.clone();
-    {
-        let mut last = LAST_CHOSEN_IP.lock().unwrap();
-        if *last != best {
-            let detail = scored
-                .iter()
-                .map(|(s, _, ip, why)| format!("{ip}({s:+}, {why})"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            logf(&format!("LAN IP selection: using {best}; candidates: {detail}"));
-            *last = best;
+    let mut alive: Vec<Ipv4Addr> = Vec::new();
+    let mut unprobed: Vec<Ipv4Addr> = Vec::new();
+    let mut dead: Vec<String> = Vec::new();
+    for (name, v4) in real {
+        let gw = facts
+            .get(&name)
+            .and_then(|(_, gw)| gw.as_deref())
+            .and_then(|g| g.parse::<Ipv4Addr>().ok());
+        match gw {
+            Some(g) if probed.get(&(v4, g)) == Some(&true) => alive.push(v4),
+            Some(g) => dead.push(format!("{v4} (gateway {g} unreachable)")),
+            None => unprobed.push(v4),
         }
     }
-    scored.into_iter().map(|(_, _, ip, _)| ip).collect()
+    alive.sort_by_key(|v| v.octets());
+    unprobed.sort_by_key(|v| v.octets());
+    let mut ips: Vec<String> = alive
+        .iter()
+        .chain(&unprobed)
+        .map(ToString::to_string)
+        .collect();
+    if ips.is_empty() {
+        // Everything filtered away — probe false negative (ICMP blocked) or
+        // an all-virtual machine. Show the unfiltered list rather than a
+        // blank QR; /qr picks the first entry.
+        ips = fallback_order(&cands);
+    }
+
+    // Log whenever any bucket changes, not just the winner: a new virtual
+    // adapter appearing or a candidate flipping to dead is diagnostic noise
+    // worth one line, while steady-state polling stays silent.
+    let best = ips.first().cloned().unwrap_or_default();
+    let signature = format!("{best}|{alive:?}|{unprobed:?}|{dead:?}|{dropped_virtual:?}");
+    {
+        let mut last = LAST_DECISION.lock().unwrap();
+        if *last != signature {
+            let list = |v: &[Ipv4Addr]| {
+                v.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+            };
+            logf(&format!(
+                "LAN IP selection: using {best}; alive [{}]; no gateway [{}]; dead [{}]; virtual [{}]",
+                list(&alive),
+                list(&unprobed),
+                dead.join(", "),
+                dropped_virtual.join(", "),
+            ));
+            *last = signature;
+        }
+    }
+    ips
 }
 
-/// Adapter metadata used for ranking: interface name -> (description, default
-/// gateway if any). Gathered by one powershell call, cached 30s — /info is
-/// polled every few seconds and must not spawn a process each time.
+/// Private-range addresses only: loopback, link-local (169.254/16) and
+/// public addresses can never be reached from the phone's browser.
+fn is_private(v4: Ipv4Addr) -> bool {
+    match v4.octets() {
+        [10, ..] | [192, 168, ..] => true,
+        [172, b, ..] => (16..=31).contains(&b),
+        _ => false,
+    }
+}
+
+/// Filter-free ordering used when adapter facts are missing or everything
+/// was filtered away: the default-route IP first (if private), then the rest
+/// in numeric order.
+fn fallback_order(cands: &[(String, Ipv4Addr)]) -> Vec<String> {
+    let mut ips: Vec<String> = Vec::new();
+    if let Ok(IpAddr::V4(v4)) = local_ip_address::local_ip() {
+        if is_private(v4) {
+            ips.push(v4.to_string());
+        }
+    }
+    let mut sorted: Vec<Ipv4Addr> = cands.iter().map(|(_, v4)| *v4).collect();
+    sorted.sort_by_key(|v| v.octets());
+    for v4 in sorted {
+        let s = v4.to_string();
+        if !ips.contains(&s) {
+            ips.push(s);
+        }
+    }
+    ips
+}
+
+fn virtual_adapter(s: &str) -> bool {
+    const KW: &[&str] = &[
+        "tun", "tap", "vpn", "docker", "wsl", "vmware", "virtual", "hyper-v", "vethernet",
+        "loopback", "clash", "xray", "sing-box", "singbox", "wireguard", "zerotier", "tailscale",
+        "wi-fi direct", "bluetooth",
+    ];
+    let l = s.to_lowercase();
+    KW.iter().any(|k| l.contains(k))
+}
+
+/// Probe several (source address, gateway) pairs concurrently; each answer
+/// is cached for 60s because /info polls collect_ips every few seconds and
+/// a probe costs up to 1s of ping timeout.
+fn probe_gateways(
+    probes: &[(Ipv4Addr, Ipv4Addr)],
+) -> std::collections::HashMap<(Ipv4Addr, Ipv4Addr), bool> {
+    static CACHE: OnceLock<Mutex<(u64, std::collections::HashMap<(Ipv4Addr, Ipv4Addr), bool>)>> =
+        OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new((0, Default::default())));
+    let mut g = cache.lock().unwrap();
+    let now = now_unix();
+    if now.saturating_sub(g.0) >= 60 {
+        g.0 = now;
+        g.1.clear();
+    }
+    let missing: Vec<(Ipv4Addr, Ipv4Addr)> = probes
+        .iter()
+        .copied()
+        .filter(|p| !g.1.contains_key(p))
+        .collect();
+    if !missing.is_empty() {
+        let handles: Vec<_> = missing
+            .iter()
+            .map(|p| {
+                let p = *p;
+                std::thread::spawn(move || (p, gateway_reachable(p.0, p.1)))
+            })
+            .collect();
+        for h in handles {
+            if let Ok((p, ok)) = h.join() {
+                g.1.insert(p, ok);
+            }
+        }
+    }
+    probes
+        .iter()
+        .map(|p| (*p, g.1.get(p).copied().unwrap_or(false)))
+        .collect()
+}
+
+/// One ICMP echo to the gateway with the interface address pinned as source
+/// (`ping -S`), 1s cap. Exit code 0 means at least one reply came back.
+/// Each real probe (60s cache miss) logs target, verdict and latency.
+#[cfg(windows)]
+fn gateway_reachable(src: Ipv4Addr, gw: Ipv4Addr) -> bool {
+    use std::os::windows::process::CommandExt;
+    use std::process::Command;
+    use std::time::Instant;
+    let started = Instant::now();
+    let ok = Command::new("ping")
+        .args(["-n", "1", "-w", "1000", "-S", &src.to_string(), &gw.to_string()])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    logf(&format!(
+        "gateway probe from {src} to {gw}: {} in {}ms",
+        if ok { "alive" } else { "no reply" },
+        started.elapsed().as_millis()
+    ));
+    ok
+}
+
+/// Never called: adapter facts are empty off-Windows, so collect_ips returns
+/// before probing. Kept only so the crate compiles on other platforms.
+#[cfg(not(windows))]
+fn gateway_reachable(_src: Ipv4Addr, _gw: Ipv4Addr) -> bool {
+    false
+}
+
+/// Adapter metadata used for filtering: interface name -> (description,
+/// default gateway if any). Gathered by one powershell call, cached 30s —
+/// /info is polled every few seconds and must not spawn a process each time.
 #[cfg(windows)]
 type AdapterFacts = std::collections::HashMap<String, (String, Option<String>)>;
 
@@ -900,7 +1009,7 @@ type AdapterFacts = std::collections::HashMap<String, (String, Option<String>)>;
 type AdapterFacts = std::collections::HashMap<String, (String, Option<String>)>;
 
 static ADAPTER_FACTS: OnceLock<Mutex<(u64, AdapterFacts)>> = OnceLock::new();
-static LAST_CHOSEN_IP: Mutex<String> = Mutex::new(String::new());
+static LAST_DECISION: Mutex<String> = Mutex::new(String::new());
 
 fn adapter_facts() -> AdapterFacts {
     let cache = ADAPTER_FACTS.get_or_init(|| Mutex::new((0, Default::default())));
@@ -952,3 +1061,4 @@ fn gather_adapter_facts() -> AdapterFacts {
 fn gather_adapter_facts() -> AdapterFacts {
     AdapterFacts::new()
 }
+

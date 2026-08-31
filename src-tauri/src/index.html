@@ -340,7 +340,7 @@
     <div class="g-title" id="gateTitle">Scan to start</div>
     <img id="gateQr" src="/qr" alt="QR code">
     <div><button id="gateUrl" title="Click to copy the address">…</button></div>
-    <div class="g-desc" id="gateDesc">Scan with your phone camera, or type the address in your phone's browser. This screen stays until a device connects.</div>
+    <div class="g-desc" id="gateDesc">Scan the QR code with any app, or type the address into your phone's browser. This screen stays until a device connects.</div>
   </div>
 </div>
 
@@ -505,16 +505,24 @@ document.addEventListener('scroll', hideCtxMenu, true);
 
 let lastList = ''; // snapshot of the last rendered list; skip re-rendering when
                    // unchanged (polling does not interrupt scrolling)
+let pollFailures = 0;
 async function refresh(){
   try {
     const r = await fetch('/list');
     const items = await r.json();
+    pollFailures = 0;
+    setOffline(false);
     const key = JSON.stringify(items);
     if(key === lastList) return;
     lastList = key;
     render(items);
-  } catch { /* silent on disconnect/timeout; offline state is handled by
-               setOffline in the SSE/poll paths */ }
+  } catch {
+    // A network death is silent: SSE is idle server-push, so a vanished peer
+    // produces no error event until the OS times the dead TCP out (minutes).
+    // This poll is the only reliable liveness signal — two consecutive
+    // failures (~8s) matches the PC-side offline window.
+    if(++pollFailures >= 2) setOffline(true);
+  }
 }
 function render(items){
   const chat = $('chat');
