@@ -27,6 +27,10 @@ use crate::catalog;
 use crate::logger::logf;
 use tauri::Manager;
 
+/// The app logo, embedded so the frontend can show it (header brand, connect
+/// gate, favicon) without shipping a separate file next to the exe.
+static LOGO: &[u8] = include_bytes!("logo.svg");
+
 /// Preferred port; when taken, fall forward within the same range, and as a
 /// last resort fall back to a kernel-assigned free port.
 const PORT: u16 = 8765;
@@ -216,6 +220,7 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 .route("/open", post(open_file))
                 .route("/rm", post(remove))
                 .route("/qr", get(qr))
+                .route("/logo", get(logo))
                 .route("/open-dir", post(open_dir))
                 .route("/reveal", post(reveal))
                 .route("/events", get(events))
@@ -769,6 +774,17 @@ async fn qr() -> impl IntoResponse {
         StatusCode::OK,
         [(header::CONTENT_TYPE, "image/png")],
         buf.into_inner(),
+    )
+        .into_response()
+}
+
+/// Return the embedded app logo (header brand, connect gate emblem and
+/// favicon). Served as SVG, which stays crisp at any size.
+async fn logo() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "image/svg+xml")],
+        LOGO.to_vec(),
     )
         .into_response()
 }

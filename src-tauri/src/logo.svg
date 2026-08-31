@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%" id="tinbox">
+  <defs>
+    <!-- 锡金属主体渐变（柔和丝光锡白与铅灰光泽） -->
+    <linearGradient id="tinSurface" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#98a2b0"/>
+      <stop offset="18%" stop-color="#cfd7e3"/>
+      <stop offset="35%" stop-color="#ffffff"/>
+      <stop offset="52%" stop-color="#b0b9c6"/>
+      <stop offset="72%" stop-color="#e8edf4"/>
+      <stop offset="88%" stop-color="#9aa4b2"/>
+      <stop offset="100%" stop-color="#697484"/>
+    </linearGradient>
+
+    <!-- 锡盒边缘冲压卷边高光（Rolled Rim） -->
+    <linearGradient id="tinRim" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.9"/>
+      <stop offset="60%" stop-color="#b0b9c6" stop-opacity="0.5"/>
+      <stop offset="100%" stop-color="#475569" stop-opacity="0.8"/>
+    </linearGradient>
+
+    <!-- 哑光漫反射柔光层 -->
+    <linearGradient id="satinSheen" x1="100%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.35"/>
+      <stop offset="50%" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#334155" stop-opacity="0.2"/>
+    </linearGradient>
+
+    <!-- 顶部锡盒金属标签（经典复古马口铁漆印深蓝/深钢色） -->
+    <linearGradient id="tinTag" x1="0%" y1="0%" x2="100%" y2="50%">
+      <stop offset="0%" stop-color="#1e293b"/>
+      <stop offset="25%" stop-color="#3b485d"/>
+      <stop offset="50%" stop-color="#64748b"/>
+      <stop offset="75%" stop-color="#2d3748"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+
+    <!-- 冲压凹槽内阴影渐变（增强压印立体感） -->
+    <linearGradient id="embossDepth" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#4b5563"/>
+      <stop offset="100%" stop-color="#8c97a8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 1. 盒子底部投影 -->
+  <path d="M460.3,489.4H51.6c-13.8,0-24.9-11.2-24.9-24.9V55.7c0-13.8,11.2-24.9,24.9-24.9h408.8c13.8,0,24.9,11.2,24.9,24.9v408.8C485.3,478.2,474.1,489.4,460.3,489.4z" fill="#000000" opacity="0.18"/>
+
+  <!-- 2. 锡盒主体（带卷边描边） -->
+  <path fill="url(#tinSurface)" stroke="url(#tinRim)" stroke-width="2.5" d="M460.3,485.4H51.6c-13.8,0-24.9-11.2-24.9-24.9V51.7c0-13.8,11.2-24.9,24.9-24.9h408.8 c13.8,0,24.9,11.2,24.9,24.9v408.8C485.3,474.2,474.1,485.4,460.3,485.4z"/>
+
+  <!-- 3. 表面丝光漫反射层 -->
+  <path fill="url(#satinSheen)" d="M460.3,485.4H51.6c-13.8,0-24.9-11.2-24.9-24.9V51.7c0-13.8,11.2-24.9,24.9-24.9h408.8 c13.8,0,24.9,11.2,24.9,24.9v408.8C485.3,474.2,474.1,485.4,460.3,485.4z"/>
+
+  <!-- 4. 顶部金属标签（带微投影与倒角） -->
+  <polygon points="314 202 255.9 164 197.8 202 197.8 26.6 314 26.6" fill="#000000" opacity="0.15"/>
+  <polygon fill="url(#tinTag)" stroke="#1e293b" stroke-width="1.2" points="312 200.9 255.9 163.9 199.8 200.9 199.8 26.6 312 26.6"/>
+  <!-- 标签内边缘高光 -->
+  <polygon fill="none" stroke="#94a3b8" stroke-width="1" stroke-opacity="0.5" points="309 195 255.9 160 202.8 195 202.8 28.6 309 28.6"/>
+
+  <!-- 5. 底部冲压条纹（Embossed 压痕效果：下高光 + 上暗槽） -->
+  <!-- 5.1 底部下边缘反光线（冲压凸出边缘） -->
+  <path fill="none" stroke="#ffffff" stroke-width="2" stroke-linecap="round" opacity="0.75" d="M85.2 386.4h101.9 M85.2 433.3h46.3"/>
+  <!-- 5.2 冲压槽主体 -->
+  <path fill="url(#embossDepth)" d="M187.1 384.4H85.2c-7.1 0-12.8-5.7-12.8-12.8l0 0c0-7.1 5.7-12.8 12.8-12.8h101.9c7.1 0 12.8 5.7 12.8 12.8l0 0C199.8 378.7 194.1 384.4 187.1 384.4zM131.5 431.3H85.2c-7.1 0-12.8-5.7-12.8-12.8l0 0c0-7.1 5.7-12.8 12.8-12.8h46.3c7.1 0 12.8 5.7 12.8 12.8l0 0C144.1 425.6 138.5 431.3 131.5 431.3z"/>
+  <!-- 5.3 顶部内凹阴影线（凹陷深部） -->
+  <path fill="none" stroke="#1f2937" stroke-width="1.2" stroke-linecap="round" opacity="0.6" d="M85.2 359.8h101.9 M85.2 406.7h46.3"/>
+</svg>

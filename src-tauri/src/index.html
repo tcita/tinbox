@@ -6,349 +6,586 @@
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="tinbox">
+<link rel="icon" href="/logo" type="image/svg+xml">
 <title>tinbox</title>
 <style>
   :root {
     color-scheme: light dark;
-    --bg: #f5f5f7;
+    --bg: #f2f2f7;
+    --bg-chat: #f8f9fb;
     --card: #ffffff;
+    --card-subtle: #f8f9fa;
     --text: #1d1d1f;
     --sub: #86868b;
-    --line: #d2d2d7;
-    --accent: #0a84ff;
-    --bubble-me: #0a84ff;
-    --bubble-them: #e9e9eb;
+    --line: rgba(0, 0, 0, 0.08);
+    --line-strong: rgba(0, 0, 0, 0.14);
+    --accent: #0071e3;
+    --accent-hover: #0077ed;
+    --accent-bg: rgba(0, 113, 227, 0.1);
+    --bubble-me: #0071e3;
+    --bubble-me-text: #ffffff;
+    --bubble-them: #ffffff;
     --bubble-them-text: #1d1d1f;
+    --bubble-them-border: rgba(0, 0, 0, 0.06);
+    --bubble-them-shadow: 0 1px 4px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.02);
     --danger: #ff3b30;
+    --danger-bg: rgba(255, 59, 48, 0.1);
     --ok: #34c759;
-    --radius: 14px;
-  }
-  @media (prefers-color-scheme: dark) {
-    --bg: #000000;
-    --card: #1c1c1e;
-    --text: #f5f5f7;
-    --sub: #98989d;
-    --line: #38383a;
-    --bubble-them: #2c2c2e;
-    --bubble-them-text: #f5f5f7;
-  }
-  * { box-sizing: border-box; }
-  html, body { height: 100%; margin: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-    background: var(--bg); color: var(--text);
-    -webkit-font-smoothing: antialiased;
-    display: flex; flex-direction: column; height: 100vh; height: 100dvh;
-    overflow: hidden;
+    --ok-glow: rgba(52, 199, 89, 0.4);
+    --glass-bg: rgba(255, 255, 255, 0.82);
+    --glass-border: rgba(255, 255, 255, 0.6);
+    --radius-lg: 20px;
+    --radius-md: 14px;
+    --radius-sm: 8px;
+    --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+    --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
   }
 
-  /* Header: title + QR code */
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000;
+      --bg-chat: #09090b;
+      --card: #1c1c1e;
+      --card-subtle: #242426;
+      --text: #f5f5f7;
+      --sub: #8e8e93;
+      --line: rgba(255, 255, 255, 0.1);
+      --line-strong: rgba(255, 255, 255, 0.18);
+      --accent: #0a84ff;
+      --accent-hover: #409cff;
+      --accent-bg: rgba(10, 132, 255, 0.15);
+      --bubble-me: #0a84ff;
+      --bubble-me-text: #ffffff;
+      --bubble-them: #1c1c1e;
+      --bubble-them-text: #f5f5f7;
+      --bubble-them-border: rgba(255, 255, 255, 0.08);
+      --bubble-them-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+      --glass-bg: rgba(28, 28, 30, 0.82);
+      --glass-border: rgba(255, 255, 255, 0.12);
+    }
+  }
+
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", Roboto, system-ui, sans-serif;
+    background: var(--bg-chat); color: var(--text);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    display: flex; flex-direction: column; height: 100vh; height: 100dvh;
+    overflow: hidden; user-select: none;
+  }
+
+  /* Header */
   .head {
-    display: flex; align-items: center; gap: 14px;
-    padding: 10px 16px; flex: none;
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: calc(8px + env(safe-area-inset-top, 0px)) 16px 10px;
+    flex: none; z-index: 20;
+    background: var(--glass-bg);
+    backdrop-filter: blur(24px) saturate(180%);
+    -webkit-backdrop-filter: blur(24px) saturate(180%);
     border-bottom: 1px solid var(--line);
-    background: var(--bg);
   }
-  h1 { font-size: 17px; font-weight: 600; margin: 0; flex: 1; letter-spacing: -0.3px; }
+  .brand {
+    display: flex; align-items: center; gap: 8px; font-size: 17px; font-weight: 700;
+    letter-spacing: -0.4px; color: var(--text);
+  }
+  .brand-icon {
+    width: 24px; height: 24px; display: flex; align-items: center; justify-content: center;
+  }
+  .brand-icon img { width: 20px; height: 20px; display: block; }
+  .head-center { display: flex; align-items: center; gap: 8px; flex: 1; margin-left: 4px; }
+  
   .badge {
-    font-size: 11px; font-weight: 500; color: var(--sub);
-    padding: 4px 9px; border: 1px solid var(--line); border-radius: 999px; flex: none;
-    display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+    font-size: 11.5px; font-weight: 500; color: var(--sub);
+    padding: 3.5px 9px; border-radius: 999px; background: color-mix(in srgb, var(--card) 60%, transparent);
+    border: 1px solid var(--line);
+    display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
+    transition: all 0.3s var(--ease-out);
   }
-  #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--ok); flex: none; }
-  .badge.off #dot { background: var(--danger); }
-  /* PC badge: gray dot when no mobile device is online (turns green when one is) */
-  .badge.wait #dot { background: var(--sub); }
-  /* QR + its address: the URL below the code lets the user verify what the
-     phone should open, or type it manually when scanning fails */
+  #dot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none;
+    box-shadow: 0 0 0 0 var(--ok-glow);
+    animation: pulse 2s infinite;
+  }
+  @keyframes pulse {
+    0% { box-shadow: 0 0 0 0 var(--ok-glow); }
+    70% { box-shadow: 0 0 0 5px rgba(52, 199, 89, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(52, 199, 89, 0); }
+  }
+  .badge.off #dot { background: var(--danger); animation: none; box-shadow: none; }
+  .badge.wait #dot { background: var(--sub); animation: none; box-shadow: none; }
+
+  .head-actions { display: flex; align-items: center; gap: 10px; }
+
+  #inboxBtn {
+    border: 1px solid var(--line); background: var(--card); color: var(--text);
+    width: 32px; height: 32px; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center;
+    cursor: pointer; transition: all 0.2s var(--ease-out);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+  }
+  #inboxBtn:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
+  #inboxBtn:active { transform: scale(0.95); }
+  @media (pointer: coarse) { #inboxBtn { display: none; } }
+
   #qrBox {
-    display: flex; flex-direction: column; align-items: center; gap: 4px; flex: none;
+    display: flex; align-items: center;
+    background: var(--card); border: 1px solid var(--line);
+    padding: 3px; border-radius: 10px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+    transition: all 0.2s var(--ease-out);
   }
+  #qrBox:hover { border-color: var(--accent); cursor: pointer; }
+  #qrBox:active { transform: scale(0.95); }
   #qr {
-    width: 104px; height: 104px; border-radius: 10px; background: #fff;
-    padding: 4px; box-shadow: 0 1px 4px rgba(0,0,0,.08);
+    width: 28px; height: 28px; border-radius: 6px; background: #fff;
+    padding: 2px; display: block; cursor: pointer;
+  }
+  .addrbar {
+    flex: none; padding: 3px 16px;
+    border-bottom: 1px solid var(--line);
+    text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   }
   #qrUrl {
-    font-size: 10.5px; font-weight: 500; color: var(--sub); cursor: pointer;
-    max-width: 136px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    font-size: 11px; font-weight: 500; color: var(--sub);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   }
-  #qrUrl:hover { color: var(--accent); }
-  @media (prefers-color-scheme: dark) { #qr { box-shadow: 0 2px 8px rgba(0,0,0,.4); } }
-  @media (pointer: coarse) { #qrBox { display: none; } }
+  @media (pointer: coarse) { #qrBox { display: none; } .addrbar { display: none; } }
 
-  /* Inbox shortcut (PC only): opens the inbox folder so the user can manage
-     received files themselves */
-  #inboxBtn {
-    border: 1px solid var(--line); background: transparent; color: var(--text);
-    font-size: 15px; line-height: 1; padding: 7px 10px; border-radius: 9px;
-    cursor: pointer; flex: none;
+  /* QR lightbox: click the small header QR to enlarge it for scanning */
+  #qrLightbox {
+    position: fixed; inset: 0; z-index: 700;
+    background: rgba(0,0,0,0.5);
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    display: none; align-items: center; justify-content: center;
+    padding: 20px;
   }
-  #inboxBtn:active { background: color-mix(in srgb, var(--accent) 12%, transparent); }
-  @media (pointer: coarse) { #inboxBtn { display: none; } }
-  /* Phone: QR code hidden; the connection-status badge stays so the phone can
-     see it too */
-  @media (pointer: coarse) { #qr { display: none; } }
+  #qrLightbox.show { display: flex; }
+  .ql-card {
+    background: var(--card); border-radius: 24px; padding: 24px;
+    text-align: center; max-width: 92vw;
+    border: 1px solid var(--line);
+    box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+    animation: zoomIn 0.25s var(--ease-spring);
+  }
+  .ql-title { font-size: 15px; font-weight: 600; margin: 0 0 14px; letter-spacing: -0.3px; }
+  .ql-qr {
+    width: 260px; height: 260px; max-width: 68vw; max-height: 68vw;
+    background: #fff; border-radius: 14px; padding: 12px; display: block;
+    margin: 0 auto;
+  }
+  .ql-url {
+    margin-top: 14px; font-size: 12.5px; font-weight: 600; color: var(--accent);
+    background: var(--accent-bg); border: none; border-radius: 10px;
+    padding: 8px 14px; max-width: 100%;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  }
+  .ql-hint { font-size: 11.5px; color: var(--sub); margin-top: 10px; }
 
-  /* Disconnect banner: shown on the phone page once the PC side (server) is
-     closed */
+  /* Disconnect banner */
   #offBanner {
-    flex: none; display: none;
-    padding: 7px 16px; font-size: 12px; text-align: center;
-    background: #b3261e; color: #fff;
+    flex: none; display: none; padding: 8px 16px; font-size: 12px; font-weight: 500;
+    text-align: center; background: #d93829; color: #ffffff;
+    box-shadow: 0 2px 8px rgba(217, 56, 41, 0.25);
+    animation: slideDown 0.3s var(--ease-out);
   }
   #offBanner.show { display: block; }
+  @keyframes slideDown { from { transform: translateY(-100%); } to { transform: translateY(0); } }
 
-  /* Chat area */
+  /* Chat Area */
   #chat {
-    flex: 1; overflow-y: auto; padding: 16px 12px 8px;
-    display: flex; flex-direction: column; gap: 10px;
+    flex: 1; overflow-y: overlay; overflow-x: hidden;
+    padding: 16px 16px 12px;
+    display: flex; flex-direction: column; gap: 14px;
+    scroll-behavior: smooth;
   }
-  .msg { display: flex; gap: 8px; align-items: flex-end; animation: in .22s ease; }
-  @keyframes in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  #chat::-webkit-scrollbar { width: 5px; }
+  #chat::-webkit-scrollbar-thumb { background: transparent; border-radius: 10px; }
+  #chat:hover::-webkit-scrollbar-thumb { background: var(--line-strong); }
+
+  .msg {
+    display: flex; gap: 10px; align-items: flex-end;
+    animation: msgIn 0.28s var(--ease-spring) forwards;
+    max-width: 100%;
+  }
+  @keyframes msgIn {
+    from { opacity: 0; transform: translateY(10px) scale(0.97); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
+  }
   .msg.me { flex-direction: row-reverse; }
+
   .avatar {
     width: 30px; height: 30px; flex: none; border-radius: 50%;
     display: flex; align-items: center; justify-content: center;
-    font-size: 16px; background: var(--card); border: 1px solid var(--line);
+    background: var(--card); border: 1px solid var(--line);
+    color: var(--sub); box-shadow: 0 1px 3px rgba(0,0,0,0.03);
+    margin-bottom: 2px;
   }
+  .msg.me .avatar {
+    background: var(--accent-bg); border-color: transparent; color: var(--accent);
+  }
+
+  .bubble-container {
+    max-width: 72%; display: flex; flex-direction: column;
+  }
+  @media (max-width: 600px) { .bubble-container { max-width: 84%; } }
+
   .bubble {
-    max-width: 78%; padding: 9px 12px; border-radius: 16px;
-    font-size: 15px; line-height: 1.4; word-break: break-word;
-    position: relative;
+    padding: 10px 14px; border-radius: 18px;
+    font-size: 14.5px; line-height: 1.45; word-break: break-word;
+    position: relative; transition: opacity 0.15s ease, transform 0.15s ease;
   }
-  .msg.me .bubble { background: var(--bubble-me); color: #fff; border-bottom-right-radius: 4px; }
-  .msg.them .bubble { background: var(--bubble-them); color: var(--bubble-them-text); border-bottom-left-radius: 4px; }
+  .msg.me .bubble {
+    background: var(--bubble-me); color: var(--bubble-me-text);
+    border-bottom-right-radius: 4px;
+    box-shadow: 0 2px 8px rgba(0, 113, 227, 0.22);
+  }
+  .msg.them .bubble {
+    background: var(--bubble-them); color: var(--bubble-them-text);
+    border-bottom-left-radius: 4px;
+    border: 1px solid var(--bubble-them-border);
+    box-shadow: var(--bubble-them-shadow);
+  }
+
   .bubble.text {
     white-space: pre-wrap; cursor: default;
-    user-select: none; -webkit-user-select: none; -webkit-touch-callout: none;
+    user-select: text; -webkit-user-select: text;
   }
-  .bubble.text:active { opacity: .7; }
+  .bubble.text:active { transform: scale(0.995); }
+
   .meta-line {
-    font-size: 10px; color: var(--sub); margin-top: 4px;
+    font-size: 10px; font-weight: 500; color: var(--sub);
+    margin-top: 4px; padding: 0 4px;
     display: flex; align-items: center; gap: 6px;
   }
   .msg.me .meta-line { justify-content: flex-end; }
 
-  /* File card (inside a bubble) */
-  .file-card { display: flex; align-items: center; gap: 10px; min-width: 180px; cursor: pointer; }
-  .file-card:active { opacity: .7; }
+  /* File Card */
+  .file-card {
+    display: flex; align-items: center; gap: 11px; min-width: 210px; cursor: pointer;
+    border-radius: 12px; transition: transform 0.15s ease;
+  }
+  .file-card:active { transform: scale(0.98); }
   .fc-ico {
-    width: 36px; height: 36px; flex: none; border-radius: 9px;
-    display: flex; align-items: center; justify-content: center; font-size: 19px;
-    background: color-mix(in srgb, var(--accent) 14%, transparent);
+    width: 40px; height: 40px; flex: none; border-radius: 10px;
+    display: flex; align-items: center; justify-content: center; font-size: 17px;
+    background: var(--accent-bg); color: var(--accent);
   }
-  .msg.me .fc-ico { background: rgba(255,255,255,.22); }
-  .fc-info { min-width: 0; }
+  .msg.me .fc-ico {
+    background: rgba(255, 255, 255, 0.2); color: #fff;
+  }
+  .fc-info { min-width: 0; flex: 1; }
   .fc-name {
-    font-size: 14px; font-weight: 500; overflow: hidden;
-    text-overflow: ellipsis; white-space: nowrap; max-width: 160px;
+    font-size: 13.5px; font-weight: 600; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; max-width: 170px;
   }
-  .fc-size { font-size: 11px; opacity: .75; margin-top: 2px; }
+  .fc-size { font-size: 11px; opacity: 0.72; margin-top: 2px; font-weight: 400; }
 
-  /* Image/video preview: inline-rendered original capped in height; video uses
-     preload=metadata so only the first frame is fetched, not the whole file */
   .file-card.has-preview {
-    flex-direction: column; align-items: flex-start; gap: 8px; min-width: 200px;
+    flex-direction: column; align-items: flex-start; gap: 10px; min-width: 220px;
   }
   .file-card.has-preview img,
   .file-card.has-preview video {
-    display: block; width: 100%; max-height: 220px; object-fit: cover;
-    border-radius: 10px; background: #000; pointer-events: none;
+    display: block; width: 100%; max-height: 240px; object-fit: cover;
+    border-radius: 12px; background: rgba(0,0,0,0.06);
   }
   .msg.me .file-card.has-preview img,
-  .msg.me .file-card.has-preview video { background: rgba(255,255,255,.14); }
+  .msg.me .file-card.has-preview video { background: rgba(255, 255, 255, 0.15); }
   .file-card.has-preview .fc-info { width: 100%; }
   .file-card.has-preview .fc-name { max-width: none; }
 
-  /* Download progress: bar inside the bubble */
-  .dltrack {
-    height: 3px; background: rgba(0,0,0,.12); border-radius: 999px; overflow: hidden; margin-top: 6px;
-  }
-  .msg.me .dltrack { background: rgba(255,255,255,.25); }
-  .dlfill { height: 100%; width: 0; background: #fff; border-radius: 999px; transition: width .15s ease; }
-  .msg.them .dlfill { background: var(--accent); }
+  /* Download Progress */
+  .dlrow { margin-top: 8px; }
   .dlrow.hidden { display: none; }
-  .dltext { font-size: 10px; opacity: .8; margin-top: 4px; display: flex; justify-content: space-between; }
+  .dltrack {
+    height: 4px; background: rgba(0,0,0,0.08); border-radius: 999px; overflow: hidden;
+  }
+  .msg.me .dltrack { background: rgba(255,255,255,0.25); }
+  .dlfill { height: 100%; width: 0%; background: var(--accent); border-radius: 999px; transition: width 0.15s ease-out; }
+  .msg.me .dlfill { background: #fff; }
+  .dltext {
+    font-size: 10.5px; opacity: 0.8; margin-top: 4px;
+    display: flex; justify-content: space-between; font-variant-numeric: tabular-nums;
+  }
 
   /* Empty state */
   .empty {
-    text-align: center; color: var(--sub); padding: 48px 16px; font-size: 14px;
-    margin: auto;
+    text-align: center; color: var(--sub); padding: 60px 20px;
+    margin: auto; max-width: 280px; display: flex; flex-direction: column; align-items: center;
   }
-  .empty .e-icon { font-size: 40px; opacity: .35; margin-bottom: 12px; }
+  .empty .e-icon {
+    width: 64px; height: 64px; border-radius: 20px; background: var(--card);
+    border: 1px solid var(--line); color: var(--sub);
+    display: flex; align-items: center; justify-content: center;
+    margin-bottom: 16px; box-shadow: 0 4px 12px rgba(0,0,0,0.03);
+  }
+  .empty .e-title { font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+  .empty .e-desc { font-size: 12.5px; line-height: 1.5; color: var(--sub); }
+
+  input[type="file"] { display: none; }
 
   /* Bottom composer */
   .composer {
     flex: none; display: flex; align-items: flex-end; gap: 8px;
-    padding: 8px 10px 10px; border-top: 1px solid var(--line); background: var(--bg);
+    padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px));
+    background: var(--glass-bg);
+    backdrop-filter: blur(24px) saturate(180%);
+    -webkit-backdrop-filter: blur(24px) saturate(180%);
+    border-top: 1px solid var(--line);
+    position: relative; z-index: 20;
   }
   .plus-btn {
-    flex: none; width: 36px; height: 36px; border-radius: 50%;
-    border: 0; background: var(--card); color: var(--text); font-size: 20px;
+    flex: none; width: 38px; height: 38px; border-radius: 50%;
+    border: 1px solid var(--line); background: var(--card); color: var(--text);
     cursor: pointer; display: flex; align-items: center; justify-content: center;
-    border: 1px solid var(--line); transition: background .15s;
+    transition: all 0.2s var(--ease-out); box-shadow: 0 1px 3px rgba(0,0,0,0.04);
   }
-  .plus-btn:active { background: color-mix(in srgb, var(--accent) 12%, var(--card)); }
+  .plus-btn:hover { border-color: var(--accent); color: var(--accent); transform: scale(1.04); }
+  .plus-btn:active { transform: scale(0.94); background: var(--accent-bg); }
+
+  .input-wrap {
+    flex: 1; position: relative; display: flex; align-items: center;
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 20px; padding: 2px 4px 2px 14px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.02) inset;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .input-wrap:focus-within {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-bg);
+  }
   #txt {
-    flex: 1; resize: none; max-height: 96px; min-height: 36px;
-    border: 1px solid var(--line); border-radius: 18px; padding: 8px 14px;
-    font-size: 15px; font-family: inherit; background: var(--card); color: var(--text);
-    line-height: 1.4;
+    flex: 1; resize: none; max-height: 100px; min-height: 34px; height: 34px;
+    border: none; outline: none; padding: 7px 0;
+    font-size: 14.5px; font-family: inherit; background: transparent; color: var(--text);
+    line-height: 1.4; user-select: text;
   }
-  #txt:focus { outline: none; border-color: var(--accent); }
+
   .send-btn {
-    flex: none; width: 36px; height: 36px; border-radius: 50%; border: 0;
-    background: var(--accent); color: #fff; font-size: 16px; cursor: pointer;
-    display: flex; align-items: center; justify-content: center; transition: opacity .15s;
+    flex: none; width: 32px; height: 32px; border-radius: 50%; border: none;
+    background: var(--accent); color: #fff; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    transition: all 0.2s var(--ease-out);
   }
-  .send-btn:disabled { opacity: .35; }
-  .send-btn:active { transform: scale(.94); }
+  .send-btn:disabled { opacity: 0.25; cursor: not-allowed; transform: none !important; }
+  .send-btn:hover:not(:disabled) { background: var(--accent-hover); transform: scale(1.05); }
+  .send-btn:active:not(:disabled) { transform: scale(0.92); }
+
+  /* Drag overlay */
+  #dragOverlay {
+    position: fixed; inset: 0; z-index: 500;
+    background: rgba(0, 113, 227, 0.15);
+    backdrop-filter: blur(12px);
+    border: 3px dashed var(--accent);
+    display: none; align-items: center; justify-content: center;
+    pointer-events: none; opacity: 0; transition: opacity 0.2s ease;
+  }
+  #dragOverlay.active { display: flex; opacity: 1; }
+  .drag-card {
+    background: var(--card); padding: 24px 36px; border-radius: 20px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.15); text-align: center;
+    transform: scale(0.95); transition: transform 0.2s var(--ease-spring);
+  }
+  #dragOverlay.active .drag-card { transform: scale(1); }
+  .drag-title { font-size: 16px; font-weight: 600; margin-top: 8px; }
 
   /* Toast */
   .toast {
-    position: fixed; bottom: 72px; left: 50%; transform: translateX(-50%) translateY(20px);
-    background: var(--text); color: var(--bg); padding: 10px 20px; border-radius: 10px;
-    font-size: 13px; font-weight: 500; opacity: 0;
-    transition: opacity .25s, transform .25s; pointer-events: none;
-    box-shadow: 0 8px 24px rgba(0,0,0,.2); z-index: 100; max-width: 80%; text-align: center;
+    position: fixed; top: 20px; left: 50%; transform: translateX(-50%) translateY(-20px) scale(0.95);
+    background: rgba(30, 30, 32, 0.9); color: #ffffff;
+    padding: 9px 18px; border-radius: 999px; font-size: 13px; font-weight: 500;
+    backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
+    box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+    opacity: 0; pointer-events: none; z-index: 600;
+    transition: all 0.3s var(--ease-spring);
+    display: flex; align-items: center; gap: 6px;
   }
-  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
 
-  /* Upload progress: bottom bar */
+  /* Upload progress top bar */
   .progress {
-    position: fixed; left: 0; bottom: 0; height: 2px; width: 0;
-    background: var(--accent); transition: width .2s; box-shadow: 0 0 8px var(--accent); z-index: 100;
+    position: fixed; top: 0; left: 0; height: 3px; width: 0%;
+    background: var(--accent); transition: width 0.2s ease-out;
+    box-shadow: 0 0 10px var(--accent); z-index: 999;
   }
 
-  input[type=file] { display: none; }
-
-  /* Connect gate (PC only): until a device is actually connected, the whole
-     UI is covered by a big QR code — the transfer screen is meaningless with
-     nobody on the other end. Sits below the firewall overlay (repair first),
-     above everything else. */
+  /* Connect Gate (PC Wait Screen) */
   #gate {
     position: fixed; inset: 0; z-index: 80; background: var(--bg);
-    display: none; align-items: center; justify-content: center;
+    display: none; align-items: center; justify-content: center; padding: 20px;
   }
   #gate.show { display: flex; }
-  .g-card { text-align: center; padding: 24px; max-width: 360px; }
-  .g-icon { font-size: 42px; }
-  .g-title { font-size: 18px; font-weight: 600; margin: 10px 0 20px; }
-  #gateQr {
-    width: 240px; height: 240px; background: #fff; border-radius: 18px;
-    padding: 12px; box-shadow: 0 6px 28px rgba(0,0,0,.14);
+  .g-card {
+    text-align: center; padding: 36px 32px 30px; max-width: 380px; width: 100%;
+    background: var(--card); border-radius: 28px;
+    border: 1px solid var(--line);
+    box-shadow: 0 16px 48px rgba(0,0,0,0.08);
+    animation: zoomIn 0.35s var(--ease-spring);
   }
-  @media (prefers-color-scheme: dark) { #gateQr { box-shadow: 0 6px 28px rgba(0,0,0,.5); } }
+  @keyframes zoomIn {
+    from { opacity: 0; transform: scale(0.92); }
+    to { opacity: 1; transform: scale(1); }
+  }
+  .g-radar {
+    width: 64px; height: 64px; display: flex; align-items: center; justify-content: center;
+    margin: 0 auto 12px;
+  }
+  .g-radar img { width: 64px; height: 64px; display: block; }
+  .g-title { font-size: 20px; font-weight: 700; margin: 0 0 6px; letter-spacing: -0.4px; }
+  .g-desc { font-size: 13px; color: var(--sub); line-height: 1.5; margin: 0 0 20px; }
+  
+  .qr-frame {
+    background: #ffffff; padding: 12px; border-radius: 18px; display: inline-block;
+    box-shadow: 0 4px 20px rgba(0,0,0,0.06); border: 1px solid rgba(0,0,0,0.04);
+  }
+  #gateQr { width: 190px; height: 190px; display: block; border-radius: 8px; }
+
   #gateUrl {
-    margin-top: 16px; font-size: 14px; font-weight: 600; color: var(--accent);
-    background: transparent; border: 1px dashed var(--line); border-radius: 10px;
-    padding: 9px 16px; cursor: pointer; max-width: 320px;
-    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    margin-top: 18px; font-size: 12.5px; font-weight: 600; color: var(--accent);
+    background: var(--accent-bg); border: none; border-radius: 10px;
+    padding: 8px 16px; max-width: 100%;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    display: inline-flex; align-items: center;
   }
-  #gateUrl:hover { border-color: var(--accent); }
-  .g-desc { font-size: 12px; color: var(--sub); margin-top: 14px; line-height: 1.6; }
   @media (pointer: coarse) { #gate { display: none !important; } }
 
-  /* Firewall repair overlay: covers the whole UI, forcing the user to handle
-     it (repair / quit) */
+  /* Modals (Firewall & Superseded) */
   .fw-overlay {
-    position: fixed; inset: 0; background: rgba(0,0,0,.55);
-    display: none; align-items: center; justify-content: center; z-index: 200;
-    backdrop-filter: blur(4px);
+    position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45);
+    display: none; align-items: center; justify-content: center; z-index: 300;
+    backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px);
+    padding: 20px;
   }
   .fw-overlay.show { display: flex; }
-
-  /* Superseded-page overlay: once a freshly scanned page takes over, older
-     tabs stop all traffic and show this instead */
-  #deadOverlay {
-    position: fixed; inset: 0; background: rgba(0,0,0,.55);
-    display: none; align-items: center; justify-content: center;
-    z-index: 300; backdrop-filter: blur(4px); padding: 24px;
-  }
-  #deadOverlay.show { display: flex; }
-  #deadOverlay .fw-card { max-width: 300px; }
-  #deadOverlay .fw-icon { font-size: 40px; margin-bottom: 10px; }
-  #deadOverlay .fw-title { font-size: 17px; font-weight: 600; margin-bottom: 6px; }
-  #deadOverlay .fw-desc { font-size: 13px; color: #ddd; line-height: 1.5; }
   .fw-card {
-    background: var(--card); border-radius: 18px; padding: 26px 24px 20px;
-    max-width: 340px; width: calc(100% - 48px); text-align: center;
-    box-shadow: 0 12px 40px rgba(0,0,0,.3);
+    background: var(--card); border-radius: 24px; padding: 28px 24px 22px;
+    max-width: 360px; width: 100%; text-align: center;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.25);
+    border: 1px solid var(--line);
+    animation: zoomIn 0.3s var(--ease-spring);
   }
-  .fw-icon { font-size: 40px; margin-bottom: 12px; }
-  .fw-title { font-size: 17px; font-weight: 600; margin: 0 0 8px; }
-  .fw-desc { font-size: 13px; color: var(--sub); line-height: 1.5; margin: 0 0 20px; }
+  .fw-icon {
+    width: 54px; height: 54px; border-radius: 16px; display: inline-flex;
+    align-items: center; justify-content: center; margin-bottom: 14px;
+    background: var(--accent-bg); color: var(--accent);
+  }
+  .fw-card.danger .fw-icon { background: var(--danger-bg); color: var(--danger); }
+  .fw-title { font-size: 17px; font-weight: 700; margin: 0 0 8px; letter-spacing: -0.3px; }
+  .fw-desc { font-size: 13px; color: var(--sub); line-height: 1.5; margin: 0 0 22px; }
   .fw-btns { display: flex; gap: 10px; }
   .fw-btn {
-    flex: 1; border: 0; border-radius: 12px; padding: 12px 0; font-size: 15px;
-    font-weight: 600; cursor: pointer; transition: opacity .15s, transform .1s;
+    flex: 1; border: 0; border-radius: 12px; padding: 11px 0; font-size: 14px;
+    font-weight: 600; cursor: pointer; transition: all 0.15s ease;
   }
-  .fw-btn:active { transform: scale(.97); }
+  .fw-btn:active { transform: scale(0.97); }
   .fw-btn.repair { background: var(--accent); color: #fff; }
-  .fw-btn.quit { background: color-mix(in srgb, var(--sub) 20%, transparent); color: var(--text); }
-  .fw-btn:disabled { opacity: .5; pointer-events: none; }
-  .fw-hint { font-size: 11px; color: var(--sub); margin-top: 12px; }
+  .fw-btn.repair:hover { background: var(--accent-hover); }
+  .fw-btn.quit { background: var(--card-subtle); color: var(--text); border: 1px solid var(--line); }
+  .fw-btn.quit:hover { background: var(--line); }
+  .fw-btn:disabled { opacity: 0.5; pointer-events: none; }
+  .fw-hint { font-size: 11.5px; color: var(--sub); margin-top: 12px; line-height: 1.4; }
 
-  /* Context menu (text long-press / right-click: copy/delete) */
+  /* Context Menu */
   .ctx-menu {
-    position: fixed; display: none; z-index: 150;
-    background: var(--card); border: 1px solid var(--line); border-radius: 10px;
-    padding: 4px; box-shadow: 0 6px 20px rgba(0,0,0,.18); min-width: 120px;
+    position: fixed; display: none; z-index: 400;
+    background: var(--glass-bg);
+    backdrop-filter: blur(24px) saturate(180%);
+    -webkit-backdrop-filter: blur(24px) saturate(180%);
+    border: 1px solid var(--glass-border);
+    border-radius: 14px; padding: 5px; min-width: 140px;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.18);
+    transform-origin: top left;
+    animation: menuIn 0.15s var(--ease-spring);
   }
+  @keyframes menuIn { from { opacity: 0; transform: scale(0.9); } to { opacity: 1; transform: scale(1); } }
   .ctx-menu.show { display: block; }
   .ctx-menu button {
-    display: block; width: 100%; border: 0; background: transparent; color: var(--text);
-    cursor: pointer; padding: 9px 14px; border-radius: 7px; font-size: 14px; text-align: left;
+    display: flex; align-items: center; gap: 8px; width: 100%; border: none;
+    background: transparent; color: var(--text); cursor: pointer;
+    padding: 8px 12px; border-radius: 9px; font-size: 13.5px; font-weight: 500; text-align: left;
+    transition: background 0.12s ease;
   }
-  .ctx-menu button:active { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .ctx-menu button:hover { background: var(--accent-bg); color: var(--accent); }
+  .ctx-menu button:active { transform: scale(0.98); }
   .ctx-menu button.danger { color: var(--danger); }
+  .ctx-menu button.danger:hover { background: var(--danger-bg); color: var(--danger); }
 </style>
 </head>
 <body>
 
 <div class="head">
-  <h1>📁 tinbox</h1>
-  <span class="badge" id="badge"><i id="dot"></i><span id="badgeTxt">Connected</span></span>
-  <button id="inboxBtn" title="Open inbox folder">📥</button>
-  <div id="qrBox">
-    <img id="qr" src="/qr" alt="">
-    <span id="qrUrl" title="Click to copy the address">…</span>
+  <div class="brand">
+    <span class="brand-icon"><img src="/logo" alt="tinbox"></span>
+    <span>tinbox</span>
+  </div>
+  <div class="head-center">
+    <span class="badge" id="badge"><i id="dot"></i><span id="badgeTxt">Connected</span></span>
+  </div>
+  <div class="head-actions">
+    <button id="inboxBtn" title="Open inbox folder">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+    </button>
+    <div id="qrBox">
+      <img id="qr" src="/qr" alt="QR">
+    </div>
   </div>
 </div>
+
+<!-- Address strip: separate from the QR tile so the two don't crowd each
+     other; shows the address for manual entry when scanning fails -->
+<div class="addrbar" id="addrbar"><span id="qrUrl">…</span></div>
 
 <div id="offBanner">⚠️ Connection lost · Reconnecting…</div>
 
 <div id="chat">
   <div class="empty" id="empty">
-    <div class="e-icon">💬</div>
-    <div>No messages yet · Try sending a file or text</div>
+    <div class="e-icon">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m3 15 4-4 4 4"/><path d="m14 9 4-4 4 4"/><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/></svg>
+    </div>
+    <div class="e-title">Ready for transfer</div>
+    <div class="e-desc">Send text messages, photos or files seamlessly across devices.</div>
   </div>
 </div>
 
 <div class="composer">
-  <div style="position:relative">
-    <button class="plus-btn" id="plus" title="Select files">+</button>
+  <button class="plus-btn" id="plus" title="Select files">
+    <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+  </button>
+  <div class="input-wrap">
+    <textarea id="txt" rows="1" placeholder="Type a message…"></textarea>
+    <button class="send-btn" id="send" disabled title="Send">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+    </button>
   </div>
-  <textarea id="txt" rows="1" placeholder="Type a message…"></textarea>
-  <button class="send-btn" id="send" disabled>➤</button>
 </div>
 <input type="file" id="fileInput" multiple>
 
+<!-- Connect Gate (PC Only) -->
 <div id="gate">
   <div class="g-card">
-    <div class="g-icon">📱</div>
-    <div class="g-title" id="gateTitle">Scan to start</div>
-    <img id="gateQr" src="/qr" alt="QR code">
-    <div><button id="gateUrl" title="Click to copy the address">…</button></div>
-    <div class="g-desc" id="gateDesc">Scan the QR code with any app, or type the address into your phone's browser. This screen stays until a device connects.</div>
+    <div class="g-radar">
+      <img src="/logo" alt="tinbox">
+    </div>
+    <div class="g-title" id="gateTitle">Scan to connect</div>
+    <div class="g-desc" id="gateDesc">Make sure your phone is on the same Wi-Fi.</div>
+    <div class="qr-frame">
+      <img id="gateQr" src="/qr" alt="QR code">
+    </div>
+    <div>
+      <div id="gateUrl"><span>…</span></div>
+    </div>
   </div>
 </div>
 
+<!-- Firewall Overlay -->
 <div class="fw-overlay" id="fwOverlay">
   <div class="fw-card">
-    <div class="fw-icon">🛡️</div>
-    <div class="fw-title">Allow tinbox network access</div>
-    <div class="fw-desc">The phone can't reach this PC. Click "Allow" and confirm again in the UAC dialog to grant tinbox network access.</div>
+    <div class="fw-icon">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+    </div>
+    <div class="fw-title">Allow Network Access</div>
+    <div class="fw-desc">Mobile devices cannot reach this PC yet. Click "Allow" and grant permissions in the system prompt.</div>
     <div class="fw-btns">
       <button class="fw-btn quit" id="fwQuit">Quit</button>
       <button class="fw-btn repair" id="fwRepair">Allow</button>
@@ -357,30 +594,48 @@
   </div>
 </div>
 
-<div id="deadOverlay">
-  <div class="fw-card">
-    <div class="fw-icon">📡</div>
-    <div class="fw-title">tinbox opened in another tab</div>
-    <div class="fw-desc">This page was replaced by a newly scanned one and is no longer connected. You can close this tab.</div>
+<!-- Superseded Overlay -->
+<div class="fw-overlay" id="deadOverlay">
+  <div class="fw-card danger">
+    <div class="fw-icon">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
+    </div>
+    <div class="fw-title">Opened in another tab</div>
+    <div class="fw-desc">This session was superseded by a newly opened page. You can safely close this window.</div>
+  </div>
+</div>
+
+<!-- QR Lightbox (PC): enlarge the header QR for scanning -->
+<div id="qrLightbox">
+  <div class="ql-card">
+    <div class="ql-title">Scan to connect a device</div>
+    <img class="ql-qr" src="/qr" alt="QR code">
+    <div><div class="ql-url" id="qlUrl">…</div></div>
+    <div class="ql-hint">Click anywhere to close</div>
   </div>
 </div>
 
 <div class="ctx-menu" id="ctxMenu"></div>
-
 <div class="toast" id="toast"></div>
 <div class="progress" id="bar"></div>
+
+<div id="dragOverlay">
+  <div class="drag-card">
+    <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+    <div class="drag-title">Drop files to send immediately</div>
+  </div>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
 
-// Local identity: the PC window loads localhost, the phone loads the LAN IP.
 const isPC = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
 const me = isPC ? 'pc' : 'phone';
 let busy = false;
 
 function toast(msg){
   const t = $('toast'); t.textContent = msg; t.classList.add('show');
-  clearTimeout(t._t); t._t = setTimeout(()=>t.classList.remove('show'), 1600);
+  clearTimeout(t._t); t._t = setTimeout(()=>t.classList.remove('show'), 1800);
 }
 
 function fmtSize(n){
@@ -393,7 +648,7 @@ function fmtTime(unix){
   if(!unix) return '';
   const d = new Date(Number(unix)*1000);
   const p = n => String(n).padStart(2,'0');
-  return `${d.getMonth()+1}-${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  return `${d.getMonth()+1}/${d.getDate()} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 function iconFor(name){
   const ext = (name.split('.').pop()||'').toLowerCase();
@@ -405,85 +660,81 @@ function iconFor(name){
   if(['xls','xlsx','csv'].includes(ext)) return '📊';
   if(['ppt','pptx'].includes(ext)) return '📑';
   if(['zip','rar','7z','tar','gz'].includes(ext)) return '🗜️';
-  if(['txt','md','log'].includes(ext)) return '📝';
-  if(['js','ts','rs','go','py','java','c','cpp','json','xml','html','css'].includes(ext)) return '⚙️';
+  if(['txt','md','log','json'].includes(ext)) return '📝';
+  if(['js','ts','rs','go','py','java','c','cpp','html','css'].includes(ext)) return '⚙️';
   return '📦';
 }
 
-// Context menu: long-press (phone) / right-click (PC) pops up an action menu,
-// unified for text and files.
-//   text: Copy / Delete (PC); file: Download / Reveal / Delete (PC), phone only
-//   has Download.
-// Single-click is the primary action (open on PC / download on phone); the menu
-// needs long-press/right-click, to avoid accidental triggers.
-let ctxTarget = null;   // message item the current menu acts on
-let ctxBubble = null;   // the matching bubble (needed for file download progress)
+// Context Menu
+let ctxTarget = null;
+let ctxBubble = null;
 let ctxTimer = null;
-let suppressClick = false; // the synthetic click fired after a long-press would
-                           // close the menu immediately, so swallow one
+let suppressClick = false;
+
 function attachMenu(el, it, bubble){
-  // Right-click (desktop)
   el.addEventListener('contextmenu', (e) => {
     e.preventDefault();
     showCtxMenu(e.clientX, e.clientY, it, bubble);
   });
-  // Long-press (mobile): start a timer on touchstart, fire at ~500ms; cancel on
-  // move/release.
   el.addEventListener('touchstart', (e) => {
     const t = e.touches[0];
     ctxTimer = setTimeout(() => {
       ctxTimer = null;
-      suppressClick = true; // swallow the click the browser synthesizes on
-                            // release so the menu isn't closed right after opening
+      suppressClick = true;
       showCtxMenu(t.clientX, t.clientY, it, bubble);
-    }, 500);
+    }, 450);
   }, {passive: true});
   el.addEventListener('touchend', () => { if(ctxTimer){ clearTimeout(ctxTimer); ctxTimer = null; } });
   el.addEventListener('touchmove', () => { if(ctxTimer){ clearTimeout(ctxTimer); ctxTimer = null; } });
 }
+
 function showCtxMenu(x, y, it, bubble){
   ctxTarget = it;
   ctxBubble = bubble;
   const m = $('ctxMenu');
-  // Build the menu items dynamically by type (the phone has no delete rights,
-  // so Delete is not rendered there).
   m.innerHTML = '';
-  const add = (label, cls, fn) => {
+  
+  const add = (label, iconSvg, cls, fn) => {
     const b = document.createElement('button');
     if(cls) b.className = cls;
-    b.textContent = label;
+    b.innerHTML = `${iconSvg}<span>${label}</span>`;
     b.onclick = (e) => { e.stopPropagation(); hideCtxMenu(); fn(); };
     m.appendChild(b);
   };
+
+  const copyIco = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>`;
+  const delIco = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>`;
+  const openIco = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>`;
+  const dlIco = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`;
+
   if(it.kind === 'text'){
-    add('Copy', '', () => copyText(ctxTarget));
-    if(isPC) add('Delete', 'danger', () => delItem(ctxTarget));
+    add('Copy', copyIco, '', () => copyText(ctxTarget));
+    if(isPC) add('Delete', delIco, 'danger', () => delItem(ctxTarget));
   } else {
     if(isPC){
-      // No download needed on the PC (local files are local, and phone-sent
-      // files are already in the inbox).
-      add('Reveal in Explorer', '', () => revealItem(ctxTarget));
-      add('Delete', 'danger', () => delItem(ctxTarget));
+      add('Reveal in Explorer', openIco, '', () => revealItem(ctxTarget));
+      add('Delete', delIco, 'danger', () => delItem(ctxTarget));
     } else {
-      add('Download', '', () => downloadFile(ctxTarget, ctxBubble));
+      add('Download', dlIco, '', () => downloadFile(ctxTarget, ctxBubble));
     }
   }
-  // Position: avoid overflowing the viewport's right/bottom edges.
-  const w = 130, h = 90;
-  const left = Math.min(x, window.innerWidth - w - 8);
-  const top = Math.min(y, window.innerHeight - h - 8);
-  m.style.left = left + 'px';
-  m.style.top = top + 'px';
+
+  const w = 160, h = 90;
+  const left = Math.min(x, window.innerWidth - w - 12);
+  const top = Math.min(y, window.innerHeight - h - 12);
+  m.style.left = Math.max(8, left) + 'px';
+  m.style.top = Math.max(8, top) + 'px';
   m.classList.add('show');
 }
+
 async function copyText(it){
-  try { await navigator.clipboard.writeText(it.text); toast('Copied'); }
+  try { await navigator.clipboard.writeText(it.text); toast('Copied to clipboard'); }
   catch { toast('Copy failed'); }
 }
 async function delItem(it){
   const msgtxt = it.kind === 'text'
     ? 'Delete this message?'
-    : 'Remove "'+it.name+'" from the record?\n(The file won\'t be deleted)';
+    : 'Remove "'+it.name+'" from list? (File on disk will stay)';
   if(!confirm(msgtxt)) return;
   const res = await fetch('/rm?id='+encodeURIComponent(it.id), {method:'POST'});
   if(res.ok) toast(it.kind === 'text' ? 'Deleted' : 'Removed');
@@ -492,19 +743,17 @@ async function delItem(it){
 }
 async function revealItem(it){
   const res = await fetch('/reveal?id='+encodeURIComponent(it.id), {method:'POST'});
-  if(!res.ok) toast('The file is no longer at its original location');
+  if(!res.ok) toast('File no longer exists');
 }
 function hideCtxMenu(){ $('ctxMenu').classList.remove('show'); }
-// Close the menu when clicking elsewhere or scrolling (the synthetic click
-// after a long-press is swallowed via suppressClick)
+
 document.addEventListener('click', () => {
   if(suppressClick){ suppressClick = false; return; }
   hideCtxMenu();
 });
 document.addEventListener('scroll', hideCtxMenu, true);
 
-let lastList = ''; // snapshot of the last rendered list; skip re-rendering when
-                   // unchanged (polling does not interrupt scrolling)
+let lastList = '';
 let pollFailures = 0;
 async function refresh(){
   try {
@@ -517,26 +766,29 @@ async function refresh(){
     lastList = key;
     render(items);
   } catch {
-    // A network death is silent: SSE is idle server-push, so a vanished peer
-    // produces no error event until the OS times the dead TCP out (minutes).
-    // This poll is the only reliable liveness signal — two consecutive
-    // failures (~8s) matches the PC-side offline window.
     if(++pollFailures >= 2) setOffline(true);
   }
 }
+
 function render(items){
   const chat = $('chat');
   const prev = chat.scrollTop;
-  const wasAtBottom = prev + chat.clientHeight >= chat.scrollHeight - 24;
+  const wasAtBottom = prev + chat.clientHeight >= chat.scrollHeight - 32;
   chat.innerHTML = '';
-  const has = items.length > 0;
-  if(!has){
+  
+  if(!items.length){
     const e = document.createElement('div');
     e.className = 'empty'; e.id = 'empty';
-    e.innerHTML = '<div class="e-icon">💬</div><div>No messages yet · Try sending a file or text</div>';
+    e.innerHTML = `
+      <div class="e-icon">
+        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m3 15 4-4 4 4"/><path d="m14 9 4-4 4 4"/><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/></svg>
+      </div>
+      <div class="e-title">Ready for transfer</div>
+      <div class="e-desc">Send text messages, photos or files seamlessly across devices.</div>`;
     chat.appendChild(e);
     return;
   }
+
   for(const it of items){
     const mine = it.from === me;
     const msg = document.createElement('div');
@@ -545,8 +797,13 @@ function render(items){
 
     const avatar = document.createElement('div');
     avatar.className = 'avatar';
-    avatar.textContent = it.from === 'pc' ? '💻' : '📱';
+    avatar.innerHTML = it.from === 'pc' 
+      ? '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>'
+      : '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>';
     msg.appendChild(avatar);
+
+    const bWrap = document.createElement('div');
+    bWrap.className = 'bubble-container';
 
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
@@ -554,16 +811,14 @@ function render(items){
     if(it.kind === 'text'){
       bubble.classList.add('text');
       bubble.textContent = it.text;
-      // Long-press/right-click menu: Copy / Delete (phone only has Copy). A
-      // single tap does nothing, to avoid accidental triggers.
       attachMenu(bubble, it, null);
     } else {
-      // File card: inline preview for images/videos, an icon for other types.
       const card = document.createElement('div');
       card.className = 'file-card';
       const ext = (it.name.split('.').pop()||'').toLowerCase();
       const isImg = ['jpg','jpeg','png','gif','webp','heic','bmp','svg'].includes(ext);
       const isVid = ['mp4','mov','avi','mkv','webm'].includes(ext);
+      
       if(isImg){
         card.classList.add('has-preview');
         const img = document.createElement('img');
@@ -583,24 +838,21 @@ function render(items){
       } else {
         card.innerHTML = `<div class="fc-ico">${iconFor(it.name)}</div>`;
       }
+      
       const info = document.createElement('div');
       info.className = 'fc-info';
       info.innerHTML = '<div class="fc-name"></div><div class="fc-size"></div>';
       info.querySelector('.fc-name').textContent = it.name;
       info.querySelector('.fc-size').textContent = fmtSize(it.size);
       card.appendChild(info);
-      // Single click: PC -> open with the system default viewer; phone ->
-      // trigger a download.
+
       card.onclick = () => {
         if(isPC) openDefault(it);
         else downloadFile(it, bubble);
       };
-      // Long-press/right-click: Download / Reveal / Delete (phone only has
-      // Download).
       attachMenu(card, it, bubble);
       bubble.appendChild(card);
 
-      // Download progress bar (shown on the phone while downloading)
       const dlrow = document.createElement('div');
       dlrow.className = 'dlrow hidden';
       dlrow.innerHTML = `
@@ -609,50 +861,46 @@ function render(items){
       bubble.appendChild(dlrow);
     }
 
-    // Timestamp
     const meta = document.createElement('div');
     meta.className = 'meta-line';
     meta.textContent = fmtTime(it.ts);
-    bubble.appendChild(meta);
-
-    msg.appendChild(bubble);
+    
+    bWrap.appendChild(bubble);
+    bWrap.appendChild(meta);
+    msg.appendChild(bWrap);
     chat.appendChild(msg);
   }
-  // At the bottom -> scroll down with new messages; scrolled up -> keep the
-  // position instead of yanking the view down.
+
   if(wasAtBottom) chat.scrollTop = chat.scrollHeight;
   else chat.scrollTop = prev;
 }
 
-// PC side single-click on a file card: open with the system default viewer.
 async function openDefault(it){
   const res = await fetch('/open?id='+encodeURIComponent(it.id), {method:'POST'});
-  if(!res.ok) toast('The file is no longer at its original location');
+  if(!res.ok) toast('File no longer exists');
 }
 
-// Download: XHR fetches a blob with progress/speed tracking, then triggers the
-// browser download when done.
 function downloadFile(it, bubble){
   const row = bubble.querySelector('.dlrow');
   if(!row) return;
   const fill = bubble.querySelector('.dlfill');
   const pctEl = bubble.querySelector('.dl-pct');
   const spdEl = bubble.querySelector('.dl-spd');
-  const show = (on) => row.classList.toggle('hidden', !on);
-  show(true);
-  fill.style.width = '0'; pctEl.textContent = '0%'; spdEl.textContent = fmtSize(0)+'/s';
+  row.classList.remove('hidden');
+  fill.style.width = '0%'; pctEl.textContent = '0%'; spdEl.textContent = fmtSize(0)+'/s';
 
   const xhr = new XMLHttpRequest();
   xhr.open('GET', '/dl?id='+encodeURIComponent(it.id), true);
   xhr.responseType = 'blob';
   let t0 = 0, lastT = 0, lastLoaded = 0;
+  
   xhr.onprogress = e => {
     const now = performance.now();
     if(!t0){ t0 = now; lastT = now; lastLoaded = 0; }
     const total = e.lengthComputable ? e.total : it.size;
     const pct = total ? (e.loaded/total*100) : 0;
     fill.style.width = pct + '%';
-    pctEl.textContent = pct.toFixed(0)+'% · '+fmtSize(e.loaded)+'/'+fmtSize(total);
+    pctEl.textContent = pct.toFixed(0)+'% ('+fmtSize(e.loaded)+')';
     if(now - lastT > 250){
       const speed = (e.loaded - lastLoaded) / ((now - lastT)/1000);
       spdEl.textContent = fmtSize(speed)+'/s';
@@ -666,15 +914,14 @@ function downloadFile(it, bubble){
       a.href = url; a.download = it.name;
       document.body.appendChild(a); a.click(); a.remove();
       URL.revokeObjectURL(url);
-      toast('Download complete ✓');
-    } else { toast('Download failed ✕'); }
-    show(false);
+      toast('Download complete');
+    } else { toast('Download failed'); }
+    row.classList.add('hidden');
   };
-  xhr.onerror = () => { toast('Network error ✕'); show(false); };
+  xhr.onerror = () => { toast('Network error'); row.classList.add('hidden'); };
   xhr.send();
 }
 
-// Text send
 function sendText(){
   const t = $('txt');
   const text = t.value.trim();
@@ -686,20 +933,19 @@ function sendText(){
   }).then(r => {
     busy = false;
     if(r.ok){ t.value = ''; autoSize(); updateSendBtn(); }
-    else toast('Send failed ✕');
-  }).catch(() => { busy = false; toast('Network error ✕'); });
+    else toast('Send failed');
+  }).catch(() => { busy = false; toast('Network error'); });
 }
 
 function autoSize(){
   const t = $('txt');
   t.style.height = 'auto';
-  t.style.height = Math.min(t.scrollHeight, 96) + 'px';
+  t.style.height = Math.min(t.scrollHeight, 100) + 'px';
 }
 function updateSendBtn(){
   $('send').disabled = $('txt').value.trim().length === 0;
 }
 
-// File upload (phone / drag-and-drop): goes through /upload
 function uploadFiles(files){
   if(!files.length || busy) return;
   busy = true;
@@ -711,42 +957,35 @@ function uploadFiles(files){
     if(e.lengthComputable) $('bar').style.width = (e.loaded/e.total*100)+'%';
   };
   xhr.onload = () => {
-    busy = false; $('bar').style.width = '0';
-    if(xhr.status===200){ toast('Sent ✓'); }
-    else toast('Send failed ✕');
+    busy = false; $('bar').style.width = '0%';
+    if(xhr.status===200){ toast('Sent successfully'); }
+    else toast('Upload failed');
   };
-  xhr.onerror = () => { busy=false; $('bar').style.width='0'; toast('Network error ✕'); };
+  xhr.onerror = () => { busy=false; $('bar').style.width='0%'; toast('Network error'); };
   xhr.send(fd);
 }
 
-// Input field
 $('txt').addEventListener('input', () => { autoSize(); updateSendBtn(); });
 $('txt').addEventListener('keydown', e => {
   if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendText(); }
 });
 $('send').onclick = sendText;
 
-// Inbox entry (PC only): open the inbox folder, where received files are
-// managed by the user.
 $('inboxBtn').onclick = () => {
   fetch('/open-dir', {method:'POST'}).catch(()=>toast('Could not open inbox'));
 };
 
-// Plus button: opens the system file picker directly (no submenu anymore).
-// PC: Tauri dialog (real paths, zero-copy references) -> POST /add-local to
-// register. Phone: browser <input type=file multiple> (uploads file content).
 $('plus').onclick = () => {
   if(isPC){ pickLocal(); return; }
   $('fileInput').click();
 };
+
 async function pickLocal(){
   const T = window.__TAURI__;
   if(!T || !T.dialog || !T.dialog.open){
-    toast('Not supported in this environment'); return;
+    $('fileInput').click(); return;
   }
   try {
-    // multiple: multi-file selection; no directory (folder selection can come
-    // later).
     const picked = await T.dialog.open({ multiple: true, title: 'Select files' });
     if(!picked) return;
     let paths = [];
@@ -758,15 +997,9 @@ async function pickLocal(){
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ paths })
     });
-    if(!r.ok){
-      toast('Registration failed');
-      fetch('/log', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({msg:'add-local HTTP '+r.status})});
-    }
-    // On success /add-local broadcasts /events, and this side's SSE refreshes
-    // automatically.
+    if(!r.ok){ toast('Registration failed'); }
   } catch(e) {
     toast('Add failed');
-    fetch('/log', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({msg:'dialog/add-local error: '+e})});
   }
 }
 $('fileInput').addEventListener('change', e => {
@@ -774,44 +1007,46 @@ $('fileInput').addEventListener('change', e => {
   e.target.value = '';
 });
 
-// Drag-and-drop upload (desktop)
-document.body.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect='copy'; });
-document.body.addEventListener('drop', e => {
+// Drag and drop overlay
+let dragCounter = 0;
+const dOverlay = $('dragOverlay');
+window.addEventListener('dragenter', e => {
   e.preventDefault();
+  dragCounter++;
+  dOverlay.classList.add('active');
+});
+window.addEventListener('dragleave', e => {
+  e.preventDefault();
+  dragCounter--;
+  if(dragCounter <= 0){
+    dragCounter = 0;
+    dOverlay.classList.remove('active');
+  }
+});
+window.addEventListener('dragover', e => { e.preventDefault(); e.dataTransfer.dropEffect='copy'; });
+window.addEventListener('drop', e => {
+  e.preventDefault();
+  dragCounter = 0;
+  dOverlay.classList.remove('active');
   if(e.dataTransfer.files.length) uploadFiles([...e.dataTransfer.files]);
 });
 
-// Connection state: when the PC side closes, SSE disconnects and /fw-status
-// polling fails -> show the disconnect banner; once recovered, hide it and
-// refresh the list once (changes during the disconnect would otherwise be
-// missed).
 let offline = false;
 function setOffline(v){
   if(offline === v) return;
   offline = v;
   $('offBanner').classList.toggle('show', v);
-  // The header status badge only matters for the phone (client); the PC is the
-  // server itself, so its badge always shows the address.
   if(isPC) return;
   $('badge').classList.toggle('off', v);
   $('badgeTxt').textContent = v ? 'Disconnected' : 'Connected';
 }
-// Server push: whenever either end sends/deletes, this side refreshes
-// automatically (cross-device sync). Also re-check firewall status: the Rust
-// side pushes on this channel the moment a Block rule is detected, so the
-// repair overlay appears immediately instead of waiting for the next poll.
+
 const es = new EventSource('/events');
 es.onmessage = () => { refresh(); checkFwStatus(); };
 es.onerror = () => setOffline(true);
 es.onopen = () => { setOffline(false); refresh(); };
-// Fallback polling (a true server: phone browsers kill SSE on network
-// switch/lock-screen/background). Every 4s, proactively ask the server for
-// status for eventual consistency. refresh does change detection, so it skips
-// re-rendering when the list is unchanged - no scroll interruption or flashing.
 const refreshTimer = setInterval(refresh, 4000);
 
-// Firewall repair overlay: poll /fw-status, show when repair is needed (the
-// window has already been pinned by the Rust side).
 let fwChecking = false;
 let fwWasShown = false;
 async function checkFwStatus(){
@@ -820,33 +1055,28 @@ async function checkFwStatus(){
   try {
     const r = await fetch('/fw-status');
     const s = await r.json();
-    setOffline(false); // poll succeeded -> online
+    setOffline(false);
     const show = !!s.needRepair;
     $('fwOverlay').classList.toggle('show', show);
-    // Transition from "needs repair" to "repaired": un-pin the window and
-    // return to normal.
-    if(fwWasShown && !show){
-      fetch('/untop', {method:'POST'}).catch(()=>{});
-    }
+    if(fwWasShown && !show){ fetch('/untop', {method:'POST'}).catch(()=>{}); }
     fwWasShown = show;
-  } catch { setOffline(true); } // poll failed -> PC side closed / network down
+  } catch { setOffline(true); }
   fwChecking = false;
 }
 $('fwRepair').onclick = async () => {
   $('fwRepair').disabled = true;
   $('fwQuit').disabled = true;
-  $('fwHint').textContent = 'Please click "Yes" in the UAC dialog that pops up…';
+  $('fwHint').textContent = 'Please confirm the administrator prompt (UAC)…';
   try {
     const r = await fetch('/repair', {method:'POST'});
     const txt = await r.text();
     if(txt.trim() === 'ok'){
-      // /repair blocks until the Block is really removed, so it is fixed now.
       $('fwOverlay').classList.remove('show');
       fetch('/untop', {method:'POST'}).catch(()=>{});
       fwWasShown = false;
-      toast('Network access granted ✓');
+      toast('Network access granted');
     } else {
-      $('fwHint').textContent = 'Not finished (UAC may have been cancelled). Click "Allow" to retry — or this closes itself once a device connects';
+      $('fwHint').textContent = 'Permission not granted. Click Allow to retry.';
     }
   } catch(e) {
     $('fwHint').textContent = 'Request failed, please retry';
@@ -856,17 +1086,8 @@ $('fwRepair').onclick = async () => {
 };
 $('fwQuit').onclick = () => { fetch('/quit', {method:'POST'}).catch(()=>{}); };
 checkFwStatus();
-const fwTimer = setInterval(checkFwStatus, 2000);
+const fwTimer = setInterval(checkFwStatus, 2500);
 
-// Single-live-page takeover: scanning the QR again opens a new tab, and old
-// tabs would otherwise keep an SSE connection plus two polling loops alive
-// forever. The browser gives a page no way to reuse an existing tab for a new
-// navigation (Service Workers could, but require HTTPS, which a plain-HTTP
-// LAN page can't have). The closest equivalent: same-origin tabs announce
-// themselves on a BroadcastChannel and every older tab stands down —
-// connection closed, timers cleared, overlay shown. Net effect: only one
-// live page at a time. BroadcastChannel never delivers to the sender, so the
-// newly opened page is unaffected by its own hello.
 function supersede(){
   if(superseded) return;
   superseded = true;
@@ -874,8 +1095,6 @@ function supersede(){
   clearInterval(refreshTimer);
   clearInterval(fwTimer);
   $('deadOverlay').classList.add('show');
-  // Best effort only: most mobile browsers ignore window.close() for tabs
-  // the user opened themselves; the overlay above is the real UI.
   setTimeout(() => window.close(), 300);
 }
 let superseded = false;
@@ -885,50 +1104,42 @@ if(takeover){
   takeover.postMessage('hello');
 }
 
-// PC: the server itself. The badge shows whether a mobile device is online -
-// gray "Waiting for mobile device", or green "Connected" when one is online.
-// /info also carries the LAN URL the QR encodes; showing it as text lets the
-// user verify the detected IP or type it manually when scanning fails.
-//
-// Connect gate: the transfer UI is only shown while a device is actually
-// connected. "Connected" is sticky — a phone that locks its screen or
-// backgroundes its browser stops polling for a while, so after the first
-// connect it takes ~60s (20 missed polls) to flip back to the gate. Otherwise
-// the UI would flicker to the QR page on every screen lock mid-conversation.
-function copyUrl(){
-  const fromGate = $('gate').classList.contains('show');
-  const u = fromGate ? $('gateUrl').textContent : $('qrUrl').textContent;
-  if(!u.startsWith('http')) return;
-  navigator.clipboard.writeText(u)
-    .then(()=>toast('Address copied: ' + u))
-    .catch(()=>toast('Copy failed, please copy manually: ' + u));
-}
+// QR lightbox: the small header QR opens a large scan-ready version on click;
+// clicking anywhere (card included) closes it. The URL is shown as plain text
+// for manual entry when scanning fails.
+function openQrLightbox(){ $('qrLightbox').classList.add('show'); }
+function closeQrLightbox(){ $('qrLightbox').classList.remove('show'); }
+$('qrBox').onclick = openQrLightbox;
+$('qrLightbox').onclick = closeQrLightbox;
+
 if(isPC){
   let everConnected = false;
   let missedPolls = 0;
   const updateMobile = () => {
     fetch('/info').then(r=>r.json()).then(d => {
-      if(!d) return; // transient failure: neither connect nor disconnect
+      if(!d) return;
       if(d.mobileConnected){
-        if(!everConnected) toast('Device connected ✓');
+        if(!everConnected) toast('Device connected');
         everConnected = true;
         missedPolls = 0;
-        $('gateTitle').textContent = 'Scan to start';
+        $('gateTitle').textContent = 'Scan to connect';
       } else if(everConnected && ++missedPolls >= 20){
         everConnected = false;
-        $('gateTitle').textContent = 'Connection lost — scan again';
+        $('gateTitle').textContent = 'Connection lost — Scan again';
       }
       $('gate').classList.toggle('show', !everConnected);
       $('badge').classList.toggle('wait', !d.mobileConnected);
-      $('badgeTxt').textContent = d.mobileConnected ? 'Connected' : 'Waiting for mobile device';
-      if(d.url){ $('qrUrl').textContent = d.url; $('gateUrl').textContent = d.url; }
+      $('badgeTxt').textContent = d.mobileConnected ? 'Connected' : 'Waiting for device';
+      if(d.url){ 
+        $('qrUrl').textContent = d.url; 
+        $('gateUrl').querySelector('span').textContent = d.url; 
+        $('qlUrl').textContent = d.url; 
+      }
     }).catch(()=>{});
   };
-  $('gate').classList.add('show'); // start behind the gate until a device proves itself
+  $('gate').classList.add('show');
   updateMobile();
   setInterval(updateMobile, 3000);
-  $('qrUrl').onclick = copyUrl;
-  $('gateUrl').onclick = copyUrl;
 }
 
 refresh();
