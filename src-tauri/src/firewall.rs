@@ -24,7 +24,7 @@
 // A temp .ps1 file is used instead of passing the script via -ArgumentList to
 // avoid quotes/braces being mangled while being passed on the command line.
 // Only takes effect on Windows; a no-op on other platforms.
-use crate::logger::logf;
+use crate::logger::{loge, logf, logw};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -74,12 +74,12 @@ pub(crate) fn run_ps(script: &str) -> Option<(bool, String)> {
             let ok = o.status.success();
             if !ok {
                 let err = String::from_utf8_lossy(&o.stderr);
-                logf(&format!("ps failed: stderr={}", err.trim()));
+                loge(&format!("ps failed: stderr={}", err.trim()));
             }
             Some((ok, String::from_utf8_lossy(&o.stdout).to_string()))
         }
         Err(e) => {
-            logf(&format!("could not launch powershell: {}", e));
+            loge(&format!("could not launch powershell: {}", e));
             None
         }
     }
@@ -213,7 +213,7 @@ pub fn ensure_background(app: AppHandle) {
                     // Cannot inspect rules; do not guess. The repair overlay
                     // stays off, and a phone actually connecting remains the
                     // only (and sufficient) signal that inbound works.
-                    logf("firewall: could not inspect rules (powershell failed), relying on connection evidence");
+                    logw("firewall: could not inspect rules (powershell failed), relying on connection evidence");
                     return;
                 }
                 BlockCheck::Absent => {}
@@ -408,7 +408,7 @@ try {{
 Remove-Item $MyInvocation.MyCommand.Path -ErrorAction SilentlyContinue"#
     );
     if std::fs::write(&ps1, &script).is_err() {
-        logf("repair: failed to write temp ps1");
+        loge("repair: failed to write temp ps1");
         return false;
     }
 

@@ -1,4 +1,4 @@
-<!doctype html>
+﻿<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -263,10 +263,27 @@
 
   /* File Card */
   .file-card {
+    position: relative;
     display: flex; align-items: center; gap: 11px; min-width: 210px; cursor: pointer;
     border-radius: 12px; transition: transform 0.15s ease;
   }
   .file-card:active { transform: scale(0.98); }
+  /* Corner transfer button: download (phone idle) / pause / resume. Independent
+     of the card click (which only opens); it also drives cross-device pause on
+     the PC while the phone is downloading. */
+  .dlcardbtn {
+    position: absolute; top: 8px; right: 8px; z-index: 3;
+    width: 30px; height: 30px; border-radius: 50%; border: none; cursor: pointer;
+    background: rgba(0,0,0,0.55); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+    transition: background 0.15s, transform 0.15s;
+  }
+  .dlcardbtn:hover { background: rgba(0,0,0,0.72); }
+  .dlcardbtn:active { transform: scale(0.9); }
+  .dlcardbtn svg { width: 14px; height: 14px; display: block; }
+  .dlcardbtn.hidden { display: none; }
+  .msg.me .dlcardbtn { background: rgba(0,0,0,0.45); }
   .fc-ico {
     width: 40px; height: 40px; flex: none; border-radius: 10px;
     display: flex; align-items: center; justify-content: center; font-size: 17px;
@@ -306,8 +323,21 @@
   .msg.me .dlfill { background: #fff; }
   .dltext {
     font-size: 10.5px; opacity: 0.8; margin-top: 4px;
-    display: flex; justify-content: space-between; font-variant-numeric: tabular-nums;
+    display: flex; align-items: center; justify-content: space-between; font-variant-numeric: tabular-nums;
   }
+  .dl-mid { display: inline-flex; gap: 8px; min-width: 0; }
+
+  /* Fullscreen media preview (phone "open" for image/video) */
+  .media-ov {
+    position: fixed; inset: 0; z-index: 400; background: rgba(0,0,0,0.92);
+    display: flex; align-items: center; justify-content: center; padding: 16px;
+    animation: fadeIn 0.18s ease;
+  }
+  .media-ov img, .media-ov video {
+    max-width: 100%; max-height: 100%; border-radius: 8px;
+    box-shadow: 0 8px 40px rgba(0,0,0,0.5);
+  }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
   /* Empty state */
   .empty {
@@ -448,6 +478,18 @@
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     display: inline-flex; align-items: center;
   }
+  /* Dismiss the gate and jump straight to the message list without waiting */
+  .g-actions {
+    margin-top: 18px; display: flex; justify-content: center;
+  }
+  .g-inbox {
+    display: inline-flex; align-items: center; gap: 7px;
+    background: var(--accent); color: #fff; border: none; border-radius: 12px;
+    padding: 10px 20px; font-size: 13.5px; font-weight: 600; cursor: pointer;
+    transition: transform 0.15s var(--ease-spring), filter 0.15s;
+  }
+  .g-inbox:hover { filter: brightness(1.06); transform: translateY(-1px); }
+  .g-inbox:active { transform: scale(0.95); }
   @media (pointer: coarse) { #gate { display: none !important; } }
 
   /* Modals (Firewall & Superseded) */
@@ -575,6 +617,12 @@
     <div>
       <div id="gateUrl"><span>…</span></div>
     </div>
+    <div class="g-actions">
+      <button class="g-inbox" id="gateInbox">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+        Inbox
+      </button>
+    </div>
   </div>
 </div>
 
@@ -601,7 +649,10 @@
       <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
     </div>
     <div class="fw-title">Opened in another tab</div>
-    <div class="fw-desc">This session was superseded by a newly opened page. You can safely close this window.</div>
+    <div class="fw-desc">Only one tab is needed - this one was superseded by a newer page. Browsers block auto-closing tabs, so please close it manually.</div>
+    <div class="fw-btns">
+      <button class="fw-btn repair" id="deadClose">Close this tab</button>
+    </div>
   </div>
 </div>
 
@@ -715,7 +766,7 @@ function showCtxMenu(x, y, it, bubble){
       add('Reveal in Explorer', openIco, '', () => revealItem(ctxTarget));
       add('Delete', delIco, 'danger', () => delItem(ctxTarget));
     } else {
-      add('Download', dlIco, '', () => downloadFile(ctxTarget, ctxBubble));
+      add('Download', dlIco, '', () => downloadFile(ctxTarget));
     }
   }
 
@@ -761,12 +812,60 @@ async function refresh(){
     const items = await r.json();
     pollFailures = 0;
     setOffline(false);
+    lastLive = Date.now();
     const key = JSON.stringify(items);
     if(key === lastList) return;
     lastList = key;
     render(items);
+    autoPull(items);
+    pruneTransfers(items);
+    restorePending(items);
   } catch {
     if(++pollFailures >= 2) setOffline(true);
+  }
+}
+
+// If a file that was being transferred (or its native download) got removed on
+// the server, stop it right away: abort the chunk XHRs and clear all local
+// state. Combined with the server clearing its /dl-status entry on /rm, the
+// downloading side gives up immediately instead of waiting for the SSE or the
+// 4s refresh timer to re-render.
+function pruneTransfers(items){
+  const ids = new Set(items.map(i => i.id));
+  for(const id of Object.keys(dlState)){
+    if(ids.has(id)) continue;
+    const st = dlState[id];
+    if(st.timer){ clearTimeout(st.timer); st.timer = null; }
+    for(const c of st.chunks){
+      if(c.ctrl){ c.ctrl.abort(); }
+      if(c.xhr){ c.xhr.abort(); }
+    }
+    if(st.opfs) opfsCleanup(st.opfs, id); // drop its part files + meta
+    delete dlState[id];
+  }
+  for(const key of Object.keys(dlInFlight))  if(!ids.has(key)) delete dlInFlight[key];
+  for(const key of Object.keys(serverPaused)) if(!ids.has(key)) delete serverPaused[key];
+  for(const key of Object.keys(progCache))   if(!ids.has(key)) delete progCache[key];
+}
+
+// Symmetric push: the PC registering a local reference is a "send" — the phone
+// starts receiving it right away, no tap needed, mirroring how the phone's own
+// upload lands on the PC instantly. Entries that already existed when the page
+// loaded are not auto-pulled (they predate this session); only new PC files.
+const autoPulled = new Set();
+let pullBaseline = null;
+function autoPull(items){
+  if(isPC) return;
+  if(pullBaseline === null){
+    pullBaseline = new Set(items.map(i => i.id));
+    return;
+  }
+  for(const it of items){
+    if(it.kind === 'file' && it.from === 'pc'
+       && !pullBaseline.has(it.id) && !autoPulled.has(it.id)){
+      autoPulled.add(it.id);
+      downloadFile(it);
+    }
   }
 }
 
@@ -846,9 +945,21 @@ function render(items){
       info.querySelector('.fc-size').textContent = fmtSize(it.size);
       card.appendChild(info);
 
+      // Single-responsibility card: click = open. A transfer in flight (local
+      // state or a server entry) makes it a no-op; the corner button owns all
+      // transfer actions (download / pause / resume) on both ends.
+      const btn = document.createElement('button');
+      btn.className = 'dlcardbtn hidden';
+      btn.type = 'button';
+      btn.onclick = (e) => { e.stopPropagation(); transferClick(it); };
+      card.appendChild(btn);
+
       card.onclick = () => {
+        const st = dlState[it.id];
+        if(st && (st.active || st.paused)) return;      // transfer in flight
+        if(dlInFlight[it.id]) return;                    // cross-device / native
         if(isPC) openDefault(it);
-        else downloadFile(it, bubble);
+        else openOnPhone(it);
       };
       attachMenu(card, it, bubble);
       bubble.appendChild(card);
@@ -857,7 +968,9 @@ function render(items){
       dlrow.className = 'dlrow hidden';
       dlrow.innerHTML = `
         <div class="dltrack"><div class="dlfill"></div></div>
-        <div class="dltext"><span class="dl-pct"></span><span class="dl-spd"></span></div>`;
+        <div class="dltext">
+          <span class="dl-mid"><span class="dl-pct"></span><span class="dl-spd"></span></span>
+        </div>`;
       bubble.appendChild(dlrow);
     }
 
@@ -869,6 +982,10 @@ function render(items){
     bWrap.appendChild(meta);
     msg.appendChild(bWrap);
     chat.appendChild(msg);
+    // Must run after the node is in the document - the selector query would
+    // miss it otherwise. This is what surfaces the download button on the
+    // phone for historical files (idle state).
+    if(it.kind !== 'text') updateCardBtn(it.id);
   }
 
   if(wasAtBottom) chat.scrollTop = chat.scrollHeight;
@@ -880,47 +997,511 @@ async function openDefault(it){
   if(!res.ok) toast('File no longer exists');
 }
 
-function downloadFile(it, bubble){
-  const row = bubble.querySelector('.dlrow');
-  if(!row) return;
-  const fill = bubble.querySelector('.dlfill');
-  const pctEl = bubble.querySelector('.dl-pct');
-  const spdEl = bubble.querySelector('.dl-spd');
-  row.classList.remove('hidden');
-  fill.style.width = '0%'; pctEl.textContent = '0%'; spdEl.textContent = fmtSize(0)+'/s';
+// Downloads: parallel chunked transfer on the phone (up to PARALLEL concurrent
+// Range streams, which survives lossy WiFi far better than one stream), with
+// per-chunk offsets so pause/resume continues exactly where it stopped. Files
+// too big to hold in browser memory (>PARALLEL_MEM_CAP) fall back to the
+// browser's own native downloader, which streams to disk. Progress and speed
+// are shown on BOTH ends via the server's /dl-status counter.
+const dlState = {};
+const PARALLEL = 6;
+const PARALLEL_MEM_CAP = 2 * 1024 * 1024 * 1024; // 2 GiB in-memory ceiling
+const DL_AUTO_RETRIES = 3;
 
-  const xhr = new XMLHttpRequest();
-  xhr.open('GET', '/dl?id='+encodeURIComponent(it.id), true);
-  xhr.responseType = 'blob';
-  let t0 = 0, lastT = 0, lastLoaded = 0;
-  
-  xhr.onprogress = e => {
-    const now = performance.now();
-    if(!t0){ t0 = now; lastT = now; lastLoaded = 0; }
-    const total = e.lengthComputable ? e.total : it.size;
-    const pct = total ? (e.loaded/total*100) : 0;
-    fill.style.width = pct + '%';
-    pctEl.textContent = pct.toFixed(0)+'% ('+fmtSize(e.loaded)+')';
-    if(now - lastT > 250){
-      const speed = (e.loaded - lastLoaded) / ((now - lastT)/1000);
-      spdEl.textContent = fmtSize(speed)+'/s';
-      lastT = now; lastLoaded = e.loaded;
+function dlRow(id){
+  const m = document.querySelector('.msg[data-id="'+id+'"]');
+  return m ? m.querySelector('.dlrow') : null;
+}
+
+// Pause/resume button in the progress row. The flag lives server-side so a
+// pause from either the PC or the phone reaches the other end through the
+// existing /dl-status poll; locally we mirror it onto the JS downloader.
+const serverPaused = {};
+const dlInFlight = {};
+const BTN_DL    = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
+const BTN_PAUSE = '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></svg>';
+const BTN_PLAY  = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
+
+function updateCardBtn(id){
+  const card = document.querySelector('.msg[data-id="'+id+'"] .file-card');
+  if(!card) return;
+  const btn = card.querySelector('.dlcardbtn');
+  if(!btn) return;
+  const st = dlState[id];
+  let mode;
+  if(st && st.active) mode = 'pause';                       // locally downloading
+  else if(st && st.paused) mode = 'resume';                 // paused / tap-to-continue
+  else if(dlInFlight[id]) mode = serverPaused[id] ? 'resume' : 'pause'; // PC / native
+  else if(!isPC) mode = 'download';                         // phone idle
+  else mode = 'none';
+  btn.classList.toggle('hidden', mode === 'none');
+  if(mode === 'none') return;
+  btn.innerHTML = mode === 'download' ? BTN_DL : (mode === 'pause' ? BTN_PAUSE : BTN_PLAY);
+  btn.title = mode === 'download' ? 'Download' : (mode === 'pause' ? 'Pause' : 'Resume');
+}
+
+async function setPaused(id, v){
+  serverPaused[id] = !!v;
+  try {
+    await fetch('/dl-pause?id='+encodeURIComponent(id)+'&paused='+(v?1:0), {method:'POST'});
+  } catch {}
+}
+
+// Corner-button action: start (phone idle) / pause / resume, unified on both
+// ends. Local downloader state wins; otherwise (PC, native download) just flip
+// the shared flag and let the downloading phone react on its next poll.
+function transferClick(it){
+  const id = it.id;
+  const st = dlState[id];
+  if(st && st.active){ setPaused(id, 1); pauseDownload(it); return; }
+  if(st && st.paused && st.chunks.length){ setPaused(id, 0); downloadFile(it); return; }
+  if(dlInFlight[id]){ setPaused(id, !serverPaused[id]); return; }
+  downloadFile(it);
+}
+
+// Phone "open": fullscreen preview for media, a hint otherwise (the phone has
+// no generic file viewer).
+function openOnPhone(it){
+  const ext = (it.name.split('.').pop()||'').toLowerCase();
+  const isImg = ['jpg','jpeg','png','gif','webp','heic','bmp','svg'].includes(ext);
+  const isVid = ['mp4','mov','avi','mkv','webm'].includes(ext);
+  if(!isImg && !isVid){ toast('No preview on this device'); return; }
+  const ov = document.createElement('div');
+  ov.className = 'media-ov';
+  const src = '/view?id='+encodeURIComponent(it.id);
+  ov.innerHTML = isVid
+    ? '<video src="'+src+'" controls autoplay playsInline></video>'
+    : '<img src="'+src+'">';
+  ov.onclick = () => ov.remove();
+  document.body.appendChild(ov);
+}
+
+async function downloadFile(it){
+  const id = it.id;
+  const row = dlRow(id);
+  if(!row) return;
+  const st = dlState[id] || (dlState[id] = { it, parts: [], chunks: [], attempts: 0, timer: null, active: false, paused: false, opfs: undefined, finishing: false });
+  if(st.active || st.finishing) return; // already transferring this file
+  if(st.timer){ clearTimeout(st.timer); st.timer = null; }
+
+  // Choose the transport once. OPFS streaming (constant memory, any size) when
+  // the browser supports it and quota fits; otherwise the in-memory blob
+  // downloader up to PARALLEL_MEM_CAP, and the native downloader beyond that.
+  if(st.opfs === undefined){
+    try { st.opfs = await opfsDir(it.size) || null; } catch { st.opfs = null; }
+  }
+  if(!st.opfs && it.size > PARALLEL_MEM_CAP){
+    nativeDownload(it);
+    return;
+  }
+
+  st.paused = false;
+  st.active = true;
+  row.classList.remove('hidden');
+  // The bar/speed only fill in on the next /dl-status poll, so seed a visible
+  // state now instead of an empty row while the first chunks register.
+  row.querySelector('.dl-pct').textContent = '0%';
+  row.querySelector('.dl-spd').textContent = 'starting…';
+  updateCardBtn(id);
+
+  const total = it.size;
+  // Build the chunk list once (later calls resume unfinished chunks).
+  if(!st.chunks.length){
+    // Fresh download from byte 0: clear any leftover progress entry from a
+    // previous transfer of the same file, or /dl-status would look complete
+    // already and the progress row would vanish. Await it so the first chunk
+    // requests do not race the reset and flicker total back to zero.
+    try {
+      await fetch('/dl-reset?id='+encodeURIComponent(id), {method:'POST'});
+    } catch {}
+    const n = total >= 64*1024*1024 ? PARALLEL : 1;
+    const per = Math.ceil(total / n);
+    for(let i=0;i<n;i++){
+      st.chunks.push({ i, start: i*per, end: Math.min((i+1)*per, total)-1, loaded: 0, xhr: null, ctrl: null, w: null, done: false });
+    }
+    if(st.opfs) saveMeta(st); // persist resume offsets for the reload case
+  }
+
+  const stopAll = () => {
+    for(const c of st.chunks){
+      if(c.ctrl){ c.ctrl.abort(); c.ctrl = null; }
+      if(c.xhr){ c.xhr.abort(); c.xhr = null; }
     }
   };
-  xhr.onload = () => {
-    if(xhr.status === 200){
-      const url = URL.createObjectURL(xhr.response);
+
+  const finish = () => {
+    if(st.finishing) return;
+    st.finishing = true;
+    st.active = false;
+    if(st.opfs){ finishOpfs(); return; }
+    const parts = [];
+    for(const c of st.chunks){
+      if(st.parts[c.i] instanceof Blob) parts.push(st.parts[c.i]);
+    }
+    const url = URL.createObjectURL(new Blob(parts));
+    const a = document.createElement('a');
+    a.href = url; a.download = it.name;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+    toast('Download complete');
+    const r = dlRow(id);
+    if(r) r.classList.add('hidden');
+    delete dlInFlight[id];
+    delete dlState[id];
+    updateCardBtn(id);
+  };
+
+  // Hard failure (network) on any chunk: retry unfinished chunks a few times,
+  // then give up and ask the user to tap to continue.
+  const fail = () => {
+    stopAll();
+    st.attempts++;
+    if(st.attempts > DL_AUTO_RETRIES){
+      st.active = false;
+      st.paused = true;
+      if(st.opfs) saveMeta(st);
+      const r = dlRow(id);
+      if(r){
+        r.querySelector('.dl-pct').textContent = 'Tap to continue';
+        r.querySelector('.dl-spd').textContent = '';
+      }
+      updateCardBtn(id);
+      return;
+    }
+    const r = dlRow(id);
+    if(r) r.querySelector('.dl-spd').textContent = 'waiting for network…';
+    st.timer = setTimeout(() => {
+      st.timer = null;
+      if(st.paused || !st.active) return;
+      for(const c of st.chunks) if(!c.done && !c.xhr && !c.ctrl) launch(c);
+    }, 800 * st.attempts);
+  };
+
+  const launch = (c) => {
+    if(st.opfs){ launchOpfs(c); return; }
+    const from = c.start + c.loaded;
+    const xhr = new XMLHttpRequest();
+    c.xhr = xhr;
+    xhr.open('GET', '/dl?id='+encodeURIComponent(id), true);
+    xhr.setRequestHeader('Range', 'bytes='+from+'-'+c.end);
+    xhr.responseType = 'blob';
+    // Per-chunk bytes received; used both for pause/resume offsets and, via the
+    // server counter, for the shared progress UI.
+    xhr.onprogress = e => { if(e.lengthComputable) c.loaded = e.loaded; };
+    xhr.onload = () => {
+      c.xhr = null;
+      if(xhr.status === 206){
+        if(xhr.response) st.parts[c.i] = xhr.response;
+        c.loaded = c.end - c.start + 1;
+        c.done = true;
+      } else if(xhr.status === 200){
+        // No Range support: treat the single full body as the whole file.
+        st.parts = [xhr.response];
+        for(const cc of st.chunks){ cc.done = true; }
+      } else {
+        fail();
+        return;
+      }
+      if(st.chunks.every(cc => cc.done)) finish();
+    };
+    xhr.onerror = () => { c.xhr = null; fail(); };
+    xhr.onabort = () => { c.xhr = null; }; // manual pause, not a failure
+    xhr.send();
+  };
+
+  // OPFS chunk: stream a Range request straight into its own part file, so
+  // memory stays constant however big the file is. `pos` starts at `loaded`,
+  // which makes resume (reopening with keepExistingData) write past the bytes
+  // already on disk.
+  const launchOpfs = async (c) => {
+    const from = c.start + c.loaded;
+    let w = null;
+    const ctrl = new AbortController();
+    c.ctrl = ctrl;
+    try {
+      const fh = await st.opfs.getFileHandle(id + '.' + c.i + '.part', {create:true});
+      w = await fh.createWritable({ keepExistingData: c.loaded > 0 });
+      c.w = w;
+    } catch(e){
+      c.ctrl = null;
+      fail();
+      return;
+    }
+    let pos = c.loaded;
+    try {
+      const resp = await fetch('/dl?id='+encodeURIComponent(id), {
+        headers: { 'Range': 'bytes='+from+'-'+c.end },
+        signal: ctrl.signal
+      });
+      if(!resp.ok || !resp.body) throw new Error('http '+resp.status);
+      const reader = resp.body.getReader();
+      while(true){
+        const { done, value } = await reader.read();
+        if(done) break;
+        await w.write({type:'write', position: pos, data: value});
+        pos += value.byteLength;
+        c.loaded = Math.min(c.end - c.start + 1, c.loaded + value.byteLength);
+      }
+      await w.close();
+      c.w = null;
+      if(resp.status === 200){
+        // No Range support: this one response already holds the whole file, so
+        // cancel the other (duplicate full-body) fetches and remember to only
+        // assemble part 0.
+        st.noRange = true;
+        stopAll();
+        for(const cc of st.chunks) cc.done = true;
+      } else {
+        c.done = true;
+      }
+    } catch(e){
+      c.ctrl = null;
+      try { if(w) await w.close(); } catch {}
+      c.w = null;
+      if(ctrl.signal.aborted) return; // manual pause, not a failure
+      fail();
+      return;
+    }
+    c.ctrl = null;
+    if(st.chunks.every(cc => cc.done)) finish();
+  };
+
+  // OPFS finish: concatenate the part files into one (streamed, memory-constant),
+  // hand it to the browser downloader, then clean up all working files.
+  const finishOpfs = async () => {
+    const dir = st.opfs;
+    const finalName = id + '.final';
+    try {
+      const fh = await dir.getFileHandle(finalName, {create:true});
+      const w = await fh.createWritable();
+      const copyOne = async (c) => {
+        const ph = await dir.getFileHandle(id + '.' + c.i + '.part');
+        const pfile = await ph.getFile();
+        const reader = pfile.stream().getReader();
+        while(true){
+          const { done, value } = await reader.read();
+          if(done) break;
+          await w.write(value);
+        }
+      };
+      if(st.noRange){
+        // The whole file came back in part 0; the others were cancelled.
+        await copyOne(st.chunks[0]);
+      } else {
+        for(const c of st.chunks) await copyOne(c);
+      }
+      await w.close();
+      const f = await fh.getFile();
+      const url = URL.createObjectURL(f);
       const a = document.createElement('a');
       a.href = url; a.download = it.name;
       document.body.appendChild(a); a.click(); a.remove();
-      URL.revokeObjectURL(url);
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+      // Parts + meta are disposable now; the assembled .final must outlive the
+      // browser download (the object URL reads it), so delete it lazily.
+      for(const c of st.chunks){ try { await dir.removeEntry(id + '.' + c.i + '.part'); } catch {} }
+      try { await dir.removeEntry(id + '.meta.json'); } catch {}
+      setTimeout(() => opfsCleanup(dir, id), 10 * 60 * 1000);
       toast('Download complete');
-    } else { toast('Download failed'); }
-    row.classList.add('hidden');
+    } catch(e){
+      toast('Failed to assemble file');
+    }
+    const r = dlRow(id);
+    if(r) r.classList.add('hidden');
+    delete dlInFlight[id];
+    delete dlState[id];
+    updateCardBtn(id);
   };
-  xhr.onerror = () => { toast('Network error'); row.classList.add('hidden'); };
-  xhr.send();
+
+  for(const c of st.chunks) if(!c.done && !c.xhr && !c.ctrl) launch(c);
 }
+
+// OPFS helpers --------------------------------------------------------------
+// The origin-private file system is the only browser storage that is
+// disk-backed: chunks stream into per-part files, memory stays flat, and a
+// .meta.json preserves offsets so a reloaded page can resume. Falls back to
+// null (in-memory / native downloaders) when unavailable or out of quota.
+
+async function opfsDir(needed){
+  try {
+    if(!navigator.storage || typeof navigator.storage.getDirectory !== 'function') return null;
+    const dir = await navigator.storage.getDirectory();
+    if(needed > 0){
+      const est = await navigator.storage.estimate();
+      if(est && est.quota){
+        const free = est.quota - est.usage;
+        if(needed > free * 0.9) return null; // not enough headroom -> native
+      }
+    }
+    // Probe createWritable: absent or broken on older iOS (pre-16.4).
+    const fh = await dir.getFileHandle('.probe', {create:true});
+    const w = await fh.createWritable();
+    await w.write('x');
+    await w.close();
+    await dir.removeEntry('.probe');
+    return dir;
+  } catch { return null; }
+}
+
+async function saveMeta(st){
+  if(!st.opfs) return;
+  try {
+    const fh = await st.opfs.getFileHandle(st.it.id + '.meta.json', {create:true});
+    const w = await fh.createWritable();
+    await w.write(JSON.stringify({
+      id: st.it.id, name: st.it.name, total: st.it.size,
+      chunks: st.chunks.map(c => ({ i:c.i, start:c.start, end:c.end, loaded:c.loaded, done:c.done }))
+    }));
+    await w.close();
+  } catch {}
+}
+
+async function opfsCleanup(dir, id){
+  if(!dir) return;
+  try {
+    for(let i=0;i<=PARALLEL;i++){ try { await dir.removeEntry(id + '.' + i + '.part'); } catch {} }
+    try { await dir.removeEntry(id + '.final'); } catch {}
+    try { await dir.removeEntry(id + '.meta.json'); } catch {}
+  } catch {}
+}
+
+// On page load, surface interrupted OPFS transfers left by a previous session:
+// the rows come back paused with "tap to resume", and tapping continues from
+// the saved per-chunk offsets (parts are already on disk).
+let restoredOnce = false;
+async function restorePending(items){
+  if(isPC || restoredOnce) return;
+  restoredOnce = true;
+  let dir;
+  try { dir = await navigator.storage.getDirectory(); } catch { return; }
+  let names = [];
+  try {
+    for await (const [name] of dir.entries()){
+      if(name.endsWith('.meta.json')) names.push(name);
+    }
+  } catch { return; }
+  for(const name of names){
+    let meta;
+    try {
+      const f = await (await dir.getFileHandle(name)).getFile();
+      meta = JSON.parse(await f.text());
+    } catch { continue; }
+    if(!meta || !meta.chunks || meta.chunks.every(c => c.done)) continue;
+    const it = items.find(x => x.id === meta.id);
+    if(!it) continue;
+    const st = {
+      it, parts: [],
+      chunks: meta.chunks.map(c => ({ i:c.i, start:c.start, end:c.end, loaded:c.loaded, done:c.done, xhr:null, ctrl:null, w:null })),
+      attempts: 0, timer: null, active: false, paused: true, opfs: dir, finishing: false
+    };
+    dlState[meta.id] = st;
+    const row = dlRow(meta.id);
+    if(row){
+      row.classList.remove('hidden');
+      let got = 0;
+      for(const c of st.chunks) got += Math.min(c.loaded, c.end - c.start + 1);
+      row.querySelector('.dl-pct').textContent = 'Paused · '+(meta.total ? Math.floor(got/meta.total*100) : 0)+'%';
+      row.querySelector('.dl-spd').textContent = 'tap to resume';
+      updateCardBtn(meta.id);
+    }
+  }
+}
+
+// Huge file: hand it to the browser's native downloader (writes to disk, no
+// memory blow-up). Progress still shows on both ends through /dl-status.
+function nativeDownload(it){
+  fetch('/dl-reset?id='+encodeURIComponent(it.id), {method:'POST'}).catch(()=>{});
+  const a = document.createElement('a');
+  a.href = '/dl?id='+encodeURIComponent(it.id);
+  a.download = it.name;
+  document.body.appendChild(a); a.click(); a.remove();
+  toast('Downloading via browser…');
+}
+
+// User-initiated pause: abort all in-flight chunks, keep per-chunk offsets.
+// OPFS chunks keep their part files on disk; the meta is saved so a reloaded
+// page can resume too.
+function pauseDownload(it){
+  const st = dlState[it.id];
+  if(!st) return;
+  st.paused = true;
+  st.active = false;
+  if(st.timer){ clearTimeout(st.timer); st.timer = null; }
+  for(const c of st.chunks){
+    if(c.ctrl){ c.ctrl.abort(); c.ctrl = null; }
+    if(c.xhr){ c.xhr.abort(); c.xhr = null; }
+  }
+  let got = 0;
+  for(const c of st.chunks) got += Math.min(c.loaded, c.end - c.start + 1);
+  if(st.opfs) saveMeta(st);
+  const r = dlRow(it.id);
+  if(r){
+    r.querySelector('.dl-pct').textContent = 'Paused · '+(it.size ? Math.floor(got/it.size*100) : 0)+'%';
+    r.querySelector('.dl-spd').textContent = '';
+  }
+  updateCardBtn(it.id);
+}
+
+// Shared progress bar: the server counts bytes sent per message id, and both
+// the PC and the phone poll it to render progress + speed on the timeline.
+// This also makes native (browser-managed) downloads visible on both ends.
+// The same poll carries the paused flag, so a pause from either device is
+// mirrored onto the other end within a second.
+const progCache = {};
+async function syncProgress(){
+  let list;
+  try {
+    const r = await fetch('/dl-status');
+    list = await r.json();
+  } catch { return; }
+  const now = performance.now();
+  for(const d of list){
+    const row = dlRow(d.id);
+    if(!row) continue;
+    const st = dlState[d.id];
+    const wasPaused = serverPaused[d.id] || false;
+    serverPaused[d.id] = d.paused;
+    if(d.sent < d.total) dlInFlight[d.id] = true;
+    updateCardBtn(d.id);
+
+    // Another end paused: mirror it locally (abort in-flight chunks).
+    if(d.paused){
+      if(st && st.active) pauseDownload(st.it);
+      continue;
+    }
+    // Pause lifted by the other end: resume from the saved per-chunk offsets.
+    if(wasPaused && st && st.paused && !st.active){
+      downloadFile(st.it);
+    }
+    if(st && st.paused) continue; // locally held; progress bar is frozen
+
+    const fill = row.querySelector('.dlfill');
+    const pctEl = row.querySelector('.dl-pct');
+    const spdEl = row.querySelector('.dl-spd');
+    const sent = Math.min(d.sent, d.total);
+    const pct = d.total ? sent/d.total*100 : 0;
+    fill.style.width = pct + '%';
+    pctEl.textContent = pct.toFixed(0)+'% ('+fmtSize(sent)+')';
+    const prev = progCache[d.id];
+    if(prev){
+      const dt = (now - prev.t)/1000;
+      if(dt > 0.3){
+        const speed = (d.sent - prev.sent)/dt;
+        spdEl.textContent = (speed >= 0 ? fmtSize(speed) : '0 B')+'/s';
+      }
+    }
+    progCache[d.id] = { t: now, sent: d.sent };
+    if(d.sent >= d.total){
+      delete progCache[d.id];
+      delete dlInFlight[d.id];
+      updateCardBtn(d.id);
+      setTimeout(() => { const r2 = dlRow(d.id); if(r2) r2.classList.add('hidden'); }, 1500);
+    } else {
+      row.classList.remove('hidden');
+    }
+  }
+}
+setInterval(syncProgress, 1000);
 
 function sendText(){
   const t = $('txt');
@@ -980,6 +1561,37 @@ $('plus').onclick = () => {
   $('fileInput').click();
 };
 
+// Register real PC paths as zero-copy local references (from="pc"), like the
+// plus button. Used by the file dialog and by PC drag-and-drop (the webview
+// exposes the dropped file's path via the non-standard File.path). A short
+// dedup window absorbs the drop being delivered both as an HTML5 drop AND as
+// the tauri://drag-drop event, so the file is not registered twice.
+const recentLocal = new Map();
+async function addLocalPaths(paths){
+  if(!paths.length) return;
+  const now = Date.now();
+  const fresh = paths.filter(p => {
+    const t = recentLocal.get(p);
+    recentLocal.set(p, now);
+    return !t || now - t > 5000;
+  });
+  if(!fresh.length) return;
+  const r = await fetch('/add-local', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ paths: fresh })
+  });
+  if(!r.ok) toast('Registration failed');
+}
+// Tauri fires tauri://drag-drop with the real paths in parallel with the HTML5
+// drop. Listening to it covers platforms where the File.path injection is
+// missing; addLocalPaths' dedup makes the double-delivery harmless.
+if(isPC && window.__TAURI__ && window.__TAURI__.event){
+  window.__TAURI__.event.listen('tauri://drag-drop', e => {
+    const p = e.payload;
+    if(p && Array.isArray(p.paths) && p.paths.length) addLocalPaths(p.paths);
+  }).catch(()=>{});
+}
+
 async function pickLocal(){
   const T = window.__TAURI__;
   if(!T || !T.dialog || !T.dialog.open){
@@ -992,12 +1604,7 @@ async function pickLocal(){
     if(Array.isArray(picked)) paths = picked.map(p => typeof p === 'string' ? p : p.path);
     else if(typeof picked === 'string') paths = [picked];
     else if(picked && picked.path) paths = [picked.path];
-    if(!paths.length) return;
-    const r = await fetch('/add-local', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ paths })
-    });
-    if(!r.ok){ toast('Registration failed'); }
+    addLocalPaths(paths);
   } catch(e) {
     toast('Add failed');
   }
@@ -1028,24 +1635,47 @@ window.addEventListener('drop', e => {
   e.preventDefault();
   dragCounter = 0;
   dOverlay.classList.remove('active');
-  if(e.dataTransfer.files.length) uploadFiles([...e.dataTransfer.files]);
+  const files = [...e.dataTransfer.files];
+  if(!files.length) return;
+  // PC drag-and-drop behaves like the plus button: zero-copy local references
+  // when the webview exposes real paths, so no local copy/upload happens. Only
+  // falls back to uploading when paths are unavailable (e.g. the phone side).
+  if(isPC){
+    const paths = files.map(f => f.path).filter(p => typeof p === 'string' && p);
+    if(paths.length === files.length){
+      addLocalPaths(paths);
+      return;
+    }
+  }
+  uploadFiles(files);
 });
 
 let offline = false;
+// Last moment any request/SSE succeeded; the watchdog below turns the phone's
+// badge to "Disconnected" after ~20s of silence. Catches silent network loss
+// (PC sleep, WiFi drop, router restart) where TCP hangs instead of erroring.
+// (The PC's own page is served by the same process, so it never outlives the
+// server; this is meaningful only for the phone's page.)
+let lastLive = Date.now();
 function setOffline(v){
   if(offline === v) return;
   offline = v;
   $('offBanner').classList.toggle('show', v);
-  if(isPC) return;
+  if(isPC) return; // PC badge reflects phone presence only, driven by /info
   $('badge').classList.toggle('off', v);
   $('badgeTxt').textContent = v ? 'Disconnected' : 'Connected';
 }
 
 const es = new EventSource('/events');
-es.onmessage = () => { refresh(); checkFwStatus(); };
+es.onmessage = () => { lastLive = Date.now(); refresh(); checkFwStatus(); };
 es.onerror = () => setOffline(true);
-es.onopen = () => { setOffline(false); refresh(); };
+es.onopen = () => { lastLive = Date.now(); setOffline(false); refresh(); };
 const refreshTimer = setInterval(refresh, 4000);
+// Watchdog: if nothing succeeded for ~20s, the link is silently gone (a hang,
+// not a reject) - force the offline state so the badge/banner do not sit stale.
+setInterval(() => {
+  if(Date.now() - lastLive > 20000) setOffline(true);
+}, 5000);
 
 let fwChecking = false;
 let fwWasShown = false;
@@ -1097,6 +1727,10 @@ function supersede(){
   $('deadOverlay').classList.add('show');
   setTimeout(() => window.close(), 300);
 }
+// Browsers only allow window.close() for script-opened windows, and tabs opened
+// by scanning a QR are user-opened - so this button may also be ignored on iOS,
+// but under a user gesture some browsers grant self-close.
+$('deadClose').onclick = () => { try { window.close(); } catch {} };
 let superseded = false;
 const takeover = 'BroadcastChannel' in window ? new BroadcastChannel('tinbox-page') : null;
 if(takeover){
@@ -1115,6 +1749,9 @@ $('qrLightbox').onclick = closeQrLightbox;
 if(isPC){
   let everConnected = false;
   let missedPolls = 0;
+  // User dismissed the gate to browse the inbox without a device connected;
+  // a real connection resets it so a later drop re-shows the scan screen.
+  let gateDismissed = false;
   const updateMobile = () => {
     fetch('/info').then(r=>r.json()).then(d => {
       if(!d) return;
@@ -1122,12 +1759,13 @@ if(isPC){
         if(!everConnected) toast('Device connected');
         everConnected = true;
         missedPolls = 0;
+        gateDismissed = false;
         $('gateTitle').textContent = 'Scan to connect';
       } else if(everConnected && ++missedPolls >= 20){
         everConnected = false;
         $('gateTitle').textContent = 'Connection lost — Scan again';
       }
-      $('gate').classList.toggle('show', !everConnected);
+      $('gate').classList.toggle('show', !everConnected && !gateDismissed);
       $('badge').classList.toggle('wait', !d.mobileConnected);
       $('badgeTxt').textContent = d.mobileConnected ? 'Connected' : 'Waiting for device';
       if(d.url){ 
@@ -1138,9 +1776,26 @@ if(isPC){
     }).catch(()=>{});
   };
   $('gate').classList.add('show');
+  $('gateInbox').onclick = () => { gateDismissed = true; $('gate').classList.remove('show'); };
   updateMobile();
   setInterval(updateMobile, 3000);
 }
+
+// Report client-side exceptions into the server log, so a failure on the phone
+// (where tinbox.log is not directly readable) still lands in tinbox.log with a
+// "client:" prefix. Fire-and-forget; a dead server must not loop on errors.
+function reportClientError(msg){
+  fetch('/log', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ msg }) }).catch(()=>{});
+}
+window.addEventListener('error', e => {
+  reportClientError((e.message || 'unknown error') + ' @' + (e.filename || '') + ':' + (e.lineno || ''));
+});
+window.addEventListener('unhandledrejection', e => {
+  const r = e.reason;
+  const msg = (r && (r.message || r.toString())) || String(r);
+  reportClientError('unhandledrejection: ' + msg);
+});
 
 refresh();
 </script>

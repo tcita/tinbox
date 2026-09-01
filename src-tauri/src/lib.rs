@@ -48,7 +48,10 @@ pub fn run() {
             .inner_size(520.0, 720.0)
             .min_inner_size(360.0, 480.0)
             .center()
-            .disable_drag_drop_handler() // let HTML5 drag-and-drop upload work, not intercepted by Tauri
+            // Keep Tauri's drag-drop handler ENABLED: it injects the real
+            // `path` onto dropped File objects (that is what lets the frontend
+            // register a zero-copy reference instead of uploading a copy). It
+            // also preventDefaults the drop, so no navigation to the file.
             .build()?;
 
             Ok(())

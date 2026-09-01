@@ -6,7 +6,7 @@
 use axum::{
     body::Body,
     extract::{connect_info::ConnectInfo, Multipart, Query, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{from_fn, Next},
     response::{Html, IntoResponse, Json, Response, sse::{Event, Sse, KeepAlive}},
     routing::{get, post},
@@ -24,12 +24,33 @@ use tokio_stream::StreamExt as _;
 use tokio_util::io::ReaderStream;
 
 use crate::catalog;
-use crate::logger::logf;
+use crate::logger::{loge, logf, logw};
 use tauri::Manager;
 
 /// The app logo, embedded so the frontend can show it (header brand, connect
 /// gate, favicon) without shipping a separate file next to the exe.
 static LOGO: &[u8] = include_bytes!("logo.svg");
+
+/// Live download progress keyed by message id, aggregated across the parallel
+/// Range requests of one transfer. Both the PC and the phone poll /dl-status
+/// to render a shared progress bar + speed on the timeline (which also covers
+/// browser-native downloads the client cannot measure itself).
+#[derive(Clone, Default)]
+struct DlProg {
+    total: u64,
+    sent: u64,
+    last_ts: u64,
+    /// Either side can pause a transfer via /dl-pause; the flag rides the same
+    /// /dl-status poll so both devices converge on a shared paused state. The
+    /// downloading side reacts by aborting (pause) or relaunching (resume).
+    paused: bool,
+}
+
+static DL_PROGRESS: OnceLock<Mutex<std::collections::HashMap<String, DlProg>>> = OnceLock::new();
+
+fn dl_progress() -> &'static Mutex<std::collections::HashMap<String, DlProg>> {
+    DL_PROGRESS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
 
 /// Preferred port; when taken, fall forward within the same range, and as a
 /// last resort fall back to a kernel-assigned free port.
@@ -125,7 +146,12 @@ async fn log_requests(
     }
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    logf(&format!("{} {} <- {}", method, path, peer));
+    // High-frequency polling endpoints would log a line every second (each
+    // connected page polls dl-status/info/fw-status and list on refresh) and
+    // bury meaningful events. Log them only when they error below.
+    if method.as_str() != "GET" || !is_quiet_poll(&path) {
+        logf(&format!("{} {} <- {}", method, path, peer));
+    }
     let resp = next.run(req).await;
     if resp.status().as_u16() >= 400 {
         logf(&format!(
@@ -137,6 +163,11 @@ async fn log_requests(
         ));
     }
     resp
+}
+
+/// Polling endpoints whose successful responses are not worth a log line.
+fn is_quiet_poll(path: &str) -> bool {
+    matches!(path, "/dl-status" | "/info" | "/fw-status" | "/list")
 }
 
 /// A LAN peer whose /24 differs from the address the QR code points at is the
@@ -168,14 +199,31 @@ fn note_foreign_subnet(peer: &SocketAddr) {
 /// by one; if all are taken, bind port 0 (kernel assigns a free port).
 async fn bind_any() -> std::io::Result<(tokio::net::TcpListener, u16)> {
     for port in PORT..PORT + 16 {
-        match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+        match bind_listener(port).await {
             Ok(l) => return Ok((l, port)),
-            Err(_) => logf(&format!("port {port} is in use, trying the next one")),
+            Err(_) => logw(&format!("port {port} is in use, trying the next one")),
         }
     }
-    let l = tokio::net::TcpListener::bind(("0.0.0.0", 0)).await?;
+    let l = bind_listener(0).await?;
     let port = l.local_addr()?.port();
     Ok((l, port))
+}
+
+/// Bind a listening socket with SO_REUSEADDR. On Windows a killed server's
+/// accepted connections linger in TIME_WAIT for ~2 minutes; without reuse the
+/// same port cannot rebind right after a restart, the app flips to the next
+/// port, and the already-open phone has to rescan the QR. Reuse keeps the same
+/// URL across restarts so the phone reconnects by itself.
+async fn bind_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    // Windows' default SO_SNDBUF is ~64 KB, which caps one LAN stream at
+    // buffer/RTT (64 KB / 5 ms ~ 12 MB/s, far less on congested WiFi), and the
+    // parallel chunks each inherit that ceiling. A large send buffer lets the
+    // server keep the pipe full; accepted sockets inherit SO_SNDBUF on Windows.
+    socket.set_send_buffer_size(4 * 1024 * 1024)?;
+    socket.bind(std::net::SocketAddr::from(([0, 0, 0, 0], port)))?;
+    socket.listen(1024)
 }
 
 /// Start axum on a separate thread; once the port is bound, send the actual
@@ -199,7 +247,9 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
             ));
 
             // Inbox directory (next to the exe); ensure it exists on first run.
-            std::fs::create_dir_all(catalog::inbox_dir()).ok();
+            if let Err(e) = std::fs::create_dir_all(catalog::inbox_dir()) {
+                loge(&format!("could not create inbox directory: {}", e));
+            }
 
             // Load the index; if empty and a legacy shared directory exists,
             // run the one-time migration (transparent to existing users).
@@ -216,11 +266,17 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 .route("/send-text", post(send_text))
                 .route("/log", post(client_log))
                 .route("/dl", get(download))
+                .route("/dl-status", get(dl_status))
+                .route("/dl-pause", post(dl_pause))
+                .route("/dl-reset", post(dl_reset))
                 .route("/view", get(view))
                 .route("/open", post(open_file))
                 .route("/rm", post(remove))
                 .route("/qr", get(qr))
                 .route("/logo", get(logo))
+                .route("/favicon.ico", get(logo))
+                .route("/apple-touch-icon.png", get(logo))
+                .route("/apple-touch-icon-precomposed.png", get(logo))
                 .route("/open-dir", post(open_dir))
                 .route("/reveal", post(reveal))
                 .route("/events", get(events))
@@ -238,7 +294,7 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
             let (listener, actual) = match bind_any().await {
                 Ok(v) => v,
                 Err(e) => {
-                    logf(&format!("could not bind any port: {}", e));
+                    loge(&format!("could not bind any port: {}", e));
                     let _ = tx.send(None);
                     return;
                 }
@@ -254,11 +310,11 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 actual, ip, actual, ips
             ));
             logf(
-                "phone cannot connect? (1) if NO '<phone-ip>' request line appears below when \
-                 the phone tries, the request never reached this machine: firewall block, \
-                 wrong QR IP, or router AP isolation / different WiFi; (2) if a request line \
-                 DOES appear, the network path is fine and any failure will show as an \
-                 'error response' line",
+                "diagnostics - how to read this log: every phone request logs a '<phone-ip> GET ...' \
+                 line. If the phone cannot open the page, those lines are absent, meaning requests \
+                 never reached this PC (firewall block, wrong QR IP, or router AP isolation / \
+                 another network). Any failure the server does see appears as an 'error response' \
+                 line",
             );
             let _ = tx.send(Some(actual));
             if let Err(e) = axum::serve(
@@ -267,7 +323,7 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
             )
             .await
             {
-                logf(&format!("server error: {}", e));
+                loge(&format!("server error: {}", e));
             }
         });
     });
@@ -307,7 +363,10 @@ fn migrate_legacy_shared() {
         }
     }
     if moved > 0 {
-        println!("migrated {} files from the old shared directory to inbox", moved);
+        logf(&format!(
+            "migrated {} files from the old shared directory to inbox",
+            moved
+        ));
     }
     // Remove the now-empty directory so it is not mistaken for being still in
     // use.
@@ -361,7 +420,7 @@ async fn upload(mut multipart: Multipart) -> impl IntoResponse {
         let file = match tokio::fs::File::create(&stored).await {
             Ok(f) => tokio::io::BufWriter::with_capacity(512 * 1024, f),
             Err(e) => {
-                logf(&format!("upload create failed {}: {}", filename, e));
+                loge(&format!("upload create failed {}: {}", filename, e));
                 return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}"))
                     .into_response();
             }
@@ -397,7 +456,7 @@ async fn upload(mut multipart: Multipart) -> impl IntoResponse {
                 // remove it and do NOT register the catalog entry.
                 drop(file);
                 let _ = std::fs::remove_file(&stored);
-                logf(&format!("upload failed {} after {} bytes: {}", filename, total, e));
+                logw(&format!("upload failed {} after {} bytes: {}", filename, total, e));
                 return (StatusCode::BAD_REQUEST, e).into_response();
             }
         }
@@ -553,9 +612,9 @@ fn mime_for(name: &str) -> String {
 /// Shared file dispatch: inline=true previews in the browser (/view), false
 /// forces a download (/dl). Looks up the message by id; only File messages can
 /// be dispatched, Text returns 400.
-async fn serve(Query(p): Query<IdParam>, inline: bool) -> impl IntoResponse {
+async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> impl IntoResponse {
     let Some(entry) = catalog::find(&p.id) else {
-        logf(&format!("serve: id {} not found", p.id));
+        logw(&format!("serve: id {} not found", p.id));
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
     let (path, name) = match &entry.body {
@@ -564,46 +623,259 @@ async fn serve(Query(p): Query<IdParam>, inline: bool) -> impl IntoResponse {
             return (StatusCode::BAD_REQUEST, "not a file").into_response();
         }
     };
-    match tokio::fs::File::open(path).await {
-        Ok(file) => {
-            // Read the file size to set Content-Length so the frontend can show
-            // a download progress bar and speed.
-            let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-            let stream = ReaderStream::new(file);
-            let body = Body::from_stream(stream);
-            let ct = if inline {
-                mime_for(name)
-            } else {
-                "application/octet-stream".to_string()
-            };
-            let disp = if inline { "inline" } else { "attachment" };
-            let cd = format!("{}; filename=\"{}\"", disp, name);
-            (
-                StatusCode::OK,
-                [
-                    (header::CONTENT_DISPOSITION, cd),
-                    (header::CONTENT_LENGTH, len.to_string()),
-                    (header::CONTENT_TYPE, ct),
-                ],
-                body,
-            )
-                .into_response()
-        }
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(f) => f,
         // The original file of a local reference may have been moved/deleted ->
         // friendly message.
         Err(_) => {
-            logf(&format!("serve: file not on disk {} ({})", name, path));
-            (StatusCode::NOT_FOUND, "file missing").into_response()
+            logw(&format!("serve: file not on disk {} ({})", name, path));
+            return (StatusCode::NOT_FOUND, "file missing").into_response();
+        }
+    };
+    // Read the file size to set Content-Length so the frontend can show a
+    // download progress bar and speed.
+    let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+
+    // Range support: the phone resumes interrupted downloads by asking for
+    // bytes=N- instead of re-fetching the whole file, and media previews get
+    // seekable playback for free. Malformed / multi-range headers fall through
+    // to a full 200 body.
+    let (start, end, partial) = match headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|r| parse_range(r, len))
+    {
+        Some(Ok((s, e))) => (s, e, true),
+        // Unsatisfiable: start is past the end of the file -> 416 with the
+        // resource length advertised for a retry.
+        Some(Err(())) => {
+            return (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, format!("bytes */{len}"))],
+            )
+                .into_response();
+        }
+        None => (0, len.saturating_sub(1), false),
+    };
+
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+    if start > 0 {
+        if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
+            logw(&format!("serve: seek failed {}: {}", path, e));
+            return (StatusCode::INTERNAL_SERVER_ERROR, "seek failed").into_response();
+        }
+    }
+    // Progress tracking: real downloads (not inline previews) register a
+    // shared counter per message id, and each chunk written to the socket is
+    // counted, so /dl-status can show the same bar/speed on both ends. Parallel
+    // Range requests of one transfer accumulate into the same entry.
+    let prog_id = if inline { None } else { Some(p.id.clone()) };
+    if let Some(id) = &prog_id {
+        let mut map = dl_progress().lock().unwrap();
+        let e = map.entry(id.clone()).or_default();
+        e.total = len;
+        e.last_ts = now_unix();
+    }
+    // Take() caps the read at the range end so a partial response carries
+    // exactly end-start+1 bytes, not the rest of the file. A large read buffer
+    // matters for throughput: 16KB chunks (ReaderStream default) saturate the
+    // LAN poorly, 512KB keeps the TCP send buffer full and pushes real WiFi
+    // speeds instead of 2 MB/s.
+    let base = ReaderStream::with_capacity(file.take(end - start + 1), 1024 * 1024);
+    let stream: std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send>,
+    > = match &prog_id {
+        Some(id) => {
+            let id = id.clone();
+            Box::pin(base.map(move |chunk| {
+                if let Ok(b) = &chunk {
+                    let mut map = dl_progress().lock().unwrap();
+                    if let Some(e) = map.get_mut(&id) {
+                        e.sent += b.len() as u64;
+                        e.last_ts = now_unix();
+                    }
+                }
+                chunk
+            }))
+        }
+        None => Box::pin(base),
+    };
+    // Downloads (not inline previews) get a throughput measurement: when the
+    // stream completes, log MB/s server->socket. If the server logs fast but
+    // the phone UI is slow, the bottleneck is the client/WiFi, not this side.
+    let body = if inline {
+        Body::from_stream(stream)
+    } else {
+        Body::from_stream(Measured {
+            inner: stream,
+            label: format!("{} [{start}-{end}]", name),
+            start: tokio::time::Instant::now(),
+            bytes: 0,
+        })
+    };
+    let ct = if inline {
+        mime_for(name)
+    } else {
+        "application/octet-stream".to_string()
+    };
+    let disp = if inline { "inline" } else { "attachment" };
+    let cd = format!("{}; filename=\"{}\"", disp, name);
+    let mut resp = (
+        StatusCode::OK,
+        [
+            (header::ACCEPT_RANGES, "bytes".to_string()),
+            (header::CONTENT_DISPOSITION, cd),
+            (header::CONTENT_LENGTH, len.to_string()),
+            (header::CONTENT_TYPE, ct),
+        ],
+        body,
+    )
+        .into_response();
+    if partial {
+        *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
+        let cr = format!("bytes {start}-{end}/{len}");
+        if let Ok(v) = HeaderValue::from_str(&cr) {
+            resp.headers_mut().insert(header::CONTENT_RANGE, v);
+        }
+        if let Ok(v) = HeaderValue::from_str(&(end - start + 1).to_string()) {
+            resp.headers_mut().insert(header::CONTENT_LENGTH, v);
+        }
+    }
+    resp
+}
+
+/// Parse a single HTTP Range header for a resource of `len` bytes.
+/// Returns Ok((start, end)) inclusive when satisfiable, Err(()) when the
+/// requested start is past the end (416), and None for malformed or
+/// multi-range values (caller serves the full body).
+fn parse_range(range: &str, len: u64) -> Option<Result<(u64, u64), ()>> {
+    let spec = range.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None; // only single ranges are handled
+    }
+    let (s, e) = spec.split_once('-')?;
+    let (s, e) = (s.trim(), e.trim());
+    if s.is_empty() {
+        // Suffix range "bytes=-N": the last N bytes.
+        let n = e.parse::<u64>().ok()?;
+        if n == 0 || len == 0 {
+            return None;
+        }
+        let n = n.min(len);
+        return Some(Ok((len - n, len - 1)));
+    }
+    let start = s.parse::<u64>().ok()?;
+    if start >= len {
+        return Some(Err(())); // unsatisfiable
+    }
+    let end = if e.is_empty() {
+        len - 1
+    } else {
+        e.parse::<u64>().ok()?.min(len - 1)
+    };
+    if end < start {
+        return None;
+    }
+    Some(Ok((start, end)))
+}
+
+async fn download(q: Query<IdParam>, headers: HeaderMap) -> impl IntoResponse {
+    serve(q, false, headers).await
+}
+
+async fn view(q: Query<IdParam>, headers: HeaderMap) -> impl IntoResponse {
+    serve(q, true, headers).await
+}
+
+/// Wraps a download stream and logs server-side throughput when it completes.
+struct Measured<S> {
+    inner: S,
+    label: String,
+    start: tokio::time::Instant,
+    bytes: u64,
+}
+
+impl<S, E> tokio_stream::Stream for Measured<S>
+where
+    S: tokio_stream::Stream<Item = Result<axum::body::Bytes, E>> + Unpin,
+{
+    type Item = Result<axum::body::Bytes, E>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(b))) => {
+                self.bytes += b.len() as u64;
+                std::task::Poll::Ready(Some(Ok(b)))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
+            std::task::Poll::Ready(None) => {
+                if self.bytes >= 4 * 1024 * 1024 {
+                    let secs = self.start.elapsed().as_secs_f64();
+                    let mbps = if secs > 0.0 {
+                        self.bytes as f64 / secs / (1024.0 * 1024.0)
+                    } else {
+                        0.0
+                    };
+                    logf(&format!(
+                        "dl {}: {:.1} MB in {:.2}s = {:.1} MB/s",
+                        self.label,
+                        self.bytes as f64 / (1024.0 * 1024.0),
+                        secs,
+                        mbps
+                    ));
+                }
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
 }
 
-async fn download(q: Query<IdParam>) -> impl IntoResponse {
-    serve(q, false).await
+/// Live transfer progress for the /dl-status poll: every download the server is
+/// currently serving (or finished within the last 30s), so the PC and the phone
+/// render the same progress bar and speed. Stale completed entries are pruned.
+async fn dl_status() -> impl IntoResponse {
+    let now = now_unix();
+    let mut map = dl_progress().lock().unwrap();
+    map.retain(|_, e| !(e.sent >= e.total && now.saturating_sub(e.last_ts) > 30));
+    let items: Vec<_> = map
+        .iter()
+        .map(|(id, e)| {
+            serde_json::json!({ "id": id, "total": e.total, "sent": e.sent, "paused": e.paused })
+        })
+        .collect();
+    Json(items)
 }
 
-async fn view(q: Query<IdParam>) -> impl IntoResponse {
-    serve(q, true).await
+/// Pause/resume a transfer from either end (POST /dl-pause?id=X&paused=1|0).
+/// Flips the shared paused flag; /dl-status carries it to both devices on the
+/// next poll, and the downloading side aborts (pause) or relaunches unfinished
+/// chunks (resume). The entry may not exist yet if a pause races the first
+/// request - create it so the flag survives until the transfer registers.
+#[derive(serde::Deserialize)]
+struct PauseParam {
+    id: String,
+    paused: u8,
+}
+
+async fn dl_pause(Query(p): Query<PauseParam>) -> impl IntoResponse {
+    let mut map = dl_progress().lock().unwrap();
+    let e = map.entry(p.id).or_default();
+    e.paused = p.paused != 0;
+    e.last_ts = now_unix();
+    (StatusCode::OK, "ok").into_response()
+}
+
+/// A fresh download restarts the shared counter: without this, re-downloading a
+/// file whose previous entry still holds sent>=total (kept alive ~30s after it
+/// finished) makes /dl-status immediately look complete and the progress row
+/// vanishes. The phone POSTs this when it starts from byte 0.
+async fn dl_reset(Query(p): Query<IdParam>) -> impl IntoResponse {
+    let mut map = dl_progress().lock().unwrap();
+    map.insert(p.id, DlProg::default());
+    (StatusCode::OK, "ok").into_response()
 }
 
 async fn remove(
@@ -615,7 +887,7 @@ async fn remove(
     // phone deletes one entry, the PC's chat history disappears with it,
     // irreversibly. Enforced on the backend to prevent bypassing the frontend.
     if from_by_peer(peer) != "pc" {
-        logf(&format!("remove: rejected delete request from phone id={}", p.id));
+        logw(&format!("remove: rejected delete request from phone id={}", p.id));
         return (StatusCode::FORBIDDEN, "phone cannot delete").into_response();
     }
     match catalog::remove(&p.id) {
@@ -630,6 +902,9 @@ async fn remove(
                 catalog::MsgBody::Text { .. } => "text message deleted".to_string(),
             };
             logf(&format!("remove: {}", label));
+            // Drop its progress entry so /dl-status stops advertising a deleted
+            // file to whichever side is still downloading it.
+            dl_progress().lock().unwrap().remove(&p.id);
             let _ = notifier().send(());
             (StatusCode::OK, "deleted").into_response()
         }
@@ -652,13 +927,15 @@ fn reveal_path(path: &str) {
         let arg = format!("/select,\"{}\"", path);
         match std::process::Command::new("explorer").raw_arg(&arg).spawn() {
             Ok(_) => return,
-            Err(_) => {}
+            Err(e) => logw(&format!("reveal: explorer /select failed: {}", e)),
         }
     }
     let dir = Path::new(path)
         .parent()
         .unwrap_or_else(|| Path::new("."));
-    let _ = open::that(dir);
+    if let Err(e) = open::that(dir) {
+        logw(&format!("reveal: could not open containing dir {}: {}", dir.display(), e));
+    }
 }
 
 /// Open a file with the system default viewer (PC side single-click on a file
@@ -683,7 +960,7 @@ async fn open_file(Query(p): Query<IdParam>) -> impl IntoResponse {
     match opened {
         Ok(Ok(_)) => (StatusCode::OK, "opened").into_response(),
         Ok(Err(e)) => {
-            logf(&format!("open: could not open {} with the default viewer: {}", path, e));
+            loge(&format!("open: could not open {} with the default viewer: {}", path, e));
             (StatusCode::INTERNAL_SERVER_ERROR, "open failed").into_response()
         }
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "task failed").into_response(),
@@ -715,7 +992,10 @@ async fn reveal(Query(p): Query<IdParam>) -> impl IntoResponse {
 async fn open_dir() -> impl IntoResponse {
     match open::that(catalog::inbox_dir()) {
         Ok(_) => (StatusCode::OK, "opened").into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
+        Err(e) => {
+            logw(&format!("open-dir: could not open inbox folder: {}", e));
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response()
+        }
     }
 }
 
@@ -741,7 +1021,7 @@ async fn qr() -> impl IntoResponse {
     let qr = match qrcode::QrCode::new(url.as_bytes()) {
         Ok(q) => q,
         Err(e) => {
-            eprintln!("QR generation failed: {}  url={}", e, url);
+            loge(&format!("QR generation failed: {}  url={}", e, url));
             return (StatusCode::INTERNAL_SERVER_ERROR, "qr error").into_response();
         }
     };
@@ -791,16 +1071,13 @@ async fn logo() -> impl IntoResponse {
 
 /// Enumerate this machine's IPv4 candidates for the QR code.
 ///
-/// Deliberately no scoring. The real-world cases are (a) a single real
-/// adapter and (b) a real adapter plus virtual noise (Docker/WSL/VPN), and
-/// both are resolved by two deterministic filters. First, adapters whose
-/// name/description matches a virtual keyword are excluded outright — their
-/// "gateway" is an in-machine vswitch that answers probes, so liveness
-/// cannot tell them apart. Second, the rest are probed by pinging their
-/// default gateway with their own address as source; no reply means the
-/// network is gone (stale DHCP lease, cable pulled) and the candidate is
-/// dropped. If that leaves nothing — e.g. an enterprise network that blocks
-/// ICMP — fall back to the unfiltered list so the QR never goes blank.
+/// Virtual adapters (TUN VPNs, Docker/WSL vswitches) can never be reached by
+/// the phone, so they are excluded outright by name/description keyword and are
+/// never returned, not even as a fallback. The remaining real adapters are
+/// ordered by gateway reachability (alive first), but a probe miss does NOT
+/// remove an adapter: an active VPN TUN hijacks the ICMP to the real gateway
+/// and produces false "dead"s, and any real IP is still a better QR target
+/// than a vswitch address.
 fn collect_ips() -> Vec<String> {
     // All private IPv4s with their interface names, deduplicated.
     let mut cands: Vec<(String, Ipv4Addr)> = Vec::new();
@@ -818,13 +1095,9 @@ fn collect_ips() -> Vec<String> {
     }
 
     let facts = adapter_facts();
-    if facts.is_empty() {
-        // Facts unavailable (powershell failed / non-Windows): nothing to
-        // filter on — default-route IP first, then numeric order.
-        return fallback_order(&cands);
-    }
 
-    // Filter 1: known virtual adapters out.
+    // Filter 1: known virtual adapters out. Name matching always applies even
+    // when facts are missing; description matching adds the adapter's type.
     let mut real: Vec<(String, Ipv4Addr)> = Vec::new();
     let mut dropped_virtual: Vec<String> = Vec::new();
     for (name, v4) in &cands {
@@ -836,10 +1109,36 @@ fn collect_ips() -> Vec<String> {
         }
     }
 
+    // Nothing real survived (an all-virtual machine). Still never emit a
+    // vswitch address - fall back to the machine's default-route private IP, or
+    // nothing at all. A blank/unreachable QR is honest; a vswitch IP is always
+    // a lie.
+    if real.is_empty() {
+        let mut out: Vec<String> = Vec::new();
+        if let Ok(IpAddr::V4(v4)) = local_ip_address::local_ip() {
+            if is_private(v4) {
+                out.push(v4.to_string());
+            }
+        }
+        let mut last = LAST_DECISION.lock().unwrap();
+        let signature = format!("{}|{}", out.join(","), dropped_virtual.join(","));
+        if *last != signature {
+            *last = signature;
+            logf(&format!(
+                "LAN IP selection: no real adapter; using default route {}; virtual [{}]",
+                out.first().map(String::as_str).unwrap_or("(none)"),
+                dropped_virtual.join(", ")
+            ));
+        }
+        return out;
+    }
+
     // Filter 2: gateway reachability, probed with the candidate's own
     // address as source so the answer is per-interface, not whatever the
     // default route happens to pick. No gateway configured -> cannot probe,
-    // kept last instead of dropped.
+    // kept last. A failed probe only demotes the adapter in the ordering; it
+    // never drops it from the list (false negatives are common with a VPN TUN
+    // active, and any real IP beats a virtual one).
     let probes: Vec<(Ipv4Addr, Ipv4Addr)> = real
         .iter()
         .filter_map(|(name, v4)| {
@@ -854,7 +1153,7 @@ fn collect_ips() -> Vec<String> {
 
     let mut alive: Vec<Ipv4Addr> = Vec::new();
     let mut unprobed: Vec<Ipv4Addr> = Vec::new();
-    let mut dead: Vec<String> = Vec::new();
+    let mut dead: Vec<(Ipv4Addr, String)> = Vec::new();
     for (name, v4) in real {
         let gw = facts
             .get(&name)
@@ -862,23 +1161,19 @@ fn collect_ips() -> Vec<String> {
             .and_then(|g| g.parse::<Ipv4Addr>().ok());
         match gw {
             Some(g) if probed.get(&(v4, g)) == Some(&true) => alive.push(v4),
-            Some(g) => dead.push(format!("{v4} (gateway {g} unreachable)")),
+            Some(g) => dead.push((v4, format!("{v4} (gateway {g} unreachable)"))),
             None => unprobed.push(v4),
         }
     }
     alive.sort_by_key(|v| v.octets());
     unprobed.sort_by_key(|v| v.octets());
-    let mut ips: Vec<String> = alive
+    dead.sort_by_key(|(v, _)| v.octets());
+    let ips: Vec<String> = alive
         .iter()
         .chain(&unprobed)
+        .chain(dead.iter().map(|(v, _)| v))
         .map(ToString::to_string)
         .collect();
-    if ips.is_empty() {
-        // Everything filtered away — probe false negative (ICMP blocked) or
-        // an all-virtual machine. Show the unfiltered list rather than a
-        // blank QR; /qr picks the first entry.
-        ips = fallback_order(&cands);
-    }
 
     // Log whenever any bucket changes, not just the winner: a new virtual
     // adapter appearing or a candidate flipping to dead is diagnostic noise
@@ -895,7 +1190,7 @@ fn collect_ips() -> Vec<String> {
                 "LAN IP selection: using {best}; alive [{}]; no gateway [{}]; dead [{}]; virtual [{}]",
                 list(&alive),
                 list(&unprobed),
-                dead.join(", "),
+                dead.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>().join(", "),
                 dropped_virtual.join(", "),
             ));
             *last = signature;
@@ -912,27 +1207,6 @@ fn is_private(v4: Ipv4Addr) -> bool {
         [172, b, ..] => (16..=31).contains(&b),
         _ => false,
     }
-}
-
-/// Filter-free ordering used when adapter facts are missing or everything
-/// was filtered away: the default-route IP first (if private), then the rest
-/// in numeric order.
-fn fallback_order(cands: &[(String, Ipv4Addr)]) -> Vec<String> {
-    let mut ips: Vec<String> = Vec::new();
-    if let Ok(IpAddr::V4(v4)) = local_ip_address::local_ip() {
-        if is_private(v4) {
-            ips.push(v4.to_string());
-        }
-    }
-    let mut sorted: Vec<Ipv4Addr> = cands.iter().map(|(_, v4)| *v4).collect();
-    sorted.sort_by_key(|v| v.octets());
-    for v4 in sorted {
-        let s = v4.to_string();
-        if !ips.contains(&s) {
-            ips.push(s);
-        }
-    }
-    ips
 }
 
 fn virtual_adapter(s: &str) -> bool {
@@ -986,7 +1260,10 @@ fn probe_gateways(
 }
 
 /// One ICMP echo to the gateway with the interface address pinned as source
-/// (`ping -S`), 1s cap. Exit code 0 means at least one reply came back.
+/// (`ping -S`), 1s cap per attempt, up to two attempts. A single dropped ICMP
+/// (transient WiFi blip, or a VPN TUN capturing the packet) is otherwise a
+/// false "dead" that misorders multi-adapter machines. Exit code 0 means at
+/// least one reply came back.
 /// Each real probe (60s cache miss) logs target, verdict and latency.
 #[cfg(windows)]
 fn gateway_reachable(src: Ipv4Addr, gw: Ipv4Addr) -> bool {
@@ -994,12 +1271,17 @@ fn gateway_reachable(src: Ipv4Addr, gw: Ipv4Addr) -> bool {
     use std::process::Command;
     use std::time::Instant;
     let started = Instant::now();
-    let ok = Command::new("ping")
-        .args(["-n", "1", "-w", "1000", "-S", &src.to_string(), &gw.to_string()])
-        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let mut ok = false;
+    for _ in 0..2 {
+        let out = Command::new("ping")
+            .args(["-n", "1", "-w", "1000", "-S", &src.to_string(), &gw.to_string()])
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .output();
+        if out.map(|o| o.status.success()).unwrap_or(false) {
+            ok = true;
+            break;
+        }
+    }
     logf(&format!(
         "gateway probe from {src} to {gw}: {} in {}ms",
         if ok { "alive" } else { "no reply" },

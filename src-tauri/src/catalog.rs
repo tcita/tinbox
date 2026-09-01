@@ -178,21 +178,52 @@ fn migrate_old_entry(v: &serde_json::Value) -> Option<Entry> {
 pub fn load() {
     let mut v = catalog().lock().unwrap();
     v.clear();
-    if let Ok(txt) = std::fs::read_to_string(catalog_path()) {
-        if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(&txt) {
-            for item in arr {
-                if let Some(e) = migrate_old_entry(&item) {
-                    v.push(e);
+    match std::fs::read_to_string(catalog_path()) {
+        Ok(txt) => match serde_json::from_str::<Vec<serde_json::Value>>(&txt) {
+            Ok(arr) => {
+                let before = arr.len();
+                for item in arr {
+                    if let Some(e) = migrate_old_entry(&item) {
+                        v.push(e);
+                    }
+                }
+                if v.len() < before {
+                    crate::logger::logw(&format!(
+                        "catalog: skipped {} unreadable entries",
+                        before - v.len()
+                    ));
                 }
             }
-        }
+            Err(e) => crate::logger::loge(&format!(
+                "catalog: corrupt index {}: {}",
+                catalog_path().display(),
+                e
+            )),
+        },
+        // A missing index on first run is normal, not an error.
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => crate::logger::loge(&format!(
+            "catalog: could not read {}: {}",
+            catalog_path().display(),
+            e
+        )),
+        Err(_) => {}
     }
 }
 
 pub fn save() {
     let v = catalog().lock().unwrap();
-    let json = serde_json::to_string_pretty(&*v).unwrap_or_default();
-    let _ = std::fs::write(catalog_path(), json);
+    match serde_json::to_string_pretty(&*v) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(catalog_path(), json) {
+                crate::logger::loge(&format!(
+                    "catalog: could not save index {}: {}",
+                    catalog_path().display(),
+                    e
+                ));
+            }
+        }
+        Err(e) => crate::logger::loge(&format!("catalog: could not serialize index: {}", e)),
+    }
 }
 
 /// Recursively collect every file under a directory into `out`.

@@ -15,14 +15,11 @@ fn log_path() -> PathBuf {
 
 static F: Mutex<()> = Mutex::new(());
 
-/// Append one line to the log file and also print it to stderr (visible when a
-/// debug console is attached). Timestamps are local wall-clock time so entries
-/// can be correlated with what the user did on the phone/PC.
-pub fn logf(msg: &str) {
+fn write_line(line: &str) {
     let line = format!(
         "[{}] {}\n",
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
-        msg
+        line
     );
     let _g = F.lock().unwrap();
     rotate_if_large();
@@ -34,6 +31,22 @@ pub fn logf(msg: &str) {
     // holding the mutex — poisoning it and panicking every future logf call,
     // which kills every HTTP request in the logging middleware.
     let _ = io::stderr().write_all(line.as_bytes());
+}
+
+/// Plain informational line (the default: request lines, lifecycle events).
+pub fn logf(msg: &str) {
+    write_line(msg);
+}
+
+/// Warning: expected-but-notable (a port fell through, a phone dropped, a
+/// request came from the wrong subnet).
+pub fn logw(msg: &str) {
+    write_line(&format!("[WARN] {msg}"));
+}
+
+/// Error: an operation failed and the user-visible path degraded.
+pub fn loge(msg: &str) {
+    write_line(&format!("[ERROR] {msg}"));
 }
 
 /// The log is diagnostic-only: once it exceeds 8 MB, rename it to .old so the
