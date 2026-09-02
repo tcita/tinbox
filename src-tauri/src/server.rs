@@ -177,6 +177,13 @@ const HEARTBEAT_SECS: u64 = 5;
 /// badge.
 const EMPTY_TICKS_OFFLINE: u32 = 3;
 
+/// Seconds a download may go without a byte being written before the monitor
+/// auto-pauses it: the peer died or its connection went silent (a killed
+/// browser, a half-open TCP). Without this the sender would show a stuck
+/// "Transferring…" forever; pausing makes the row read "Paused" and a later
+/// resume (/dl-pause paused=0) re-arms it.
+const STALL_AUTO_PAUSE_SECS: u64 = 6;
+
 /// Whether a non-loopback (LAN) device has made a request within the last
 /// `secs` seconds. This is positive proof that inbound traffic is not blocked:
 /// rule inspection can be wrong or unavailable, but packets arriving are
@@ -767,9 +774,18 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
     let prog_id = if inline { None } else { Some(p.id.clone()) };
     if let Some(id) = &prog_id {
         let mut map = dl_progress().lock().unwrap();
-        let e = map.entry(id.clone()).or_default();
-        e.total = len;
-        e.last_ts = now_unix();
+        let fresh = {
+            let e = map.entry(id.clone()).or_default();
+            // total == 0 -> this entry has no real counter yet (a dl-reset zeroed
+            // it, or it is brand new), so this request starts the transfer.
+            let fresh = e.total == 0;
+            e.total = len;
+            e.last_ts = now_unix();
+            fresh
+        };
+        if fresh {
+            logf(&format!("download start {id}: {name} [{start}-{end}]/{len}"));
+        }
     }
     // Take() caps the read at the range end so a partial response carries
     // exactly end-start+1 bytes, not the rest of the file. A large read buffer
@@ -783,15 +799,27 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
         Some(id) => {
             let id = id.clone();
             Box::pin(base.map(move |chunk| {
-                if let Ok(b) = &chunk {
-                    let mut map = dl_progress().lock().unwrap();
-                    if let Some(e) = map.get_mut(&id) {
-                        e.sent += b.len() as u64;
-                        e.last_ts = now_unix();
+                match &chunk {
+                    Ok(b) => {
+                        let mut map = dl_progress().lock().unwrap();
+                        if let Some(e) = map.get_mut(&id) {
+                            let before = e.sent;
+                            e.sent += b.len() as u64;
+                            e.last_ts = now_unix();
+                            if before < e.total && e.sent >= e.total {
+                                logf(&format!("download done {id}: {} bytes", e.sent));
+                            }
+                        }
+                        // Push throttled ~1/s per transfer (instant on completion)
+                        // so both ends get live progress without polling.
+                        push_progress(&mut *map, &id, now_ms(), false);
                     }
-                    // Push throttled ~1/s per transfer (instant on completion)
-                    // so both ends get live progress without polling.
-                    push_progress(&mut *map, &id, now_ms(), false);
+                    Err(err) => {
+                        // The peer closed/cut this Range stream (pause, tab
+                        // killed, WiFi drop): the entry stays partial and the
+                        // monitor auto-pauses it if nothing resumes it.
+                        logw(&format!("download stream cut {id}: {err}"));
+                    }
                 }
                 chunk
             }))
@@ -969,6 +997,12 @@ async fn dl_pause(Query(p): Query<PauseParam>) -> impl IntoResponse {
     // Push immediately (force, not throttled) so the downloading side
     // aborts/relaunches right away instead of waiting for the next progress tick.
     push_progress(&mut *map, &p.id, now_ms(), true);
+    logf(&format!(
+        "dl-pause {} -> paused={} ({} bytes)",
+        p.id,
+        p.paused != 0,
+        map.get(&p.id).map(|e| e.sent).unwrap_or(0)
+    ));
     (StatusCode::OK, "ok").into_response()
 }
 
@@ -977,6 +1011,7 @@ async fn dl_pause(Query(p): Query<PauseParam>) -> impl IntoResponse {
 /// finished) makes the pushed progress immediately look complete and the
 /// progress row vanishes. The phone POSTs this when it starts from byte 0.
 async fn dl_reset(Query(p): Query<IdParam>) -> impl IntoResponse {
+    logf(&format!("dl-reset {}", p.id));
     let mut map = dl_progress().lock().unwrap();
     map.insert(p.id.clone(), DlProg::default());
     // Announce the zeroed counter so the other end clears any stale row right
@@ -1284,8 +1319,49 @@ async fn monitor_loop() {
         // Prune completed transfers whose entries went stale (was pruned in
         // /dl-status before; the frontend no longer polls it).
         let now = now_unix();
-        let mut map = dl_progress().lock().unwrap();
-        map.retain(|_, e| !(e.sent >= e.total && now.saturating_sub(e.last_ts) > 30));
+        {
+            let mut map = dl_progress().lock().unwrap();
+            map.retain(|_, e| !(e.sent >= e.total && now.saturating_sub(e.last_ts) > 30));
+        }
+        // Auto-pause a download whose bytes have stopped moving: the peer died
+        // or its connection went silent, so the sender should show "Paused"
+        // instead of a stuck "Transferring…". Uploads being absorbed self-clean
+        // on error, so only served downloads (non-pending files) are considered;
+        // a later resume (/dl-pause paused=0) clears the flag.
+        let stalled: Vec<String> = dl_progress()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, e)| {
+                e.total > 0
+                    && e.sent < e.total
+                    && !e.paused
+                    && now.saturating_sub(e.last_ts) >= STALL_AUTO_PAUSE_SECS
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stalled {
+            let is_upload = catalog::find(&id).map(|e| e.pending).unwrap_or(false);
+            if is_upload {
+                continue;
+            }
+            let mut map = dl_progress().lock().unwrap();
+            if let Some(e) = map.get_mut(&id) {
+                if e.total > 0
+                    && e.sent < e.total
+                    && !e.paused
+                    && now.saturating_sub(e.last_ts) >= STALL_AUTO_PAUSE_SECS
+                {
+                    e.paused = true;
+                    e.last_ts = now;
+                    logf(&format!(
+                        "auto-paused stalled download {} at {}/{} bytes",
+                        id, e.sent, e.total
+                    ));
+                    push_progress(&mut *map, &id, now_ms(), true);
+                }
+            }
+        }
     }
 }
 

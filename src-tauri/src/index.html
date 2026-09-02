@@ -312,7 +312,8 @@
   .file-card.has-preview .fc-info { width: 100%; }
   .file-card.has-preview .fc-name { max-width: none; }
 
-  /* Transfer progress: green ring fills as bytes land; percent beside it */
+  /* Transfer row: the green ring is drawn ONLY by the receiving side (the one
+     writing bytes to disk). The sending side shows a plain status chip instead. */
   .dlrow { margin-top: 6px; display: flex; align-items: center; gap: 8px; min-height: 18px; }
   .dlrow.hidden { display: none; }
   .ring {
@@ -325,6 +326,7 @@
   .msg.me .ring { background: conic-gradient(#fff calc(var(--p) * 1%), rgba(255,255,255,0.28) 0); }
   .dl-pct { font-size: 10.5px; opacity: 0.85; font-variant-numeric: tabular-nums; }
   .dl-status { font-size: 10.5px; opacity: 0.7; }
+  .dlrow.chip .ring, .dlrow.chip .dl-pct { display: none; }
   .file-card.pending { opacity: 0.75; }
 
   /* Fullscreen media preview (phone "open" for image/video) */
@@ -676,6 +678,9 @@ const $ = id => document.getElementById(id);
 const isPC = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
 const me = isPC ? 'pc' : 'phone';
 let busy = false;
+// True while this phone is POSTing an upload, so it knows which pending "from
+// phone" row is its own and shows the "Uploading…" chip (not another device's).
+let localUploading = false;
 
 function toast(msg){
   const t = $('toast'); t.textContent = msg; t.classList.add('show');
@@ -799,6 +804,7 @@ document.addEventListener('click', () => {
 document.addEventListener('scroll', hideCtxMenu, true);
 
 let lastList = '';
+let curItems = [];   // latest message list, mirrors what render() is showing
 // Apply a full message list: dedup against what we already rendered, then
 // render + the housekeeping passes. Called from the one-shot refresh() fetch
 // and from each SSE `list` event (which carries the full array, so steady
@@ -807,10 +813,14 @@ function applyList(items){
   const key = JSON.stringify(items);
   if(key === lastList) return;
   lastList = key;
+  curItems = items;
   render(items);
   autoPull(items);
   pruneTransfers(items);
   restorePending(items);
+  // render() rebuilt the DOM and wiped every transfer row; repaint the ones
+  // still in flight from their local/server state.
+  repaintTransfers();
 }
 // One-shot fetch, used on page load and on every SSE (re)connect. Link state is
 // driven by EventSource (onopen/onerror), not by fetch failures.
@@ -840,6 +850,11 @@ function pruneTransfers(items){
   }
   for(const key of Object.keys(dlInFlight))  if(!ids.has(key)) delete dlInFlight[key];
   for(const key of Object.keys(serverPaused)) if(!ids.has(key)) delete serverPaused[key];
+  for(const key of Object.keys(nativeDl))     if(!ids.has(key)) delete nativeDl[key];
+  for(const key of Object.keys(progCache))    if(!ids.has(key)) delete progCache[key];
+  for(const key of Object.keys(doneIds))      if(!ids.has(key)) delete doneIds[key];
+  for(const key of Object.keys(rowTimers))    if(!ids.has(key)){ clearTimeout(rowTimers[key]); delete rowTimers[key]; }
+  for(const key of Object.keys(hideTimers))   if(!ids.has(key)){ clearTimeout(hideTimers[key]); delete hideTimers[key]; }
 }
 
 // Symmetric push: the PC registering a local reference is a "send" — the phone
@@ -997,8 +1012,10 @@ async function openDefault(it){
 // Range streams, which survives lossy WiFi far better than one stream), with
 // per-chunk offsets so pause/resume continues exactly where it stopped. Files
 // too big to hold in browser memory (>PARALLEL_MEM_CAP) fall back to the
-// browser's own native downloader, which streams to disk. Progress (a percent,
-// no speed) is shown on BOTH ends via the server's /dl-status counter.
+// browser's own native downloader, which streams to disk. The ring is drawn
+// HERE, on the receiving phone, from the bytes it writes (percent + speed);
+// the PC sender shows only a state chip. Native downloads cannot count bytes,
+// so they get a chip too.
 const dlState = {};
 const PARALLEL = 6;
 const PARALLEL_MEM_CAP = 2 * 1024 * 1024 * 1024; // 2 GiB in-memory ceiling
@@ -1013,6 +1030,128 @@ function dlRow(id){
 function ringPct(row, pct){
   const r = row && row.querySelector('.ring');
   if(r) r.style.setProperty('--p', Math.max(0, Math.min(100, pct)));
+}
+
+// ---- Transfer rows: the ring lives on the receiver --------------------------
+// A percent ring is drawn ONLY by the side that writes bytes to disk (the
+// receiver: the phone for a download, the PC for an upload it is absorbing).
+// The sending side shows a plain status chip instead (no ring, no %). Every
+// ring is therefore local truth - a suspended receiver can never echo a stale
+// copy of the sender's byte counter (the old 30%/20% divergence). The server
+// still pushes a snapshot ~1/s for every transfer so cross-device pause/resume
+// works and senders know when to show and release their chip.
+const progCache = {};   // id -> {sent,total,paused,t,rate} latest server snapshot
+const nativeDl = {};    // ids handed to the browser's native downloader (no JS byte count)
+const doneIds = {};     // transfers already shown complete -> row stays hidden
+const rowTimers = {};   // coalesced per-id repaint timers
+const hideTimers = {};  // per-id "hide the completed row" timers
+function itemById(id){ for(const it of curItems) if(it.id === id) return it; return null; }
+function fmtRate(bps){
+  if(!isFinite(bps) || bps <= 0) return '';
+  if(bps >= 1048576) return (bps/1048576).toFixed(1)+' MB/s';
+  return Math.max(1, Math.round(bps/1024))+' KB/s';
+}
+// Coalesced repaint: byte arrivals come many times a second, one DOM write each.
+function touchRow(id){
+  if(rowTimers[id]) return;
+  rowTimers[id] = setTimeout(() => { rowTimers[id] = null; paintRow(id); }, 120);
+}
+// Confirmed bytes across a download's chunks (what the receiver actually holds).
+function localGot(st){
+  let g = 0;
+  for(const c of st.chunks) g += Math.min(c.loaded, c.end - c.start + 1);
+  return g;
+}
+// Receiver speed: slope of received bytes over a ~2s window, computed here from
+// the receiver's own counter. No cross-device sync; the sender never computes it.
+function sampleRate(st){
+  if(!st) return 0;
+  if(!st.active) return st.rate || 0;
+  const now = Date.now(), got = localGot(st);
+  if(!st.spd) st.spd = [];
+  if(st.spd.length && now - st.spd[st.spd.length-1].t < 300) return st.rate || 0;
+  st.spd.push({t: now, b: got});
+  while(st.spd.length && now - st.spd[0].t > 2500) st.spd.shift();
+  if(st.spd.length >= 2){
+    const a = st.spd[0], b = st.spd[st.spd.length-1];
+    const dt = (b.t - a.t) / 1000;
+    if(dt > 0.2) st.rate = Math.max(0, (b.b - a.b) / dt);
+  }
+  return st.rate || 0;
+}
+// What THIS device is for an in-flight file:
+//   'recv'   - this device writes the bytes -> draws the ring
+//   'send'   - this device pushes bytes out  -> chip only
+//   'native' - receiver, but the browser owns the download (no JS byte count) -> chip
+function roleOf(id){
+  const it = itemById(id);
+  if(!it) return null;
+  if(isPC) return (it.pending && it.from === 'phone') ? 'recv' : 'send';
+  if(dlState[id]) return 'recv';
+  if(nativeDl[id]) return 'native';
+  if(localUploading && it.pending && it.from === 'phone') return 'send';   // this phone's own upload
+  return null;
+}
+function paintRow(id){
+  const row = dlRow(id);
+  if(!row) return;
+  const it = itemById(id);
+  if(!it){ row.classList.add('hidden'); return; }
+  const prog = progCache[id];
+  const completed = !!prog && prog.total > 0 && prog.sent >= prog.total && !serverPaused[id];
+  if(completed) doneIds[id] = true;
+  else if(doneIds[id]){
+    // A fresh start on a previously-finished file: allow the row to reappear.
+    delete doneIds[id];
+    if(hideTimers[id]){ clearTimeout(hideTimers[id]); hideTimers[id] = null; }
+  }
+  const role = roleOf(id);
+  if(!role){ row.classList.add('hidden'); updateCardBtn(id); return; }
+  row.classList.remove('hidden');
+  if(hideTimers[id]){ clearTimeout(hideTimers[id]); hideTimers[id] = null; }
+
+  const st = dlState[id];
+  const paused = !!((serverPaused[id] && !st) || (st && st.paused));
+  if(role === 'recv'){
+    const total = it.size || (prog ? prog.total : 0) || 1;
+    const got = st ? localGot(st) : (prog ? Math.min(prog.sent, prog.total) : 0);
+    const pct = total ? got/total*100 : 0;
+    const rate = st ? sampleRate(st) : (prog ? (prog.rate || 0) : 0);
+    ringPct(row, pct);
+    row.querySelector('.dl-pct').textContent = Math.round(pct)+'%';
+    const s = row.querySelector('.dl-status');
+    s.textContent = completed ? ''
+      : paused ? ((st && st.hint) || 'Paused')
+      : got === 0 ? 'Starting…'
+      : rate > 0 ? fmtRate(rate) : '';
+    row.classList.remove('chip');
+    if(completed){
+      // Receiver reached 100%: hold the full ring a moment, then clear the row.
+      hideTimers[id] = setTimeout(() => { const r2 = dlRow(id); if(r2) r2.classList.add('hidden'); }, 1400);
+    }
+  } else {
+    if(completed){ row.classList.add('hidden'); updateCardBtn(id); return; }
+    const text = paused ? 'Paused'
+      : !isPC && role === 'send' ? 'Uploading…'
+      : !isPC ? 'Downloading…'
+      : 'Transferring…';
+    row.classList.add('chip');
+    row.querySelector('.dl-pct').textContent = '';
+    row.querySelector('.dl-status').textContent = text;
+    ringPct(row, 0);
+  }
+  updateCardBtn(id);
+}
+// render() wipes every transfer row; re-paint the ones that are still alive.
+function repaintTransfers(){
+  const now = Date.now();
+  for(const it of curItems){
+    if(it.kind !== 'file') continue;
+    const id = it.id;
+    if(!(it.pending || dlState[id] || nativeDl[id] || serverPaused[id]
+         || (progCache[id] && now - progCache[id].t < 2500))) continue;
+    paintRow(id);
+  }
 }
 
 // Pause/resume button in the progress row. The flag lives server-side so a
@@ -1032,11 +1171,11 @@ function updateCardBtn(id){
   if(card.dataset.pending){ btn.classList.add('hidden'); return; } // mid-upload
   const st = dlState[id];
   let mode;
-  if(st && st.active) mode = 'pause';                       // locally downloading
-  else if(st && st.paused) mode = 'resume';                 // paused / tap-to-continue
-  else if(dlInFlight[id]) mode = serverPaused[id] ? 'resume' : 'pause'; // PC / native
-  else if(!isPC) mode = 'download';                         // phone idle
-  else mode = 'none';
+  if(st && st.active) mode = 'pause';                              // locally downloading
+  else if(st && st.paused) mode = 'resume';                        // paused / tap-to-continue
+  else if(isPC){ mode = dlInFlight[id] ? (serverPaused[id] ? 'resume' : 'pause') : 'none'; } // PC serves a phone download
+  else if(nativeDl[id]) mode = serverPaused[id] ? 'resume' : 'pause';                        // browser-native on this phone
+  else mode = 'download';                                          // phone idle -> start a real download
   btn.classList.toggle('hidden', mode === 'none');
   if(mode === 'none') return;
   btn.innerHTML = mode === 'download' ? BTN_DL : (mode === 'pause' ? BTN_PAUSE : BTN_PLAY);
@@ -1059,7 +1198,12 @@ function transferClick(it){
   const st = dlState[id];
   if(st && st.active){ setPaused(id, 1); pauseDownload(it); return; }
   if(st && st.paused && st.chunks.length){ setPaused(id, 0); downloadFile(it); return; }
-  if(dlInFlight[id]){ setPaused(id, !serverPaused[id]); return; }
+  // A browser-native download (no JS byte count) only exposes the shared
+  // pause flag; nothing else on this device is downloading the file, so this
+  // click always starts a real download. If the server still holds a stale
+  // partial counter from a session that died, downloadFile's /dl-reset clears
+  // it before the first chunk.
+  if(dlInFlight[id] && nativeDl[id]){ setPaused(id, !serverPaused[id]); return; }
   downloadFile(it);
 }
 
@@ -1094,6 +1238,15 @@ async function downloadFile(it){
   if(st.opfs === undefined){
     try { st.opfs = await opfsDir(it.size) || null; } catch { st.opfs = null; }
   }
+  // Diagnostic: which transport actually runs, and the two preconditions that
+  // decide it (OPFS needs a secure context, which an http://<LAN-IP> page is NOT).
+  const secure = !!window.isSecureContext;
+  const hasOpfs = !!(navigator.storage && navigator.storage.getDirectory);
+  const transport = st.opfs ? 'opfs' : (it.size > PARALLEL_MEM_CAP ? 'native' : 'blob');
+  if(transport !== st._lastTransportLog){
+    st._lastTransportLog = transport;
+    reportClientError('dl-start '+it.name+' size='+it.size+' -> '+transport+' (secure='+secure+' opfsApi='+hasOpfs+')');
+  }
   if(!st.opfs && it.size > PARALLEL_MEM_CAP){
     nativeDownload(it);
     return;
@@ -1101,13 +1254,13 @@ async function downloadFile(it){
 
   st.paused = false;
   st.active = true;
+  st.spd = [];
+  st.rate = 0;
+  st.hint = '';
   row.classList.remove('hidden');
-  // The bar fills in on the first `progress` push, so seed a visible state now
-  // instead of an empty row while the first chunks register.
-  ringPct(row, 0);
-  row.querySelector('.dl-pct').textContent = '0%';
-  row.querySelector('.dl-status').textContent = 'starting…';
-  updateCardBtn(id);
+  // The receiver ring is self-counted: seed a visible row now, then every
+  // confirmed chunk write repaints it locally.
+  paintRow(id);
 
   const total = it.size;
   // Build the chunk list once (later calls resume unfinished chunks).
@@ -1152,7 +1305,10 @@ async function downloadFile(it){
     const r = dlRow(id);
     if(r) r.classList.add('hidden');
     delete dlInFlight[id];
+    doneIds[id] = true;
     delete dlState[id];
+    delete nativeDl[id];
+    if(rowTimers[id]){ clearTimeout(rowTimers[id]); rowTimers[id] = null; }
     updateCardBtn(id);
   };
 
@@ -1164,14 +1320,9 @@ async function downloadFile(it){
     if(st.attempts > DL_AUTO_RETRIES){
       st.active = false;
       st.paused = true;
+      st.hint = 'Interrupted — tap to resume';
       if(st.opfs) saveMeta(st);
-      const r = dlRow(id);
-      if(r){
-        ringPct(r, 0);
-        r.querySelector('.dl-pct').textContent = 'Tap to continue';
-        r.querySelector('.dl-status').textContent = '';
-      }
-      updateCardBtn(id);
+      paintRow(id);
       return;
     }
     const r = dlRow(id);
@@ -1191,9 +1342,9 @@ async function downloadFile(it){
     xhr.open('GET', '/dl?id='+encodeURIComponent(id), true);
     xhr.setRequestHeader('Range', 'bytes='+from+'-'+c.end);
     xhr.responseType = 'blob';
-    // Per-chunk bytes received; used both for pause/resume offsets and, via the
-    // server counter, for the shared progress UI.
-    xhr.onprogress = e => { if(e.lengthComputable) c.loaded = e.loaded; };
+    // Per-chunk bytes received; drives pause/resume offsets and, locally, the
+    // receiver ring (the phone repaints from this count as it lands).
+    xhr.onprogress = e => { if(e.lengthComputable){ c.loaded = e.loaded; touchRow(id); } };
     xhr.onload = () => {
       c.xhr = null;
       if(xhr.status === 206){
@@ -1247,6 +1398,7 @@ async function downloadFile(it){
         await w.write({type:'write', position: pos, data: value});
         pos += value.byteLength;
         c.loaded = Math.min(c.end - c.start + 1, c.loaded + value.byteLength);
+        touchRow(id);
       }
       await w.close();
       c.w = null;
@@ -1315,7 +1467,10 @@ async function downloadFile(it){
     const r = dlRow(id);
     if(r) r.classList.add('hidden');
     delete dlInFlight[id];
+    doneIds[id] = true;
     delete dlState[id];
+    delete nativeDl[id];
+    if(rowTimers[id]){ clearTimeout(rowTimers[id]); rowTimers[id] = null; }
     updateCardBtn(id);
   };
 
@@ -1398,31 +1553,25 @@ async function restorePending(items){
     const st = {
       it, parts: [],
       chunks: meta.chunks.map(c => ({ i:c.i, start:c.start, end:c.end, loaded:c.loaded, done:c.done, xhr:null, ctrl:null, w:null })),
-      attempts: 0, timer: null, active: false, paused: true, opfs: dir, finishing: false
+      attempts: 0, timer: null, active: false, paused: true, opfs: dir, finishing: false, hint: 'tap to resume'
     };
     dlState[meta.id] = st;
-    const row = dlRow(meta.id);
-    if(row){
-      row.classList.remove('hidden');
-      let got = 0;
-      for(const c of st.chunks) got += Math.min(c.loaded, c.end - c.start + 1);
-      row.querySelector('.dl-pct').textContent = 'Paused · '+(meta.total ? Math.floor(got/meta.total*100) : 0)+'%';
-      row.querySelector('.dl-status').textContent = 'tap to resume';
-      ringPct(row, meta.total ? got/meta.total*100 : 0);
-      updateCardBtn(meta.id);
-    }
+    if(dlRow(meta.id)) paintRow(meta.id);
   }
 }
 
-// Huge file: hand it to the browser's native downloader (writes to disk, no
-// memory blow-up). Progress still shows on both ends through /dl-status.
+// Huge file (or no OPFS): hand it to the browser's native downloader, which
+// writes to disk itself - so this side cannot count bytes and shows a plain
+// "downloading" chip instead of a ring.
 function nativeDownload(it){
+  nativeDl[it.id] = true;
   fetch('/dl-reset?id='+encodeURIComponent(it.id), {method:'POST'}).catch(()=>{});
   const a = document.createElement('a');
   a.href = '/dl?id='+encodeURIComponent(it.id);
   a.download = it.name;
   document.body.appendChild(a); a.click(); a.remove();
   toast('Downloading via browser…');
+  paintRow(it.id);
 }
 
 // User-initiated pause: abort all in-flight chunks, keep per-chunk offsets.
@@ -1438,61 +1587,50 @@ function pauseDownload(it){
     if(c.ctrl){ c.ctrl.abort(); c.ctrl = null; }
     if(c.xhr){ c.xhr.abort(); c.xhr = null; }
   }
-  let got = 0;
-  for(const c of st.chunks) got += Math.min(c.loaded, c.end - c.start + 1);
   if(st.opfs) saveMeta(st);
-  const r = dlRow(it.id);
-  if(r){
-    r.querySelector('.dl-pct').textContent = 'Paused · '+(it.size ? Math.floor(got/it.size*100) : 0)+'%';
-    r.querySelector('.dl-status').textContent = '';
-    ringPct(r, it.size ? got/it.size*100 : 0);
-  }
-  updateCardBtn(it.id);
+  paintRow(it.id);
 }
 
-// Shared progress bar: the server counts bytes sent per message id and pushes
-// `progress` events (~1/s per transfer), which both the PC and the phone render
-// on the timeline as a percent. This also makes native (browser-managed)
-// downloads visible on both ends. The push carries the paused flag, so a pause
-// from either device is mirrored onto the other end almost immediately. No
-// speed is derived anywhere — a transfer reports only how far it has got.
-// Progress state applied from the given snapshot - a single `progress` SSE
-// event or a full /dl-status list on resync/connect. No steady-state polling.
+// Transfer snapshots arrive as `progress` SSE events (~1/s per transfer) and a
+// one-shot /dl-status resync on connect. They do NOT paint the ring: the ring is
+// drawn by the receiver from its own byte counter (paintRow). Here we only
+//   (1) mirror the shared paused flag onto the local downloader (cross-device
+//       pause/resume), and
+//   (2) keep sender chips and the PC's server-counted upload ring live from the
+//       snapshots, plus derive the sender-side speed for uploads (server is the
+//       receiver, so that ring/counter is already local truth).
+// No steady-state polling.
 function syncProgress(list){
+  const now = Date.now();
   for(const d of list){
-    const row = dlRow(d.id);
-    if(!row) continue;
-    const st = dlState[d.id];
+    const prev = progCache[d.id];
+    progCache[d.id] = { sent: d.sent, total: d.total, paused: d.paused, t: now, rate: prev ? prev.rate : 0 };
+    if(prev && !d.paused && now - prev.t >= 400 && d.sent >= prev.sent){
+      progCache[d.id].rate = (d.sent - prev.sent) / ((now - prev.t) / 1000);
+    } else if(d.paused){
+      progCache[d.id].rate = 0;
+    }
+    // A native (browser-managed) download the server has fully sent is done.
+    if(d.total > 0 && d.sent >= d.total) delete nativeDl[d.id];
+    if(d.sent < d.total) dlInFlight[d.id] = true; else delete dlInFlight[d.id];
     const wasPaused = serverPaused[d.id] || false;
     serverPaused[d.id] = d.paused;
-    if(d.sent < d.total) dlInFlight[d.id] = true;
     updateCardBtn(d.id);
+    if(!dlRow(d.id)) continue;
 
     // Another end paused: mirror it locally (abort in-flight chunks).
     if(d.paused){
+      const st = dlState[d.id];
       if(st && st.active) pauseDownload(st.it);
+      paintRow(d.id);
       continue;
     }
     // Pause lifted by the other end: resume from the saved per-chunk offsets.
-    if(wasPaused && st && st.paused && !st.active){
-      downloadFile(st.it);
+    if(wasPaused){
+      const st = dlState[d.id];
+      if(st && st.paused && !st.active) downloadFile(st.it);
     }
-    if(st && st.paused) continue; // locally held; progress bar is frozen
-
-    const pctEl = row.querySelector('.dl-pct');
-    const sent = Math.min(d.sent, d.total);
-    const pct = d.total ? sent/d.total*100 : 0;
-    ringPct(row, pct);
-    pctEl.textContent = Math.round(pct)+'%';
-    // A live percent clears any leftover status hint (starting…, tap to resume).
-    row.querySelector('.dl-status').textContent = '';
-    if(d.sent >= d.total){
-      delete dlInFlight[d.id];
-      updateCardBtn(d.id);
-      setTimeout(() => { const r2 = dlRow(d.id); if(r2) r2.classList.add('hidden'); }, 1500);
-    } else {
-      row.classList.remove('hidden');
-    }
+    paintRow(d.id);
   }
 }
 // One-shot recovery fetch: after an SSE push was missed (the server sends
@@ -1532,18 +1670,22 @@ function uploadFiles(files){
   busy = true;
   const fd = new FormData();
   for(const f of files) fd.append('file', f);
-  // The server registers the file as a pending row as soon as the request lands
-  // and pushes progress, so a ring + percent appears on BOTH ends — no local
-  // progress UI here. ?size= is the declared total for the shared counter.
+  // The server registers the file as a pending row the instant the request
+  // lands and streams the body to its own disk, so the PC (the receiver here)
+  // draws the ring while this phone shows an "Uploading…" chip on that row.
+  // ?size= is the declared total for the server's received-byte counter.
   const size = files[0] && files[0].size ? files[0].size : 0;
+  localUploading = true;
   const xhr = new XMLHttpRequest();
   xhr.open('POST', '/upload?size='+size);
   xhr.onload = () => {
     busy = false;
+    localUploading = false;
     if(xhr.status===200) toast('Sent successfully');
     else toast('Upload failed');
   };
-  xhr.onerror = () => { busy=false; toast('Network error'); };
+  xhr.onerror = () => { busy=false; localUploading=false; toast('Network error'); };
+  xhr.onabort = () => { busy=false; localUploading=false; };
   xhr.send(fd);
 }
 
