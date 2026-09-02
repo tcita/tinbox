@@ -13,6 +13,7 @@ use axum::{
     Router,
 };
 use axum::extract::DefaultBodyLimit;
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -72,6 +73,15 @@ static DL_PROGRESS: OnceLock<Mutex<std::collections::HashMap<String, DlProg>>> =
 
 fn dl_progress() -> &'static Mutex<std::collections::HashMap<String, DlProg>> {
     DL_PROGRESS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Ids whose transfer the PC asked to stop (/cancel). The upload writer and the
+/// download stream poll this on every chunk and tear down when they see their
+/// id. A fresh /dl request for the same id clears it, so stopping one download
+/// never silently kills a later one of the same file.
+static CANCELLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+fn cancelled() -> &'static Mutex<HashSet<String>> {
+    CANCELLED.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 /// Millisecond clock for throttling progress pushes (wall clock; fine for a
@@ -171,18 +181,18 @@ fn now_unix() -> u64 {
 /// Client link state is EventSource's own onopen/onerror; no client timer.
 const HEARTBEAT_SECS: u64 = 5;
 
-/// Consecutive 2s monitor ticks with no open LAN /events stream before the PC
-/// is told "no device connected". It rides out the ~3s gap while EventSource
-/// reconnects, so a phone that drops and reopens its stream never flips the
-/// badge.
-const EMPTY_TICKS_OFFLINE: u32 = 3;
-
 /// Seconds a download may go without a byte being written before the monitor
 /// auto-pauses it: the peer died or its connection went silent (a killed
 /// browser, a half-open TCP). Without this the sender would show a stuck
 /// "Transferring…" forever; pausing makes the row read "Paused" and a later
 /// resume (/dl-pause paused=0) re-arms it.
 const STALL_AUTO_PAUSE_SECS: u64 = 6;
+
+/// Seconds of LAN silence (no request at all) before a device that holds no
+/// /events stream is treated as gone. A download or page load counts as proof of
+/// presence too — "the phone can reach the server" is what the PC badge means,
+/// not just "its /events stream is open".
+const PRESENCE_ACT_SECS: u64 = 8;
 
 /// Whether a non-loopback (LAN) device has made a request within the last
 /// `secs` seconds. This is positive proof that inbound traffic is not blocked:
@@ -201,9 +211,15 @@ pub(crate) fn lan_seen_recently(secs: u64) -> bool {
 /// debounces the count so a quick reconnect never reads as a drop.
 static LAN_EVENTS_OPEN: AtomicU64 = AtomicU64::new(0);
 
-/// Whether at least one LAN device currently holds an open /events stream.
+/// Whether a LAN device is present: it either holds an open /events stream, or
+/// is actively reaching this machine (a request in the last few seconds, or a
+/// transfer whose bytes are still flowing — e.g. a native download running even
+/// while its page's /events is down). "The phone can reach the server" is what
+/// the PC badge means, so any of those counts.
 fn lan_peer_connected() -> bool {
     LAN_EVENTS_OPEN.load(Ordering::Relaxed) > 0
+        || lan_seen_recently(PRESENCE_ACT_SECS)
+        || transfer_active_recently(PRESENCE_ACT_SECS)
 }
 
 /// Any in-flight download whose streams pushed bytes within the last `secs`
@@ -363,6 +379,7 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 .route("/dl-status", get(dl_status))
                 .route("/dl-pause", post(dl_pause))
                 .route("/dl-reset", post(dl_reset))
+                .route("/cancel", post(cancel))
                 .route("/view", get(view))
                 .route("/open", post(open_file))
                 .route("/rm", post(remove))
@@ -540,6 +557,12 @@ async fn upload(Query(q): Query<UpQuery>, mut multipart: Multipart) -> impl Into
         let mut file = file;
         let mut total: u64 = 0;
         let write_result: Result<(), String> = loop {
+            // The PC (receiver) asked to stop this upload (/cancel): drop it as a
+            // failure so the row + partial file are cleaned up below. Noticed per
+            // chunk, so latency is one body chunk once the flag is set.
+            if cancelled().lock().unwrap().contains(&id) {
+                break Err("cancelled by peer".to_string());
+            }
             match field.next().await {
                 Some(Ok(chunk)) => {
                     let n = chunk.len() as u64;
@@ -773,12 +796,24 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
     // bar/speed. Parallel Range requests accumulate into the same entry.
     let prog_id = if inline { None } else { Some(p.id.clone()) };
     if let Some(id) = &prog_id {
+        // Any /dl request is a fresh transfer (or an OS resume of one): clear an
+        // earlier stop so it can run — a cancelled download must not silently
+        // kill the next attempt at the same file.
+        cancelled().lock().unwrap().remove(id);
         let mut map = dl_progress().lock().unwrap();
         let fresh = {
             let e = map.entry(id.clone()).or_default();
-            // total == 0 -> this entry has no real counter yet (a dl-reset zeroed
-            // it, or it is brand new), so this request starts the transfer.
-            let fresh = e.total == 0;
+            // A full-body (no-Range) request means "fetch the whole file from 0":
+            // reset the counter so a re-download (or a download that restarted)
+            // never looks complete because an older entry still holds sent==total.
+            // Range requests instead continue the existing counter — an
+            // interrupted native download resuming exactly where it stopped. Any
+            // new stream also clears a stale auto-pause.
+            let fresh = !partial || e.total == 0;
+            if fresh {
+                e.sent = 0;
+            }
+            e.paused = false;
             e.total = len;
             e.last_ts = now_unix();
             fresh
@@ -799,6 +834,15 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
         Some(id) => {
             let id = id.clone();
             Box::pin(base.map(move |chunk| {
+                // The PC asked to stop this download (/cancel): end the stream so
+                // the receiver's in-flight download is cut (its OS then reports it
+                // interrupted) instead of being allowed to drain.
+                if cancelled().lock().unwrap().contains(&id) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "transfer cancelled by PC",
+                    ));
+                }
                 match &chunk {
                     Ok(b) => {
                         let mut map = dl_progress().lock().unwrap();
@@ -1020,6 +1064,49 @@ async fn dl_reset(Query(p): Query<IdParam>) -> impl IntoResponse {
     (StatusCode::OK, "ok").into_response()
 }
 
+/// Stop a transfer by id. Only the PC can do this — it is the role that hosts a
+/// download the phone is pulling (revoke it) and the one receiving a phone
+/// upload (refuse it). The id is flagged so the in-flight upload writer /
+/// download stream tear down on their next chunk; shared progress is dropped
+/// right away. For a pending upload the record and partial file are also removed
+/// so the sending phone (which sees its row vanish and aborts) is not left
+/// streaming into nothing. A ready file's record is kept — cancelling a download
+/// must not delete the file.
+async fn cancel(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(p): Query<IdParam>,
+) -> impl IntoResponse {
+    if from_by_peer(peer) != "pc" {
+        logw(&format!("cancel: rejected stop request from phone id={}", p.id));
+        return (StatusCode::FORBIDDEN, "phone cannot stop transfers").into_response();
+    }
+    cancelled().lock().unwrap().insert(p.id.clone());
+    let was_pending = catalog::find(&p.id).map(|e| e.pending).unwrap_or(false);
+    // Drop the shared counter so neither end keeps mirroring a dead transfer.
+    dl_progress().lock().unwrap().remove(&p.id);
+    if was_pending {
+        // An incoming upload: remove the pending row and best-effort the partial
+        // file. If the writer still holds the handle open (Windows), it deletes
+        // the file itself when it wakes on the cancel flag.
+        if let Some(e) = catalog::remove(&p.id) {
+            if let catalog::MsgBody::File {
+                source: catalog::Source::Remote { path },
+                ..
+            } = &e.body
+            {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        let _ = notifier().send(PushEvent::List(catalog::all_items()));
+    }
+    logf(&format!(
+        "cancel {}: {} stopped",
+        p.id,
+        if was_pending { "upload" } else { "download" }
+    ));
+    (StatusCode::OK, "stopped").into_response()
+}
+
 async fn remove(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(p): Query<IdParam>,
@@ -1177,21 +1264,15 @@ async fn events(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
     // Device presence: opening this stream from a LAN peer is what makes a
-    // device "online". Count it before building the replay below, so a
-    // connecting device's own `info` shows it as online. The guard decrements
-    // when the connection (and thus this handler's stream) ends.
+    // device "online". Only COUNT it here — the monitor is the single writer
+    // that announces the resulting state to everyone, so a connecting device's
+    // own `info` replay (built after this increment) shows it as online. The
+    // guard decrements when the connection (and thus this handler's stream)
+    // ends. Deliberately no broadcast on open: that would double the monitor's
+    // transition report, and arrival within one 2s tick is plenty for a badge.
     let is_lan = !peer.ip().is_loopback();
     let guard = if is_lan {
-        // A device arriving is a real event (its /events stream just opened), so
-        // it is announced right here when the count goes 0 -> 1 — not derived by
-        // the monitor's sampled transitions. That way a page which loaded just
-        // before the (re)connect still hears "online" instead of being stuck on
-        // the offline state it saw at startup.
-        if LAN_EVENTS_OPEN.fetch_add(1, Ordering::Relaxed) == 0 {
-            logf(&format!("device connected: LAN peer opened /events ({})", peer.ip()));
-            let (ip, port, url) = current_url();
-            let _ = notifier().send(PushEvent::Info { mobile_connected: true, url, ip, port });
-        }
+        LAN_EVENTS_OPEN.fetch_add(1, Ordering::Relaxed);
         Some(PresenceGuard)
     } else {
         None
@@ -1275,39 +1356,41 @@ fn current_url() -> (String, u16, String) {
     (ip, port, url)
 }
 
-/// Background monitor: reports device departures (a silent leave has no event
-/// of its own, so the 2s sampler catches it; arrivals are announced by events()
-/// at stream-open time), plus the firewall repair flag and stale download
-/// entries, pushing /events on every change so the frontend never polls.
-/// Runs every 2s; need_repair() already throttles its powershell rule check.
+/// Background monitor: reports the live device-presence bit (the PC badge), plus
+/// the firewall repair flag and stale download entries, pushing /events on every
+/// change so the frontend never polls. Runs every 2s; need_repair() already
+/// throttles its powershell rule check.
+///
+/// Presence is a single writer here. The monitor announces both ARRIVAL (a LAN
+/// peer holds an open /events stream, or is downloading/requesting without one)
+/// and the silent DEPARTURE (a closed stream has no event of its own); events()
+/// only maintains the stream count. There is deliberately no debounce counter:
+/// `online` is just `lan_peer_connected()` sampled now, and the two 8-second
+/// activity windows inside it already provide the hysteresis that keeps a phone
+/// whose stream briefly reconnects from flickering the badge. Presence only
+/// drives a cosmetic badge, so a genuinely absent device may read "Waiting"
+/// within one tick — honesty beats a state machine.
 async fn monitor_loop() {
     let mut prev_online: Option<bool> = None;
     let mut prev_repair: Option<bool> = None;
-    // Consecutive ticks with no open LAN /events stream; presence flips offline
-    // only after EMPTY_TICKS_OFFLINE of them.
-    let mut empty_ticks: u32 = 0;
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        // Device presence: online while a LAN peer holds an open /events stream
-        // (its page is alive and reachable for pushes), debounced so the ~3s
-        // gap of an EventSource reconnect never reads as a drop.
-        let online = if lan_peer_connected() {
-            empty_ticks = 0;
-            true
-        } else {
-            empty_ticks += 1;
-            empty_ticks >= EMPTY_TICKS_OFFLINE
-        };
-        // Arrivals are announced at stream-open time (events()), so this loop
-        // only ever reports the debounced DEPARTURE — a silent leave has no
-        // event of its own, which is exactly why a sampler must catch it.
+        // Report transitions only, so a cold start with no device stays quiet
+        // (prev_online starts None and the first false->false match announces
+        // nothing) instead of manufacturing a spurious event.
+        let online = lan_peer_connected();
         if prev_online != Some(online) {
             let was_online = prev_online.unwrap_or(false);
             prev_online = Some(online);
-            if was_online && !online {
-                logf("device disconnected: last LAN /events stream closed");
+            if was_online != online {
                 let (ip, port, url) = current_url();
-                let _ = notifier().send(PushEvent::Info { mobile_connected: false, url, ip, port });
+                if online {
+                    logf("device present: LAN device reachable");
+                    let _ = notifier().send(PushEvent::Info { mobile_connected: true, url, ip, port });
+                } else {
+                    logf("device disconnected: no LAN device present");
+                    let _ = notifier().send(PushEvent::Info { mobile_connected: false, url, ip, port });
+                }
             }
         }
         // Firewall repair flag transitions.
