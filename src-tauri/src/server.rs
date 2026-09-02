@@ -162,12 +162,10 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-/// Cadence for the SSE link to a page: the server pushes a data-bearing
-/// keepalive every HEARTBEAT_SECS while the stream is quiet, and the receiving
-/// page (the phone, which can outlive nothing but needs to know when its link
-/// is gone) declares the link dead when nothing has arrived for a few beats.
-/// This is the only remaining heartbeat; device presence is not timer-driven at
-/// all — see LAN_EVENTS_OPEN below.
+/// How often the server sends a keepalive on an otherwise-quiet /events stream.
+/// It exists purely to keep moving bytes, so a phone's EventSource socket is
+/// not silently reaped by a NAT/AP idle timeout while the page is backgrounded.
+/// Client link state is EventSource's own onopen/onerror; no client timer.
 const HEARTBEAT_SECS: u64 = 5;
 
 /// Consecutive 2s monitor ticks with no open LAN /events stream before the PC
@@ -1092,8 +1090,8 @@ impl tokio_stream::Stream for GuardedStream {
 
 /// Server push: typed events over one SSE connection. On connect it replays the
 /// current state (list + firewall + device presence) so a fresh page needs no
-/// poll, then streams live PushEvents. A data-bearing keepalive keeps the
-/// socket warm and feeds the phone's receiver-side link watchdog while idle.
+/// poll, then streams live PushEvents. A periodic keepalive keeps the socket
+/// warm so a phone that backgrounds/sleeps is not silently reaped.
 async fn events(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
@@ -1121,9 +1119,8 @@ async fn events(
             Err(_) => Event::default().event("resync").data("1"),
         })
     }));
-    // A data-bearing keepalive (not axum's default comment) so `message` events
-    // fire and the phone's watchdog sees the link as alive even while idle and
-    // quiet. (KeepAlive::text() emits a comment, which the browser ignores.)
+    // Keepalive every HEARTBEAT_SECS so an idle stream still moves bytes (a
+    // fully silent socket can otherwise be reaped by NAT/AP idle timeouts).
     Sse::new(GuardedStream { inner: Box::pin(stream), _guard: guard }).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(HEARTBEAT_SECS))

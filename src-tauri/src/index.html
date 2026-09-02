@@ -810,8 +810,6 @@ let lastList = '';
 // and from each SSE `list` event (which carries the full array, so steady
 // state makes no /list requests at all).
 function applyList(items){
-  setOffline(false);
-  lastLive = Date.now();
   const key = JSON.stringify(items);
   if(key === lastList) return;
   lastList = key;
@@ -820,8 +818,8 @@ function applyList(items){
   pruneTransfers(items);
   restorePending(items);
 }
-// One-shot fetch, used on page load and on every SSE (re)connect. Offline
-// detection is owned by the SSE error/watchdog path, not by fetch failures.
+// One-shot fetch, used on page load and on every SSE (re)connect. Link state is
+// driven by EventSource (onopen/onerror), not by fetch failures.
 async function refresh(){
   try {
     applyList(await (await fetch('/list')).json());
@@ -1656,25 +1654,23 @@ window.addEventListener('drop', e => {
   uploadFiles(files);
 });
 
-let offline = false;
-// Last moment any request/SSE activity (including the keepalive) succeeded;
-// the watchdog below turns the badge to "Disconnected" after OFFLINE_AFTER_SECS
-// of silence. Catches silent network loss (PC sleep, WiFi drop, router restart)
-// where TCP hangs instead of erroring. (The PC's own page is served by the same
-// process, so it never outlives the server; this is meaningful only for the
-// phone's page.)
-let lastLive = Date.now();
 // PC gate state: has a device connected this session, and did the user dismiss
 // the scan gate. Driven by SSE `info` events now (no /info polling).
 let everConnected = false;
 let gateDismissed = false;
-function setOffline(v){
-  if(offline === v) return;
-  offline = v;
-  $('offBanner').classList.toggle('show', v);
-  if(isPC) return; // PC badge reflects phone presence only, driven by `info` events
-  $('badge').classList.toggle('off', v);
-  $('badgeTxt').textContent = v ? 'Disconnected' : 'Connected';
+// Connection light (phone only): simply mirrors whether the SSE /events link is
+// up. No timers — EventSource fires `error` when it loses (or cannot reach) the
+// link and `open` on every (re)connect, and it reconnects on its own. A link
+// that dies silently (half-open TCP) shows stale here, but every real action
+// then fails loudly, which is how the user actually notices.
+let linkUp = true;
+function setLink(up){
+  if(linkUp === up) return;
+  linkUp = up;
+  $('offBanner').classList.toggle('show', !up);
+  if(isPC) return; // PC badge reflects device presence only, driven by `info`
+  $('badge').classList.toggle('off', !up);
+  $('badgeTxt').textContent = up ? 'Connected' : 'Disconnected';
 }
 // Device presence update (PC only): badge + scan gate + connection toast. The
 // server pushes `info` when a LAN device's /events stream opens or (debounced)
@@ -1702,30 +1698,18 @@ function applyInfo(d){
 // polls no state endpoints. On open the server replays list/fw/info and we
 // additionally pull /list and /dl-status once to cover the replay race.
 const es = new EventSource('/events');
-// Any event over the SSE proves the link is alive, so every handler refreshes
-// lastLive (what the watchdog watches). This matters most during a download:
-// the stream is busy emitting named `progress` events ~1/s, which suppress the
-// unnamed keepalive and never fire onmessage - without touching lastLive here,
-// the watchdog would declare the link dead while the transfer is clearly
-// running. (`list` also refreshes lastLive inside applyList.)
-const touch = () => { lastLive = Date.now(); setOffline(false); };
-es.onopen = () => { touch(); refresh(); resyncProgress(); };
-// The unnamed keepalive carries data every HEARTBEAT_SECS while the stream is
-// otherwise quiet; onmessage is the idle-time beat.
-es.onmessage = touch;
-es.onerror = () => setOffline(true);
-es.addEventListener('list', e => { touch(); applyList(JSON.parse(e.data)); });
-es.addEventListener('progress', e => { touch(); syncProgress([JSON.parse(e.data)]); });
-es.addEventListener('resync', () => { touch(); resyncProgress(); });
-es.addEventListener('fw', e => { touch(); applyFw(JSON.parse(e.data).needRepair); });
-es.addEventListener('info', e => { touch(); applyInfo(JSON.parse(e.data)); });
-// Watchdog: if no SSE activity (keepalives included) for OFFLINE_AFTER_SECS
-// (15s, i.e. 3 missed keepalives), the link is silently gone (a hang, not a
-// reject) - force offline so the badge/banner do not sit stale. A local timer,
-// not a poll.
-const watchdog = setInterval(() => {
-  if(Date.now() - lastLive > 15000) setOffline(true);
-}, 5000);
+// The connection light is driven purely by EventSource state: `open` = up,
+// `error` = lost or unreachable (EventSource keeps retrying on its own and
+// fires `open` again on each successful reconnect). The server's keepalives
+// keep the socket from being silently reaped while backgrounded; no client-side
+// timer remains.
+es.onopen = () => { setLink(true); refresh(); resyncProgress(); };
+es.onerror = () => setLink(false);
+es.addEventListener('list', e => { applyList(JSON.parse(e.data)); });
+es.addEventListener('progress', e => { syncProgress([JSON.parse(e.data)]); });
+es.addEventListener('resync', () => resyncProgress());
+es.addEventListener('fw', e => { applyFw(JSON.parse(e.data).needRepair); });
+es.addEventListener('info', e => { applyInfo(JSON.parse(e.data)); });
 
 let fwWasShown = false;
 // Firewall repair flag arrives as an SSE `fw` event (the server pushes only on
@@ -1763,7 +1747,6 @@ function supersede(){
   if(superseded) return;
   superseded = true;
   try { es.close(); } catch {}
-  clearInterval(watchdog);
   $('deadOverlay').classList.add('show');
   setTimeout(() => window.close(), 300);
 }
