@@ -55,6 +55,10 @@ pub struct Entry {
     pub ts: String,
     pub from: String, // "pc" | "phone"
     pub body: MsgBody,
+    /// True while a phone upload is still landing (the file on disk is
+    /// incomplete). Missing on older files -> false.
+    #[serde(default)]
+    pub pending: bool,
 }
 
 /// List item for the frontend; carries different fields per kind, which the
@@ -70,6 +74,8 @@ pub struct MsgItem {
     pub name: String,
     pub size: u64,
     pub source_kind: String, // "local" | "remote"; empty for text
+    /// True while this remote file is still being uploaded.
+    pub pending: bool,
     // valid for text:
     pub text: String,
 }
@@ -85,6 +91,7 @@ impl Entry {
                 name: name.clone(),
                 size: *size,
                 source_kind: source.kind_str().to_string(),
+                pending: self.pending,
                 text: String::new(),
             },
             MsgBody::Text { text } => MsgItem {
@@ -95,6 +102,7 @@ impl Entry {
                 name: String::new(),
                 size: 0,
                 source_kind: String::new(),
+                pending: false,
                 text: text.clone(),
             },
         }
@@ -173,6 +181,7 @@ fn migrate_old_entry(v: &serde_json::Value) -> Option<Entry> {
         ts,
         from,
         body: MsgBody::File { source, size, name },
+        pending: false,
     })
 }
 
@@ -284,6 +293,7 @@ pub fn add_local(paths: Vec<PathBuf>) -> usize {
                 size: meta.len(),
                 name,
             },
+            pending: false,
         });
         added += 1;
     }
@@ -308,12 +318,86 @@ pub fn add_remote(id: &str, inbox_path: &Path, display_name: &str) -> Entry {
             size,
             name: display_name.to_string(),
         },
+        pending: false,
     };
     let mut v = catalog().lock().unwrap();
     v.push(entry.clone());
     drop(v);
     save();
     entry
+}
+
+/// Register a phone upload the moment its request arrives, marked `pending` so
+/// both devices can render the row and a progress ring while bytes stream in.
+/// `size` is the declared total (the phone sends it in the query string); it is
+/// corrected to the on-disk length when the upload finishes.
+pub fn add_remote_pending(id: &str, inbox_path: &Path, display_name: &str, size: u64) -> Entry {
+    let entry = Entry {
+        id: id.to_string(),
+        ts: now_ts(),
+        from: "phone".to_string(),
+        body: MsgBody::File {
+            source: Source::Remote {
+                path: inbox_path.to_string_lossy().to_string(),
+            },
+            size,
+            name: display_name.to_string(),
+        },
+        pending: true,
+    };
+    let mut v = catalog().lock().unwrap();
+    v.push(entry.clone());
+    drop(v);
+    save();
+    entry
+}
+
+/// Flip a pending upload to a real entry once the whole body has been written:
+/// clears the flag and fixes `size` to the actual on-disk length. No-op (false)
+/// if the id is gone or not a pending remote file.
+pub fn mark_remote_ready(id: &str) -> bool {
+    let mut v = catalog().lock().unwrap();
+    let Some(e) = v.iter_mut().find(|e| e.id == id) else {
+        return false;
+    };
+    let is_pending_remote_file = e.pending && e.from == "phone"
+        && matches!(&e.body, MsgBody::File { source: Source::Remote { .. }, .. });
+    if !is_pending_remote_file {
+        return false;
+    }
+    e.pending = false;
+    if let MsgBody::File { source, size, .. } = &mut e.body {
+        *size = std::fs::metadata(source.path()).map(|m| m.len()).unwrap_or(*size);
+    }
+    drop(v);
+    save();
+    true
+}
+
+/// Drop catalog entries left pending by a crashed/interrupted upload and delete
+/// their partial files. Called once at startup.
+pub fn purge_pending() {
+    let mut v = catalog().lock().unwrap();
+    let before = v.len();
+    v.retain(|e| {
+        if e.pending {
+            if let MsgBody::File { source: Source::Remote { path }, .. } = &e.body {
+                let _ = std::fs::remove_file(path);
+            }
+            false
+        } else {
+            true
+        }
+    });
+    let removed = before - v.len();
+    drop(v);
+    if removed > 0 {
+        save();
+        crate::logger::logf(&format!(
+            "catalog: purged {removed} interrupted upload{}",
+            if removed == 1 { "" } else { "s" }
+        ));
+    }
 }
 
 /// Register a text message (the caller passes the `from` value determined from
@@ -326,6 +410,7 @@ pub fn add_text(from: &str, text: &str) -> Entry {
         body: MsgBody::Text {
             text: text.to_string(),
         },
+        pending: false,
     };
     let mut v = catalog().lock().unwrap();
     v.push(entry.clone());

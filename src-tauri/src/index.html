@@ -312,20 +312,20 @@
   .file-card.has-preview .fc-info { width: 100%; }
   .file-card.has-preview .fc-name { max-width: none; }
 
-  /* Download Progress */
-  .dlrow { margin-top: 8px; }
+  /* Transfer progress: green ring fills as bytes land; percent beside it */
+  .dlrow { margin-top: 6px; display: flex; align-items: center; gap: 8px; min-height: 18px; }
   .dlrow.hidden { display: none; }
-  .dltrack {
-    height: 4px; background: rgba(0,0,0,0.08); border-radius: 999px; overflow: hidden;
+  .ring {
+    --p: 0;
+    width: 18px; height: 18px; flex: none; border-radius: 50%;
+    background: conic-gradient(var(--accent) calc(var(--p) * 1%), rgba(0,0,0,0.10) 0);
+    -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4px));
+            mask: radial-gradient(farthest-side, transparent calc(100% - 5px), #000 calc(100% - 4px));
   }
-  .msg.me .dltrack { background: rgba(255,255,255,0.25); }
-  .dlfill { height: 100%; width: 0%; background: var(--accent); border-radius: 999px; transition: width 0.15s ease-out; }
-  .msg.me .dlfill { background: #fff; }
-  .dltext {
-    font-size: 10.5px; opacity: 0.8; margin-top: 4px;
-    display: flex; align-items: center; justify-content: space-between; font-variant-numeric: tabular-nums;
-  }
-  .dl-mid { display: inline-flex; gap: 8px; min-width: 0; }
+  .msg.me .ring { background: conic-gradient(#fff calc(var(--p) * 1%), rgba(255,255,255,0.28) 0); }
+  .dl-pct { font-size: 10.5px; opacity: 0.85; font-variant-numeric: tabular-nums; }
+  .dl-status { font-size: 10.5px; opacity: 0.7; }
+  .file-card.pending { opacity: 0.75; }
 
   /* Fullscreen media preview (phone "open" for image/video) */
   .media-ov {
@@ -433,12 +433,6 @@
   }
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
 
-  /* Upload progress top bar */
-  .progress {
-    position: fixed; top: 0; left: 0; height: 3px; width: 0%;
-    background: var(--accent); transition: width 0.2s ease-out;
-    box-shadow: 0 0 10px var(--accent); z-index: 999;
-  }
 
   /* Connect Gate (PC Wait Screen) */
   #gate {
@@ -668,7 +662,6 @@
 
 <div class="ctx-menu" id="ctxMenu"></div>
 <div class="toast" id="toast"></div>
-<div class="progress" id="bar"></div>
 
 <div id="dragOverlay">
   <div class="drag-card">
@@ -740,6 +733,7 @@ function attachMenu(el, it, bubble){
 }
 
 function showCtxMenu(x, y, it, bubble){
+  if(it.pending) return;               // mid-upload: no reveal/delete/download yet
   ctxTarget = it;
   ctxBubble = bubble;
   const m = $('ctxMenu');
@@ -846,7 +840,6 @@ function pruneTransfers(items){
   }
   for(const key of Object.keys(dlInFlight))  if(!ids.has(key)) delete dlInFlight[key];
   for(const key of Object.keys(serverPaused)) if(!ids.has(key)) delete serverPaused[key];
-  for(const key of Object.keys(progCache))   if(!ids.has(key)) delete progCache[key];
 }
 
 // Symmetric push: the PC registering a local reference is a "send" — the phone
@@ -915,11 +908,13 @@ function render(items){
     } else {
       const card = document.createElement('div');
       card.className = 'file-card';
+      if(it.pending){ card.dataset.pending = '1'; card.classList.add('pending'); }
       const ext = (it.name.split('.').pop()||'').toLowerCase();
       const isImg = ['jpg','jpeg','png','gif','webp','heic','bmp','svg'].includes(ext);
       const isVid = ['mp4','mov','avi','mkv','webm'].includes(ext);
-      
-      if(isImg){
+
+      // A pending upload has nothing on disk yet: no /view preview, no open.
+      if(!it.pending && isImg){
         card.classList.add('has-preview');
         const img = document.createElement('img');
         img.src = '/view?id='+encodeURIComponent(it.id);
@@ -927,7 +922,7 @@ function render(items){
         img.loading = 'lazy';
         img.onerror = () => { img.remove(); card.classList.remove('has-preview'); };
         card.appendChild(img);
-      } else if(isVid){
+      } else if(!it.pending && isVid){
         card.classList.add('has-preview');
         const v = document.createElement('video');
         v.src = '/view?id='+encodeURIComponent(it.id);
@@ -956,6 +951,7 @@ function render(items){
       card.appendChild(btn);
 
       card.onclick = () => {
+        if(it.pending) return;                            // still uploading
         const st = dlState[it.id];
         if(st && (st.active || st.paused)) return;      // transfer in flight
         if(dlInFlight[it.id]) return;                    // cross-device / native
@@ -968,10 +964,9 @@ function render(items){
       const dlrow = document.createElement('div');
       dlrow.className = 'dlrow hidden';
       dlrow.innerHTML = `
-        <div class="dltrack"><div class="dlfill"></div></div>
-        <div class="dltext">
-          <span class="dl-mid"><span class="dl-pct"></span><span class="dl-spd"></span></span>
-        </div>`;
+        <span class="ring"></span>
+        <span class="dl-pct"></span>
+        <span class="dl-status"></span>`;
       bubble.appendChild(dlrow);
     }
 
@@ -1002,8 +997,8 @@ async function openDefault(it){
 // Range streams, which survives lossy WiFi far better than one stream), with
 // per-chunk offsets so pause/resume continues exactly where it stopped. Files
 // too big to hold in browser memory (>PARALLEL_MEM_CAP) fall back to the
-// browser's own native downloader, which streams to disk. Progress and speed
-// are shown on BOTH ends via the server's /dl-status counter.
+// browser's own native downloader, which streams to disk. Progress (a percent,
+// no speed) is shown on BOTH ends via the server's /dl-status counter.
 const dlState = {};
 const PARALLEL = 6;
 const PARALLEL_MEM_CAP = 2 * 1024 * 1024 * 1024; // 2 GiB in-memory ceiling
@@ -1012,6 +1007,12 @@ const DL_AUTO_RETRIES = 3;
 function dlRow(id){
   const m = document.querySelector('.msg[data-id="'+id+'"]');
   return m ? m.querySelector('.dlrow') : null;
+}
+// Fill a transfer row's ring to pct (0-100): a full ring means the transfer is
+// done. The arc is a conic-gradient sized by the --p custom property.
+function ringPct(row, pct){
+  const r = row && row.querySelector('.ring');
+  if(r) r.style.setProperty('--p', Math.max(0, Math.min(100, pct)));
 }
 
 // Pause/resume button in the progress row. The flag lives server-side so a
@@ -1028,6 +1029,7 @@ function updateCardBtn(id){
   if(!card) return;
   const btn = card.querySelector('.dlcardbtn');
   if(!btn) return;
+  if(card.dataset.pending){ btn.classList.add('hidden'); return; } // mid-upload
   const st = dlState[id];
   let mode;
   if(st && st.active) mode = 'pause';                       // locally downloading
@@ -1052,6 +1054,7 @@ async function setPaused(id, v){
 // ends. Local downloader state wins; otherwise (PC, native download) just flip
 // the shared flag and let the downloading phone react on the next progress push.
 function transferClick(it){
+  if(it.pending) return;               // still uploading, nothing to act on
   const id = it.id;
   const st = dlState[id];
   if(st && st.active){ setPaused(id, 1); pauseDownload(it); return; }
@@ -1099,10 +1102,11 @@ async function downloadFile(it){
   st.paused = false;
   st.active = true;
   row.classList.remove('hidden');
-  // The bar/speed fill in on the first `progress` push, so seed a visible
-  // state now instead of an empty row while the first chunks register.
+  // The bar fills in on the first `progress` push, so seed a visible state now
+  // instead of an empty row while the first chunks register.
+  ringPct(row, 0);
   row.querySelector('.dl-pct').textContent = '0%';
-  row.querySelector('.dl-spd').textContent = 'starting…';
+  row.querySelector('.dl-status').textContent = 'starting…';
   updateCardBtn(id);
 
   const total = it.size;
@@ -1163,14 +1167,15 @@ async function downloadFile(it){
       if(st.opfs) saveMeta(st);
       const r = dlRow(id);
       if(r){
+        ringPct(r, 0);
         r.querySelector('.dl-pct').textContent = 'Tap to continue';
-        r.querySelector('.dl-spd').textContent = '';
+        r.querySelector('.dl-status').textContent = '';
       }
       updateCardBtn(id);
       return;
     }
     const r = dlRow(id);
-    if(r) r.querySelector('.dl-spd').textContent = 'waiting for network…';
+    if(r) r.querySelector('.dl-status').textContent = 'waiting for network…';
     st.timer = setTimeout(() => {
       st.timer = null;
       if(st.paused || !st.active) return;
@@ -1402,7 +1407,8 @@ async function restorePending(items){
       let got = 0;
       for(const c of st.chunks) got += Math.min(c.loaded, c.end - c.start + 1);
       row.querySelector('.dl-pct').textContent = 'Paused · '+(meta.total ? Math.floor(got/meta.total*100) : 0)+'%';
-      row.querySelector('.dl-spd').textContent = 'tap to resume';
+      row.querySelector('.dl-status').textContent = 'tap to resume';
+      ringPct(row, meta.total ? got/meta.total*100 : 0);
       updateCardBtn(meta.id);
     }
   }
@@ -1438,21 +1444,21 @@ function pauseDownload(it){
   const r = dlRow(it.id);
   if(r){
     r.querySelector('.dl-pct').textContent = 'Paused · '+(it.size ? Math.floor(got/it.size*100) : 0)+'%';
-    r.querySelector('.dl-spd').textContent = '';
+    r.querySelector('.dl-status').textContent = '';
+    ringPct(r, it.size ? got/it.size*100 : 0);
   }
   updateCardBtn(it.id);
 }
 
 // Shared progress bar: the server counts bytes sent per message id and pushes
 // `progress` events (~1/s per transfer), which both the PC and the phone render
-// on the timeline. This also makes native (browser-managed) downloads visible
-// on both ends. The push carries the paused flag, so a pause from either device
-// is mirrored onto the other end almost immediately.
-const progCache = {};
+// on the timeline as a percent. This also makes native (browser-managed)
+// downloads visible on both ends. The push carries the paused flag, so a pause
+// from either device is mirrored onto the other end almost immediately. No
+// speed is derived anywhere — a transfer reports only how far it has got.
 // Progress state applied from the given snapshot - a single `progress` SSE
 // event or a full /dl-status list on resync/connect. No steady-state polling.
 function syncProgress(list){
-  const now = performance.now();
   for(const d of list){
     const row = dlRow(d.id);
     if(!row) continue;
@@ -1473,24 +1479,14 @@ function syncProgress(list){
     }
     if(st && st.paused) continue; // locally held; progress bar is frozen
 
-    const fill = row.querySelector('.dlfill');
     const pctEl = row.querySelector('.dl-pct');
-    const spdEl = row.querySelector('.dl-spd');
     const sent = Math.min(d.sent, d.total);
     const pct = d.total ? sent/d.total*100 : 0;
-    fill.style.width = pct + '%';
-    pctEl.textContent = pct.toFixed(0)+'% ('+fmtSize(sent)+')';
-    const prev = progCache[d.id];
-    if(prev){
-      const dt = (now - prev.t)/1000;
-      if(dt > 0.3){
-        const speed = (d.sent - prev.sent)/dt;
-        spdEl.textContent = (speed >= 0 ? fmtSize(speed) : '0 B')+'/s';
-      }
-    }
-    progCache[d.id] = { t: now, sent: d.sent };
+    ringPct(row, pct);
+    pctEl.textContent = Math.round(pct)+'%';
+    // A live percent clears any leftover status hint (starting…, tap to resume).
+    row.querySelector('.dl-status').textContent = '';
     if(d.sent >= d.total){
-      delete progCache[d.id];
       delete dlInFlight[d.id];
       updateCardBtn(d.id);
       setTimeout(() => { const r2 = dlRow(d.id); if(r2) r2.classList.add('hidden'); }, 1500);
@@ -1536,17 +1532,18 @@ function uploadFiles(files){
   busy = true;
   const fd = new FormData();
   for(const f of files) fd.append('file', f);
+  // The server registers the file as a pending row as soon as the request lands
+  // and pushes progress, so a ring + percent appears on BOTH ends — no local
+  // progress UI here. ?size= is the declared total for the shared counter.
+  const size = files[0] && files[0].size ? files[0].size : 0;
   const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/upload');
-  xhr.upload.onprogress = e => {
-    if(e.lengthComputable) $('bar').style.width = (e.loaded/e.total*100)+'%';
-  };
+  xhr.open('POST', '/upload?size='+size);
   xhr.onload = () => {
-    busy = false; $('bar').style.width = '0%';
-    if(xhr.status===200){ toast('Sent successfully'); }
+    busy = false;
+    if(xhr.status===200) toast('Sent successfully');
     else toast('Upload failed');
   };
-  xhr.onerror = () => { busy=false; $('bar').style.width='0%'; toast('Network error'); };
+  xhr.onerror = () => { busy=false; toast('Network error'); };
   xhr.send(fd);
 }
 
@@ -1654,9 +1651,16 @@ window.addEventListener('drop', e => {
   uploadFiles(files);
 });
 
-// PC gate state: has a device connected this session, and did the user dismiss
-// the scan gate. Driven by SSE `info` events now (no /info polling).
+// PC gate state: two SEPARATE facts, both fed by the same discrete `info`
+// events but never sharing one sampler:
+//  - everConnected: the gate. Has a device EVER connected this session? Latches
+//    true on the first `online` and never resets, so the full-screen scan gate
+//    shows only before the first device (adding a later device is the header QR
+//    job, not a re-shown gate).
+//  - deviceOnline : the badge. Is a device connected RIGHT NOW? Follows the
+//    online/offline events live.
 let everConnected = false;
+let deviceOnline = false;
 let gateDismissed = false;
 // Connection light (phone only): simply mirrors whether the SSE /events link is
 // up. No timers — EventSource fires `error` when it loses (or cannot reach) the
@@ -1672,21 +1676,23 @@ function setLink(up){
   $('badge').classList.toggle('off', !up);
   $('badgeTxt').textContent = up ? 'Connected' : 'Disconnected';
 }
-// Device presence update (PC only): badge + scan gate + connection toast. The
-// server pushes `info` when a LAN device's /events stream opens or (debounced)
-// the last one closes. `everConnected` latches on the first connect and is
-// never reset by a drop, so the full-screen gate appears only before the first
-// device — afterwards the badge alone reports connect/disconnect. Reconnect is
-// the phone's own job (EventSource reconnects by itself); the header QR stays
-// available for adding a fresh device.
+// Device presence update (PC only). The server emits two discrete events:
+// `info`{mobileConnected:true} the instant a LAN device's /events stream opens,
+// and {mobileConnected:false} once the last one has been gone for the debounce
+// window. They feed the two facts above:
+//   everConnected -> scan gate (latched once, never unlatched);
+//   deviceOnline  -> badge (follows each event live).
+// Keeping them apart means a reconnect is just another `online` event — the gate
+// cannot get stuck on a stale "offline" snapshot taken at page load.
 function applyInfo(d){
   if(!isPC || !d) return;
   const online = !!d.mobileConnected;
   if(online && !everConnected) toast('Device connected');
-  everConnected = everConnected || online;
+  if(online) everConnected = true;
+  deviceOnline = online;
   $('gate').classList.toggle('show', !everConnected && !gateDismissed);
-  $('badge').classList.toggle('wait', !online);
-  $('badgeTxt').textContent = online ? 'Connected' : 'Waiting for device';
+  $('badge').classList.toggle('wait', !deviceOnline);
+  $('badgeTxt').textContent = deviceOnline ? 'Connected' : 'Waiting for device';
   if(d.url){
     $('qrUrl').textContent = d.url;
     $('gateUrl').querySelector('span').textContent = d.url;

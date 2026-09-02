@@ -127,6 +127,13 @@ struct IdParam {
     id: String,
 }
 
+/// Upload query: the sender's declared file size (drives the pending row's
+/// total for the shared ring). Absent -> total unknown until the body lands.
+#[derive(serde::Deserialize)]
+struct UpQuery {
+    size: Option<u64>,
+}
+
 #[derive(serde::Deserialize)]
 struct TextPayload {
     text: String,
@@ -147,10 +154,6 @@ fn from_by_peer(peer: SocketAddr) -> &'static str {
 /// traffic reaches this machine. The PC's own requests go over loopback and
 /// never update it, so the PC never counts itself.
 static LAST_PHONE_ACT: AtomicU64 = AtomicU64::new(0);
-
-/// Last non-local peer seen, so the online/offline transition lines can name
-/// which device came and went.
-static LAST_PHONE_PEER: Mutex<String> = Mutex::new(String::new());
 
 /// Peers already warned about coming from a different subnet than the QR IP.
 static SUBNET_WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
@@ -221,7 +224,6 @@ async fn log_requests(
     let is_lan = !peer.ip().is_loopback();
     if is_lan {
         LAST_PHONE_ACT.store(now_unix(), Ordering::Relaxed);
-        *LAST_PHONE_PEER.lock().unwrap() = peer.to_string();
         note_foreign_subnet(&peer);
     }
     let method = req.method().clone();
@@ -339,6 +341,9 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
             if catalog::all_items().is_empty() {
                 migrate_legacy_shared();
             }
+            // A crash can leave a pending upload behind (entry + partial file);
+            // drop them so no stale half-file surfaces in the timeline.
+            catalog::purge_pending();
 
             let app = Router::new()
                 .route("/", get(index))
@@ -479,7 +484,7 @@ async fn list() -> impl IntoResponse {
     Json(catalog::all_items())
 }
 
-async fn upload(mut multipart: Multipart) -> impl IntoResponse {
+async fn upload(Query(q): Query<UpQuery>, mut multipart: Multipart) -> impl IntoResponse {
     loop {
         let mut field = match multipart.next_field().await {
             Ok(Some(f)) => f,
@@ -497,6 +502,19 @@ async fn upload(mut multipart: Multipart) -> impl IntoResponse {
         // same-name overwrites; the catalog id matches this prefix.
         let id = catalog::new_id();
         let stored = catalog::inbox_dir().join(format!("{id}__{filename}"));
+        // Register the row as `pending` the moment the request lands, and seed a
+        // shared byte counter, so BOTH ends render a progress ring immediately.
+        // The sender reports its declared total via ?size=.
+        let size = q.size.unwrap_or(0);
+        catalog::add_remote_pending(&id, &stored, &filename, size);
+        let _ = notifier().send(PushEvent::List(catalog::all_items()));
+        {
+            let mut map = dl_progress().lock().unwrap();
+            let e = map.entry(id.clone()).or_default();
+            e.total = size;
+            e.sent = 0;
+            e.last_ts = now_unix();
+        }
         // Stream the body straight to disk instead of buffering it whole in
         // memory: a phone can send multi-GB videos, and buffering those would
         // spike RSS to the file size. The 512 KiB BufWriter coalesces the
@@ -505,6 +523,9 @@ async fn upload(mut multipart: Multipart) -> impl IntoResponse {
             Ok(f) => tokio::io::BufWriter::with_capacity(512 * 1024, f),
             Err(e) => {
                 loge(&format!("upload create failed {}: {}", filename, e));
+                catalog::remove(&id);
+                dl_progress().lock().unwrap().remove(&id);
+                let _ = notifier().send(PushEvent::List(catalog::all_items()));
                 return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}"))
                     .into_response();
             }
@@ -514,10 +535,19 @@ async fn upload(mut multipart: Multipart) -> impl IntoResponse {
         let write_result: Result<(), String> = loop {
             match field.next().await {
                 Some(Ok(chunk)) => {
-                    total += chunk.len() as u64;
+                    let n = chunk.len() as u64;
+                    total += n;
                     if let Err(e) = file.write_all(&chunk).await {
                         break Err(format!("write: {e}"));
                     }
+                    // Count received bytes and push ~1/s, mirroring download
+                    // progress, so the ring on both ends tracks this counter.
+                    let mut map = dl_progress().lock().unwrap();
+                    if let Some(e) = map.get_mut(&id) {
+                        e.sent += n;
+                        e.last_ts = now_unix();
+                    }
+                    push_progress(&mut *map, &id, now_ms(), false);
                 }
                 Some(Err(e)) => break Err(format!("read: {e}")),
                 None => {
@@ -530,16 +560,28 @@ async fn upload(mut multipart: Multipart) -> impl IntoResponse {
         };
         match write_result {
             Ok(()) => {
-                catalog::add_remote(&id, &stored, &filename);
+                catalog::mark_remote_ready(&id);
                 logf(&format!("upload done: {} ({} bytes) -> inbox", filename, total));
+                // Final tick (sent == total) closes the ring on both ends.
+                {
+                    let mut map = dl_progress().lock().unwrap();
+                    if let Some(e) = map.get_mut(&id) {
+                        e.sent = e.total.max(e.sent);
+                        e.last_ts = now_unix();
+                    }
+                    push_progress(&mut *map, &id, now_ms(), true);
+                }
                 let _ = notifier().send(PushEvent::List(catalog::all_items()));
                 return (StatusCode::OK, format!("uploaded: {filename}")).into_response();
             }
             Err(e) => {
-                // Aborted or failed mid-transfer: the partial file is garbage,
-                // remove it and do NOT register the catalog entry.
+                // Aborted or failed mid-transfer: drop the pending row and the
+                // partial file; do NOT leave the entry in the catalog.
                 drop(file);
+                catalog::remove(&id);
                 let _ = std::fs::remove_file(&stored);
+                dl_progress().lock().unwrap().remove(&id);
+                let _ = notifier().send(PushEvent::List(catalog::all_items()));
                 logw(&format!("upload failed {} after {} bytes: {}", filename, total, e));
                 return (StatusCode::BAD_REQUEST, e).into_response();
             }
@@ -666,6 +708,10 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
         logw(&format!("serve: id {} not found", p.id));
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
+    // A file still being uploaded has nothing to serve yet (partial on disk).
+    if entry.pending {
+        return (StatusCode::NOT_FOUND, "still uploading").into_response();
+    }
     let (path, name) = match &entry.body {
         catalog::MsgBody::File { source, name, .. } => (source.path(), name.as_str()),
         catalog::MsgBody::Text { .. } => {
@@ -1099,11 +1145,21 @@ async fn events(
     // device "online". Count it before building the replay below, so a
     // connecting device's own `info` shows it as online. The guard decrements
     // when the connection (and thus this handler's stream) ends.
-    let guard = if peer.ip().is_loopback() {
-        None
-    } else {
-        LAN_EVENTS_OPEN.fetch_add(1, Ordering::Relaxed);
+    let is_lan = !peer.ip().is_loopback();
+    let guard = if is_lan {
+        // A device arriving is a real event (its /events stream just opened), so
+        // it is announced right here when the count goes 0 -> 1 — not derived by
+        // the monitor's sampled transitions. That way a page which loaded just
+        // before the (re)connect still hears "online" instead of being stuck on
+        // the offline state it saw at startup.
+        if LAN_EVENTS_OPEN.fetch_add(1, Ordering::Relaxed) == 0 {
+            logf(&format!("device connected: LAN peer opened /events ({})", peer.ip()));
+            let (ip, port, url) = current_url();
+            let _ = notifier().send(PushEvent::Info { mobile_connected: true, url, ip, port });
+        }
         Some(PresenceGuard)
+    } else {
+        None
     };
     let rx = notifier().subscribe();
     // Replay current state first: covers the gap between page load and the
@@ -1184,10 +1240,11 @@ fn current_url() -> (String, u16, String) {
     (ip, port, url)
 }
 
-/// Background monitor: watches for device-presence transitions, the firewall
-/// repair flag, and stale download entries, pushing /events on every change so
-/// the frontend never polls. Runs every 2s; need_repair() already throttles its
-/// powershell rule check to every 4s.
+/// Background monitor: reports device departures (a silent leave has no event
+/// of its own, so the 2s sampler catches it; arrivals are announced by events()
+/// at stream-open time), plus the firewall repair flag and stale download
+/// entries, pushing /events on every change so the frontend never polls.
+/// Runs every 2s; need_repair() already throttles its powershell rule check.
 async fn monitor_loop() {
     let mut prev_online: Option<bool> = None;
     let mut prev_repair: Option<bool> = None;
@@ -1198,9 +1255,7 @@ async fn monitor_loop() {
         tokio::time::sleep(Duration::from_secs(2)).await;
         // Device presence: online while a LAN peer holds an open /events stream
         // (its page is alive and reachable for pushes), debounced so the ~3s
-        // gap of an EventSource reconnect never reads as a drop. Opening or
-        // closing the stream is the event; nothing is pinged or polled. `info`
-        // transitions drive the PC badge + gate.
+        // gap of an EventSource reconnect never reads as a drop.
         let online = if lan_peer_connected() {
             empty_ticks = 0;
             true
@@ -1208,26 +1263,17 @@ async fn monitor_loop() {
             empty_ticks += 1;
             empty_ticks >= EMPTY_TICKS_OFFLINE
         };
-        match prev_online {
-            // First observation: seed the baseline without logging or pushing.
-            // The /events replay already delivered the initial state to the page
-            // on connect, so a pre-device "went offline" right after startup is
-            // just noise.
-            None => prev_online = Some(online),
-            Some(prev) if prev != online => {
-                prev_online = Some(online);
-                if online {
-                    logf(&format!(
-                        "device connected: LAN peer opened /events (last seen from {})",
-                        LAST_PHONE_PEER.lock().unwrap()
-                    ));
-                } else {
-                    logf("device disconnected: last LAN /events stream closed");
-                }
+        // Arrivals are announced at stream-open time (events()), so this loop
+        // only ever reports the debounced DEPARTURE — a silent leave has no
+        // event of its own, which is exactly why a sampler must catch it.
+        if prev_online != Some(online) {
+            let was_online = prev_online.unwrap_or(false);
+            prev_online = Some(online);
+            if was_online && !online {
+                logf("device disconnected: last LAN /events stream closed");
                 let (ip, port, url) = current_url();
-                let _ = notifier().send(PushEvent::Info { mobile_connected: online, url, ip, port });
+                let _ = notifier().send(PushEvent::Info { mobile_connected: false, url, ip, port });
             }
-            Some(_) => {}
         }
         // Firewall repair flag transitions.
         let repair = crate::firewall::need_repair();
