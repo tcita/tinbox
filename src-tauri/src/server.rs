@@ -16,6 +16,7 @@ use axum::extract::DefaultBodyLimit;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use std::sync::{Mutex, OnceLock};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
@@ -31,25 +32,78 @@ use tauri::Manager;
 /// gate, favicon) without shipping a separate file next to the exe.
 static LOGO: &[u8] = include_bytes!("logo.svg");
 
+/// Events pushed over the /events SSE channel. The frontend used to poll four
+/// endpoints (/list, /dl-status, /info, /fw-status); now each of those states
+/// arrives here as a typed, payload-carrying event, so a page only renders what
+/// changed and polls no state endpoints.
+#[derive(Clone)]
+pub(crate) enum PushEvent {
+    /// The full message list, on any add/delete/reference change.
+    List(Vec<catalog::MsgItem>),
+    /// Download progress for one transfer (throttled to ~1/s server-side; the
+    /// final `sent >= total` tick fires immediately).
+    Progress { id: String, total: u64, sent: u64, paused: bool },
+    /// Firewall repair flag changed.
+    Fw(bool),
+    /// A LAN device connected/disconnected, or the server address changed (the
+    /// PC badge + gate).
+    Info { mobile_connected: bool, url: String, ip: String, port: u16 },
+}
+
 /// Live download progress keyed by message id, aggregated across the parallel
-/// Range requests of one transfer. Both the PC and the phone poll /dl-status
-/// to render a shared progress bar + speed on the timeline (which also covers
-/// browser-native downloads the client cannot measure itself).
+/// Range requests of one transfer. Both the PC and the phone render a shared
+/// progress bar + speed on the timeline from pushed `progress` events (which
+/// also covers browser-native downloads the client cannot measure itself).
 #[derive(Clone, Default)]
 struct DlProg {
     total: u64,
     sent: u64,
     last_ts: u64,
-    /// Either side can pause a transfer via /dl-pause; the flag rides the same
-    /// /dl-status poll so both devices converge on a shared paused state. The
+    /// Either side can pause a transfer via /dl-pause; the flag rides the next
+    /// progress push so both devices converge on a shared paused state. The
     /// downloading side reacts by aborting (pause) or relaunching (resume).
     paused: bool,
+    /// Last time a progress event was pushed for this transfer, to throttle SSE
+    /// emissions to ~1/s per transfer (the frontend used to poll /dl-status).
+    last_emit_ms: u64,
 }
 
 static DL_PROGRESS: OnceLock<Mutex<std::collections::HashMap<String, DlProg>>> = OnceLock::new();
 
 fn dl_progress() -> &'static Mutex<std::collections::HashMap<String, DlProg>> {
     DL_PROGRESS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Millisecond clock for throttling progress pushes (wall clock; fine for a
+/// coarse >= 1s gate).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Push a progress event for `id`, throttled to ~1/s per transfer. Completion
+/// (`sent >= total`) always emits immediately so both ends hide the row without
+/// waiting for the next tick, as does `force` (pause/resume flips must reach
+/// the other end right away). The caller already holds the dl_progress lock.
+fn push_progress(
+    map: &mut std::collections::HashMap<String, DlProg>,
+    id: &str,
+    now: u64,
+    force: bool,
+) {
+    let Some(e) = map.get_mut(id) else { return };
+    let done = e.sent >= e.total;
+    if force || done || now.saturating_sub(e.last_emit_ms) >= 1000 {
+        e.last_emit_ms = now;
+        let _ = notifier().send(PushEvent::Progress {
+            id: id.to_string(),
+            total: e.total,
+            sent: e.sent,
+            paused: e.paused,
+        });
+    }
 }
 
 /// Preferred port; when taken, fall forward within the same range, and as a
@@ -60,13 +114,12 @@ const PORT: u16 = 8765;
 /// like /qr to build URLs consistent with the window).
 static BOUND_PORT: OnceLock<u16> = OnceLock::new();
 
-/// Change broadcast: after any upload/delete/add-reference, a send notifies all
-/// clients subscribed to /events to refresh their lists automatically.
-/// pub(crate) so Tauri commands (main runtime) can trigger a refresh after
-/// writing.
-pub(crate) fn notifier() -> &'static broadcast::Sender<()> {
-    static TX: OnceLock<broadcast::Sender<()>> = OnceLock::new();
-    TX.get_or_init(|| broadcast::channel(16).0)
+/// Push channel: after any state change, a send notifies all clients subscribed
+/// to /events with the new state (list, download progress, firewall, phone
+/// presence). pub(crate) so firewall.rs can push the repair flag.
+pub(crate) fn notifier() -> &'static broadcast::Sender<PushEvent> {
+    static TX: OnceLock<broadcast::Sender<PushEvent>> = OnceLock::new();
+    TX.get_or_init(|| broadcast::channel(64).0)
 }
 
 #[derive(serde::Deserialize)]
@@ -90,16 +143,14 @@ fn from_by_peer(peer: SocketAddr) -> &'static str {
 }
 
 /// Timestamp (unix seconds) of the most recent request from a non-local
-/// (phone) device, used to tell whether a mobile device is online. The PC's own
-/// requests go over loopback and never update it, so the PC never counts itself.
+/// (phone) device. The firewall module reads it as positive proof that inbound
+/// traffic reaches this machine. The PC's own requests go over loopback and
+/// never update it, so the PC never counts itself.
 static LAST_PHONE_ACT: AtomicU64 = AtomicU64::new(0);
 
 /// Last non-local peer seen, so the online/offline transition lines can name
 /// which device came and went.
 static LAST_PHONE_PEER: Mutex<String> = Mutex::new(String::new());
-
-/// Phone online state as of the last /info poll, for logging transitions.
-static PHONE_ONLINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Peers already warned about coming from a different subnet than the QR IP.
 static SUBNET_WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
@@ -111,20 +162,51 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Cadence for the SSE link to a page: the server pushes a data-bearing
+/// keepalive every HEARTBEAT_SECS while the stream is quiet, and the receiving
+/// page (the phone, which can outlive nothing but needs to know when its link
+/// is gone) declares the link dead when nothing has arrived for a few beats.
+/// This is the only remaining heartbeat; device presence is not timer-driven at
+/// all — see LAN_EVENTS_OPEN below.
+const HEARTBEAT_SECS: u64 = 5;
+
+/// Consecutive 2s monitor ticks with no open LAN /events stream before the PC
+/// is told "no device connected". It rides out the ~3s gap while EventSource
+/// reconnects, so a phone that drops and reopens its stream never flips the
+/// badge.
+const EMPTY_TICKS_OFFLINE: u32 = 3;
+
 /// Whether a non-loopback (LAN) device has made a request within the last
 /// `secs` seconds. This is positive proof that inbound traffic is not blocked:
 /// rule inspection can be wrong or unavailable, but packets arriving are
 /// packets arriving. The firewall module uses it as the ground truth to clear
-/// the repair flag; mobile_connected() is the 8s variant for the online badge.
+/// the repair flag.
 pub(crate) fn lan_seen_recently(secs: u64) -> bool {
     now_unix().saturating_sub(LAST_PHONE_ACT.load(Ordering::Relaxed)) < secs
 }
 
-/// Whether a phone is online: a non-local request within the last 8 seconds
-/// (the phone polls fw-status every 2s and pulls the list every 4s, which is
-/// plenty).
-fn mobile_connected() -> bool {
-    lan_seen_recently(8)
+/// How many /events streams are currently open from a non-loopback peer. A
+/// device is "online" exactly while it holds one open — its page is alive and
+/// reachable for pushes. No periodic ping: a live page keeps its EventSource
+/// open (the server's keepalives keep it warm), and after any drop it
+/// reconnects, reopening a stream and flipping presence back on. The monitor
+/// debounces the count so a quick reconnect never reads as a drop.
+static LAN_EVENTS_OPEN: AtomicU64 = AtomicU64::new(0);
+
+/// Whether at least one LAN device currently holds an open /events stream.
+fn lan_peer_connected() -> bool {
+    LAN_EVENTS_OPEN.load(Ordering::Relaxed) > 0
+}
+
+/// Any in-flight download whose streams pushed bytes within the last `secs`
+/// seconds: a transfer can hold its Range streams open with no new HTTP request
+/// arriving (which lan_seen_recently would miss), so the firewall treats
+/// flowing bytes as positive evidence inbound is open.
+pub(crate) fn transfer_active_recently(secs: u64) -> bool {
+    let now = now_unix();
+    let map = dl_progress().lock().unwrap();
+    map.iter()
+        .any(|(_, e)| e.sent < e.total && now.saturating_sub(e.last_ts) < secs)
 }
 
 /// Log every incoming HTTP request and its source IP (key diagnostic: if a
@@ -146,9 +228,9 @@ async fn log_requests(
     }
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    // High-frequency polling endpoints would log a line every second (each
-    // connected page polls dl-status/info/fw-status and list on refresh) and
-    // bury meaningful events. Log them only when they error below.
+    // High-frequency endpoints would otherwise log a line every second
+    // (dl-status on each connect/resync, list on every SSE re-render) and bury
+    // meaningful events. Log them only when they error below.
     if method.as_str() != "GET" || !is_quiet_poll(&path) {
         logf(&format!("{} {} <- {}", method, path, peer));
     }
@@ -165,9 +247,11 @@ async fn log_requests(
     resp
 }
 
-/// Polling endpoints whose successful responses are not worth a log line.
+/// Endpoints hit once per SSE connect (or on a rare one-shot resync), whose
+/// successful responses are not worth a log line. /info and /fw-status are gone
+/// entirely: their state now arrives over the /events push channel.
 fn is_quiet_poll(path: &str) -> bool {
-    matches!(path, "/dl-status" | "/info" | "/fw-status" | "/list")
+    matches!(path, "/dl-status" | "/list")
 }
 
 /// A LAN peer whose /24 differs from the address the QR code points at is the
@@ -280,8 +364,6 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 .route("/open-dir", post(open_dir))
                 .route("/reveal", post(reveal))
                 .route("/events", get(events))
-                .route("/info", get(info))
-                .route("/fw-status", get(fw_status))
                 .route("/repair", post(repair))
                 .route("/quit", post(quit))
                 .route("/untop", post(untop))
@@ -317,6 +399,10 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                  line",
             );
             let _ = tx.send(Some(actual));
+            // Background state monitor: device presence, the firewall repair flag
+            // and stale download entries are watched here and pushed over
+            // /events, so the frontend never polls /info or /fw-status.
+            tokio::spawn(monitor_loop());
             if let Err(e) = axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -448,7 +534,7 @@ async fn upload(mut multipart: Multipart) -> impl IntoResponse {
             Ok(()) => {
                 catalog::add_remote(&id, &stored, &filename);
                 logf(&format!("upload done: {} ({} bytes) -> inbox", filename, total));
-                let _ = notifier().send(());
+                let _ = notifier().send(PushEvent::List(catalog::all_items()));
                 return (StatusCode::OK, format!("uploaded: {filename}")).into_response();
             }
             Err(e) => {
@@ -476,7 +562,7 @@ async fn send_text(
     let from = from_by_peer(peer);
     catalog::add_text(from, text);
     logf(&format!("send-text: from={} len={}", from, text.chars().count()));
-    let _ = notifier().send(());
+    let _ = notifier().send(PushEvent::List(catalog::all_items()));
     (StatusCode::OK, "sent").into_response()
 }
 
@@ -493,7 +579,7 @@ async fn add_local(axum::Json(payload): axum::Json<AddLocalPayload>) -> impl Int
     let n = catalog::add_local(paths);
     if n > 0 {
         logf(&format!("add-local: registered {} local references", n));
-        let _ = notifier().send(());
+        let _ = notifier().send(PushEvent::List(catalog::all_items()));
     }
     (StatusCode::OK, format!("added: {n}")).into_response()
 }
@@ -507,41 +593,6 @@ struct ClientLogPayload {
 async fn client_log(axum::Json(payload): axum::Json<ClientLogPayload>) -> impl IntoResponse {
     logf(&format!("client: {}", payload.msg));
     (StatusCode::OK, "logged").into_response()
-}
-
-/// Frontend poll: whether the firewall repair overlay should be shown.
-async fn fw_status() -> impl IntoResponse {
-    Json(serde_json::json!({ "needRepair": crate::firewall::need_repair() }))
-}
-
-/// Basic server info: LAN IP + whether a mobile device is online (the PC badge
-/// shows green/gray accordingly). The PC polls this every couple of seconds, so
-/// it is the natural place to log online/offline transitions and build a
-/// timeline of whether the phone ever actually reached the server.
-async fn info() -> impl IntoResponse {
-    let online = mobile_connected();
-    let prev = PHONE_ONLINE.swap(online, std::sync::atomic::Ordering::Relaxed);
-    if online != prev {
-        if online {
-            logf(&format!(
-                "phone came online: LAN request seen from {} within the last 8s",
-                LAST_PHONE_PEER.lock().unwrap()
-            ));
-        } else {
-            logf(&format!(
-                "phone went offline: no LAN request for over 8s (last seen from {})",
-                LAST_PHONE_PEER.lock().unwrap()
-            ));
-        }
-    }
-    let ip = collect_ips().first().cloned().unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = BOUND_PORT.get().copied().unwrap_or(PORT);
-    Json(serde_json::json!({
-        "ip": ip,
-        "port": port,
-        "url": format!("http://{}:{}", ip, port),
-        "mobileConnected": online
-    }))
 }
 
 /// Frontend "Repair" click: launch elevated UAC to delete the Block and add an
@@ -667,8 +718,8 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
     }
     // Progress tracking: real downloads (not inline previews) register a
     // shared counter per message id, and each chunk written to the socket is
-    // counted, so /dl-status can show the same bar/speed on both ends. Parallel
-    // Range requests of one transfer accumulate into the same entry.
+    // counted and pushed as a `progress` event, so both ends show the same
+    // bar/speed. Parallel Range requests accumulate into the same entry.
     let prog_id = if inline { None } else { Some(p.id.clone()) };
     if let Some(id) = &prog_id {
         let mut map = dl_progress().lock().unwrap();
@@ -694,6 +745,9 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
                         e.sent += b.len() as u64;
                         e.last_ts = now_unix();
                     }
+                    // Push throttled ~1/s per transfer (instant on completion)
+                    // so both ends get live progress without polling.
+                    push_progress(&mut *map, &id, now_ms(), false);
                 }
                 chunk
             }))
@@ -833,9 +887,10 @@ where
     }
 }
 
-/// Live transfer progress for the /dl-status poll: every download the server is
-/// currently serving (or finished within the last 30s), so the PC and the phone
-/// render the same progress bar and speed. Stale completed entries are pruned.
+/// Live transfer progress snapshot: every download the server is currently
+/// serving (or finished within the last 30s). Now only hit once on SSE connect
+/// (and on a one-shot resync after a lagged push) - steady-state progress rides
+/// /events `progress` pushes. Stale completed entries are pruned.
 async fn dl_status() -> impl IntoResponse {
     let now = now_unix();
     let mut map = dl_progress().lock().unwrap();
@@ -850,10 +905,10 @@ async fn dl_status() -> impl IntoResponse {
 }
 
 /// Pause/resume a transfer from either end (POST /dl-pause?id=X&paused=1|0).
-/// Flips the shared paused flag; /dl-status carries it to both devices on the
-/// next poll, and the downloading side aborts (pause) or relaunches unfinished
-/// chunks (resume). The entry may not exist yet if a pause races the first
-/// request - create it so the flag survives until the transfer registers.
+/// Flips the shared paused flag, which is pushed to both devices immediately as
+/// a `progress` event; the downloading side aborts (pause) or relaunches
+/// unfinished chunks (resume). The entry may not exist yet if a pause races the
+/// first request - create it so the flag survives until the transfer registers.
 #[derive(serde::Deserialize)]
 struct PauseParam {
     id: String,
@@ -862,19 +917,27 @@ struct PauseParam {
 
 async fn dl_pause(Query(p): Query<PauseParam>) -> impl IntoResponse {
     let mut map = dl_progress().lock().unwrap();
-    let e = map.entry(p.id).or_default();
-    e.paused = p.paused != 0;
-    e.last_ts = now_unix();
+    {
+        let e = map.entry(p.id.clone()).or_default();
+        e.paused = p.paused != 0;
+        e.last_ts = now_unix();
+    }
+    // Push immediately (force, not throttled) so the downloading side
+    // aborts/relaunches right away instead of waiting for the next progress tick.
+    push_progress(&mut *map, &p.id, now_ms(), true);
     (StatusCode::OK, "ok").into_response()
 }
 
 /// A fresh download restarts the shared counter: without this, re-downloading a
 /// file whose previous entry still holds sent>=total (kept alive ~30s after it
-/// finished) makes /dl-status immediately look complete and the progress row
-/// vanishes. The phone POSTs this when it starts from byte 0.
+/// finished) makes the pushed progress immediately look complete and the
+/// progress row vanishes. The phone POSTs this when it starts from byte 0.
 async fn dl_reset(Query(p): Query<IdParam>) -> impl IntoResponse {
     let mut map = dl_progress().lock().unwrap();
-    map.insert(p.id, DlProg::default());
+    map.insert(p.id.clone(), DlProg::default());
+    // Announce the zeroed counter so the other end clears any stale row right
+    // away instead of waiting for the first real chunk to tick.
+    push_progress(&mut *map, &p.id, now_ms(), true);
     (StatusCode::OK, "ok").into_response()
 }
 
@@ -902,10 +965,10 @@ async fn remove(
                 catalog::MsgBody::Text { .. } => "text message deleted".to_string(),
             };
             logf(&format!("remove: {}", label));
-            // Drop its progress entry so /dl-status stops advertising a deleted
-            // file to whichever side is still downloading it.
+            // Drop its progress entry so no further `progress` events advertise
+            // a deleted file to whichever side is still downloading it.
             dl_progress().lock().unwrap().remove(&p.id);
-            let _ = notifier().send(());
+            let _ = notifier().send(PushEvent::List(catalog::all_items()));
             (StatusCode::OK, "deleted").into_response()
         }
         None => (StatusCode::NOT_FOUND, "not found").into_response(),
@@ -999,14 +1062,188 @@ async fn open_dir() -> impl IntoResponse {
     }
 }
 
-/// Server push: notify all connected clients (including across devices) to
-/// refresh when the file list changes.
-async fn events() -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+/// RAII guard that decrements LAN_EVENTS_OPEN when its /events stream ends. It
+/// rides inside GuardedStream, which axum drops when the client disconnects, so
+/// the counter tracks exactly the currently-open LAN streams.
+struct PresenceGuard;
+impl Drop for PresenceGuard {
+    fn drop(&mut self) {
+        LAN_EVENTS_OPEN.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// A boxed SSE stream carrying an optional PresenceGuard for the whole life of
+/// the connection (present for LAN peers, absent for the PC's own loopback
+/// page).
+type SseItem = Result<Event, std::convert::Infallible>;
+struct GuardedStream {
+    inner: std::pin::Pin<Box<dyn tokio_stream::Stream<Item = SseItem> + Send>>,
+    _guard: Option<PresenceGuard>,
+}
+impl tokio_stream::Stream for GuardedStream {
+    type Item = SseItem;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
+
+/// Server push: typed events over one SSE connection. On connect it replays the
+/// current state (list + firewall + device presence) so a fresh page needs no
+/// poll, then streams live PushEvents. A data-bearing keepalive keeps the
+/// socket warm and feeds the phone's receiver-side link watchdog while idle.
+async fn events(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    // Device presence: opening this stream from a LAN peer is what makes a
+    // device "online". Count it before building the replay below, so a
+    // connecting device's own `info` shows it as online. The guard decrements
+    // when the connection (and thus this handler's stream) ends.
+    let guard = if peer.ip().is_loopback() {
+        None
+    } else {
+        LAN_EVENTS_OPEN.fetch_add(1, Ordering::Relaxed);
+        Some(PresenceGuard)
+    };
     let rx = notifier().subscribe();
-    let stream = BroadcastStream::new(rx).map(|_| {
-        Ok::<_, std::convert::Infallible>(Event::default().data("change"))
-    });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    // Replay current state first: covers the gap between page load and the
+    // first live event, so the PC/phone never has to fetch /list, /info or
+    // /fw-status on start.
+    let initial = tokio_stream::iter(vec![list_event(), info_event(), fw_event()])
+        .map(Ok::<_, std::convert::Infallible>);
+    let stream = initial.chain(BroadcastStream::new(rx).map(|msg| {
+        Ok::<_, std::convert::Infallible>(match msg {
+            Ok(ev) => push_event_to_sse(ev),
+            // A slow subscriber fell behind and missed events; ask it to
+            // re-fetch /dl-status once so progress bars self-heal.
+            Err(_) => Event::default().event("resync").data("1"),
+        })
+    }));
+    // A data-bearing keepalive (not axum's default comment) so `message` events
+    // fire and the phone's watchdog sees the link as alive even while idle and
+    // quiet. (KeepAlive::text() emits a comment, which the browser ignores.)
+    Sse::new(GuardedStream { inner: Box::pin(stream), _guard: guard }).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(HEARTBEAT_SECS))
+            .event(Event::default().data("{}")),
+    )
+}
+
+fn list_event() -> Event {
+    Event::default()
+        .event("list")
+        .json_data(&catalog::all_items())
+        .unwrap()
+}
+
+fn fw_event() -> Event {
+    Event::default()
+        .event("fw")
+        .json_data(&serde_json::json!({ "needRepair": crate::firewall::need_repair() }))
+        .unwrap()
+}
+
+fn info_event() -> Event {
+    let (ip, port, url) = current_url();
+    let online = lan_peer_connected();
+    Event::default()
+        .event("info")
+        .json_data(&serde_json::json!({
+            "mobileConnected": online, "ip": ip, "port": port, "url": url
+        }))
+        .unwrap()
+}
+
+fn push_event_to_sse(ev: PushEvent) -> Event {
+    match ev {
+        PushEvent::List(items) => Event::default().event("list").json_data(&items).unwrap(),
+        PushEvent::Progress { id, total, sent, paused } => Event::default()
+            .event("progress")
+            .json_data(&serde_json::json!({ "id": id, "total": total, "sent": sent, "paused": paused }))
+            .unwrap(),
+        PushEvent::Fw(need) => Event::default()
+            .event("fw")
+            .json_data(&serde_json::json!({ "needRepair": need }))
+            .unwrap(),
+        PushEvent::Info { mobile_connected, url, ip, port } => Event::default()
+            .event("info")
+            .json_data(&serde_json::json!({
+                "mobileConnected": mobile_connected, "url": url, "ip": ip, "port": port
+            }))
+            .unwrap(),
+    }
+}
+
+/// Best LAN IP + bound port + full URL, shared by the /qr code and `info` events.
+fn current_url() -> (String, u16, String) {
+    let ip = collect_ips()
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = BOUND_PORT.get().copied().unwrap_or(PORT);
+    let url = format!("http://{}:{}", ip, port);
+    (ip, port, url)
+}
+
+/// Background monitor: watches for device-presence transitions, the firewall
+/// repair flag, and stale download entries, pushing /events on every change so
+/// the frontend never polls. Runs every 2s; need_repair() already throttles its
+/// powershell rule check to every 4s.
+async fn monitor_loop() {
+    let mut prev_online: Option<bool> = None;
+    let mut prev_repair: Option<bool> = None;
+    // Consecutive ticks with no open LAN /events stream; presence flips offline
+    // only after EMPTY_TICKS_OFFLINE of them.
+    let mut empty_ticks: u32 = 0;
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Device presence: online while a LAN peer holds an open /events stream
+        // (its page is alive and reachable for pushes), debounced so the ~3s
+        // gap of an EventSource reconnect never reads as a drop. Opening or
+        // closing the stream is the event; nothing is pinged or polled. `info`
+        // transitions drive the PC badge + gate.
+        let online = if lan_peer_connected() {
+            empty_ticks = 0;
+            true
+        } else {
+            empty_ticks += 1;
+            empty_ticks >= EMPTY_TICKS_OFFLINE
+        };
+        match prev_online {
+            // First observation: seed the baseline without logging or pushing.
+            // The /events replay already delivered the initial state to the page
+            // on connect, so a pre-device "went offline" right after startup is
+            // just noise.
+            None => prev_online = Some(online),
+            Some(prev) if prev != online => {
+                prev_online = Some(online);
+                if online {
+                    logf(&format!(
+                        "device connected: LAN peer opened /events (last seen from {})",
+                        LAST_PHONE_PEER.lock().unwrap()
+                    ));
+                } else {
+                    logf("device disconnected: last LAN /events stream closed");
+                }
+                let (ip, port, url) = current_url();
+                let _ = notifier().send(PushEvent::Info { mobile_connected: online, url, ip, port });
+            }
+            Some(_) => {}
+        }
+        // Firewall repair flag transitions.
+        let repair = crate::firewall::need_repair();
+        if prev_repair != Some(repair) {
+            prev_repair = Some(repair);
+            let _ = notifier().send(PushEvent::Fw(repair));
+        }
+        // Prune completed transfers whose entries went stale (was pruned in
+        // /dl-status before; the frontend no longer polls it).
+        let now = now_unix();
+        let mut map = dl_progress().lock().unwrap();
+        map.retain(|_, e| !(e.sent >= e.total && now.saturating_sub(e.last_ts) > 30));
+    }
 }
 
 /// Return a QR code PNG whose content is http://<best-LAN-IP>:<port>. The IP
@@ -1177,7 +1414,7 @@ fn collect_ips() -> Vec<String> {
 
     // Log whenever any bucket changes, not just the winner: a new virtual
     // adapter appearing or a candidate flipping to dead is diagnostic noise
-    // worth one line, while steady-state polling stays silent.
+    // worth one line, while steady-state checks stay silent.
     let best = ips.first().cloned().unwrap_or_default();
     let signature = format!("{best}|{alive:?}|{unprobed:?}|{dead:?}|{dropped_virtual:?}");
     {
@@ -1220,8 +1457,8 @@ fn virtual_adapter(s: &str) -> bool {
 }
 
 /// Probe several (source address, gateway) pairs concurrently; each answer
-/// is cached for 60s because /info polls collect_ips every few seconds and
-/// a probe costs up to 1s of ping timeout.
+/// is cached for 60s because collect_ips runs on every `info` event / connect
+/// replay and a probe costs up to 1s of ping timeout.
 fn probe_gateways(
     probes: &[(Ipv4Addr, Ipv4Addr)],
 ) -> std::collections::HashMap<(Ipv4Addr, Ipv4Addr), bool> {
@@ -1299,7 +1536,8 @@ fn gateway_reachable(_src: Ipv4Addr, _gw: Ipv4Addr) -> bool {
 
 /// Adapter metadata used for filtering: interface name -> (description,
 /// default gateway if any). Gathered by one powershell call, cached 30s —
-/// /info is polled every few seconds and must not spawn a process each time.
+/// `info` events fire on connect and on phone transitions, so the query must
+/// not spawn a process each time.
 #[cfg(windows)]
 type AdapterFacts = std::collections::HashMap<String, (String, Option<String>)>;
 

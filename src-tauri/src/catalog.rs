@@ -58,8 +58,9 @@ pub struct Entry {
 }
 
 /// List item for the frontend; carries different fields per kind, which the
-/// frontend renders according to kind.
-#[derive(Serialize)]
+/// frontend renders according to kind. Clone so the SSE push channel can
+/// broadcast the full list on every change.
+#[derive(Serialize, Clone)]
 pub struct MsgItem {
     pub id: String,
     pub ts: String,

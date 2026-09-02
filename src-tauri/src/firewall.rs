@@ -170,8 +170,8 @@ fn log_network_profile() {
 static PENDING_REPAIR: AtomicBool = AtomicBool::new(false);
 
 /// Rate limit for the confirmatory rule re-checks in need_repair(): while the
-/// repair overlay is up, the frontend polls /fw-status every 2s; re-running
-/// powershell on every poll is wasteful.
+/// repair overlay is up, the background monitor re-checks every couple of
+/// seconds; re-running powershell on every check is wasteful.
 static LAST_RULE_CHECK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn now_unix() -> u64 {
@@ -184,9 +184,9 @@ fn now_unix() -> u64 {
 /// Entry point: run the firewall check in the background, without blocking
 /// setup/window creation (otherwise a cold powershell start can hang for
 /// seconds). A detected Block -> flag PENDING_REPAIR and bring the window to
-/// the front; the frontend polls /fw-status to show the HTML repair overlay.
-/// No Block but missing Allow -> poll after startup (wait for the Windows
-/// dialog to be answered).
+/// the front; the server pushes the repair flag over /events so the frontend
+/// shows the HTML repair overlay. No Block but missing Allow -> poll after
+/// startup (wait for the Windows dialog to be answered).
 pub fn ensure_background(app: AppHandle) {
     #[cfg(windows)]
     {
@@ -283,9 +283,9 @@ fn post_startup_poll(app: &AppHandle, exe: &str) {
 #[cfg(windows)]
 fn mark_need_repair(app: &AppHandle) {
     PENDING_REPAIR.store(true, Ordering::SeqCst);
-    // Push through the existing SSE channel so the frontend re-checks
-    // /fw-status right now instead of waiting up to its full 2s poll interval.
-    let _ = crate::server::notifier().send(());
+    // Push the repair flag over the SSE channel so the frontend shows the
+    // overlay immediately instead of waiting for the background monitor.
+    let _ = crate::server::notifier().send(crate::server::PushEvent::Fw(true));
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.unminimize();
         let _ = w.set_focus();
@@ -308,7 +308,13 @@ fn mark_need_repair(app: &AppHandle) {
 pub fn need_repair() -> bool {
     #[cfg(windows)]
     {
-        if crate::server::lan_seen_recently(30) {
+        // Positive evidence also includes bytes flowing to a phone mid-download:
+        // a request that opens a Range stream proved inbound is open, and a
+        // transfer can then hold that stream for many seconds with no new
+        // requests arriving (which lan_seen_recently alone would miss).
+        if crate::server::lan_seen_recently(30)
+            || crate::server::transfer_active_recently(30)
+        {
             PENDING_REPAIR.store(false, Ordering::SeqCst);
             return false;
         }

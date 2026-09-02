@@ -805,24 +805,27 @@ document.addEventListener('click', () => {
 document.addEventListener('scroll', hideCtxMenu, true);
 
 let lastList = '';
-let pollFailures = 0;
+// Apply a full message list: dedup against what we already rendered, then
+// render + the housekeeping passes. Called from the one-shot refresh() fetch
+// and from each SSE `list` event (which carries the full array, so steady
+// state makes no /list requests at all).
+function applyList(items){
+  setOffline(false);
+  lastLive = Date.now();
+  const key = JSON.stringify(items);
+  if(key === lastList) return;
+  lastList = key;
+  render(items);
+  autoPull(items);
+  pruneTransfers(items);
+  restorePending(items);
+}
+// One-shot fetch, used on page load and on every SSE (re)connect. Offline
+// detection is owned by the SSE error/watchdog path, not by fetch failures.
 async function refresh(){
   try {
-    const r = await fetch('/list');
-    const items = await r.json();
-    pollFailures = 0;
-    setOffline(false);
-    lastLive = Date.now();
-    const key = JSON.stringify(items);
-    if(key === lastList) return;
-    lastList = key;
-    render(items);
-    autoPull(items);
-    pruneTransfers(items);
-    restorePending(items);
-  } catch {
-    if(++pollFailures >= 2) setOffline(true);
-  }
+    applyList(await (await fetch('/list')).json());
+  } catch {}
 }
 
 // If a file that was being transferred (or its native download) got removed on
@@ -1014,8 +1017,8 @@ function dlRow(id){
 }
 
 // Pause/resume button in the progress row. The flag lives server-side so a
-// pause from either the PC or the phone reaches the other end through the
-// existing /dl-status poll; locally we mirror it onto the JS downloader.
+// pause from either the PC or the phone reaches the other end through the next
+// SSE `progress` push; locally we mirror it onto the JS downloader.
 const serverPaused = {};
 const dlInFlight = {};
 const BTN_DL    = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
@@ -1049,7 +1052,7 @@ async function setPaused(id, v){
 
 // Corner-button action: start (phone idle) / pause / resume, unified on both
 // ends. Local downloader state wins; otherwise (PC, native download) just flip
-// the shared flag and let the downloading phone react on its next poll.
+// the shared flag and let the downloading phone react on the next progress push.
 function transferClick(it){
   const id = it.id;
   const st = dlState[id];
@@ -1098,7 +1101,7 @@ async function downloadFile(it){
   st.paused = false;
   st.active = true;
   row.classList.remove('hidden');
-  // The bar/speed only fill in on the next /dl-status poll, so seed a visible
+  // The bar/speed fill in on the first `progress` push, so seed a visible
   // state now instead of an empty row while the first chunks register.
   row.querySelector('.dl-pct').textContent = '0%';
   row.querySelector('.dl-spd').textContent = 'starting…';
@@ -1442,18 +1445,15 @@ function pauseDownload(it){
   updateCardBtn(it.id);
 }
 
-// Shared progress bar: the server counts bytes sent per message id, and both
-// the PC and the phone poll it to render progress + speed on the timeline.
-// This also makes native (browser-managed) downloads visible on both ends.
-// The same poll carries the paused flag, so a pause from either device is
-// mirrored onto the other end within a second.
+// Shared progress bar: the server counts bytes sent per message id and pushes
+// `progress` events (~1/s per transfer), which both the PC and the phone render
+// on the timeline. This also makes native (browser-managed) downloads visible
+// on both ends. The push carries the paused flag, so a pause from either device
+// is mirrored onto the other end almost immediately.
 const progCache = {};
-async function syncProgress(){
-  let list;
-  try {
-    const r = await fetch('/dl-status');
-    list = await r.json();
-  } catch { return; }
+// Progress state applied from the given snapshot - a single `progress` SSE
+// event or a full /dl-status list on resync/connect. No steady-state polling.
+function syncProgress(list){
   const now = performance.now();
   for(const d of list){
     const row = dlRow(d.id);
@@ -1501,7 +1501,13 @@ async function syncProgress(){
     }
   }
 }
-setInterval(syncProgress, 1000);
+// One-shot recovery fetch: after an SSE push was missed (the server sends
+// `resync` when a subscriber lags) and once on connect, to re-sync progress.
+async function resyncProgress(){
+  try {
+    syncProgress(await (await fetch('/dl-status')).json());
+  } catch {}
+}
 
 function sendText(){
   const t = $('txt');
@@ -1651,47 +1657,84 @@ window.addEventListener('drop', e => {
 });
 
 let offline = false;
-// Last moment any request/SSE succeeded; the watchdog below turns the phone's
-// badge to "Disconnected" after ~20s of silence. Catches silent network loss
-// (PC sleep, WiFi drop, router restart) where TCP hangs instead of erroring.
-// (The PC's own page is served by the same process, so it never outlives the
-// server; this is meaningful only for the phone's page.)
+// Last moment any request/SSE activity (including the keepalive) succeeded;
+// the watchdog below turns the badge to "Disconnected" after OFFLINE_AFTER_SECS
+// of silence. Catches silent network loss (PC sleep, WiFi drop, router restart)
+// where TCP hangs instead of erroring. (The PC's own page is served by the same
+// process, so it never outlives the server; this is meaningful only for the
+// phone's page.)
 let lastLive = Date.now();
+// PC gate state: has a device connected this session, and did the user dismiss
+// the scan gate. Driven by SSE `info` events now (no /info polling).
+let everConnected = false;
+let gateDismissed = false;
 function setOffline(v){
   if(offline === v) return;
   offline = v;
   $('offBanner').classList.toggle('show', v);
-  if(isPC) return; // PC badge reflects phone presence only, driven by /info
+  if(isPC) return; // PC badge reflects phone presence only, driven by `info` events
   $('badge').classList.toggle('off', v);
   $('badgeTxt').textContent = v ? 'Disconnected' : 'Connected';
 }
+// Device presence update (PC only): badge + scan gate + connection toast. The
+// server pushes `info` when a LAN device's /events stream opens or (debounced)
+// the last one closes. `everConnected` latches on the first connect and is
+// never reset by a drop, so the full-screen gate appears only before the first
+// device — afterwards the badge alone reports connect/disconnect. Reconnect is
+// the phone's own job (EventSource reconnects by itself); the header QR stays
+// available for adding a fresh device.
+function applyInfo(d){
+  if(!isPC || !d) return;
+  const online = !!d.mobileConnected;
+  if(online && !everConnected) toast('Device connected');
+  everConnected = everConnected || online;
+  $('gate').classList.toggle('show', !everConnected && !gateDismissed);
+  $('badge').classList.toggle('wait', !online);
+  $('badgeTxt').textContent = online ? 'Connected' : 'Waiting for device';
+  if(d.url){
+    $('qrUrl').textContent = d.url;
+    $('gateUrl').querySelector('span').textContent = d.url;
+    $('qlUrl').textContent = d.url;
+  }
+}
 
+// Single SSE push channel: named events carry the actual state, so the page
+// polls no state endpoints. On open the server replays list/fw/info and we
+// additionally pull /list and /dl-status once to cover the replay race.
 const es = new EventSource('/events');
-es.onmessage = () => { lastLive = Date.now(); refresh(); checkFwStatus(); };
+// Any event over the SSE proves the link is alive, so every handler refreshes
+// lastLive (what the watchdog watches). This matters most during a download:
+// the stream is busy emitting named `progress` events ~1/s, which suppress the
+// unnamed keepalive and never fire onmessage - without touching lastLive here,
+// the watchdog would declare the link dead while the transfer is clearly
+// running. (`list` also refreshes lastLive inside applyList.)
+const touch = () => { lastLive = Date.now(); setOffline(false); };
+es.onopen = () => { touch(); refresh(); resyncProgress(); };
+// The unnamed keepalive carries data every HEARTBEAT_SECS while the stream is
+// otherwise quiet; onmessage is the idle-time beat.
+es.onmessage = touch;
 es.onerror = () => setOffline(true);
-es.onopen = () => { lastLive = Date.now(); setOffline(false); refresh(); };
-const refreshTimer = setInterval(refresh, 4000);
-// Watchdog: if nothing succeeded for ~20s, the link is silently gone (a hang,
-// not a reject) - force the offline state so the badge/banner do not sit stale.
-setInterval(() => {
-  if(Date.now() - lastLive > 20000) setOffline(true);
+es.addEventListener('list', e => { touch(); applyList(JSON.parse(e.data)); });
+es.addEventListener('progress', e => { touch(); syncProgress([JSON.parse(e.data)]); });
+es.addEventListener('resync', () => { touch(); resyncProgress(); });
+es.addEventListener('fw', e => { touch(); applyFw(JSON.parse(e.data).needRepair); });
+es.addEventListener('info', e => { touch(); applyInfo(JSON.parse(e.data)); });
+// Watchdog: if no SSE activity (keepalives included) for OFFLINE_AFTER_SECS
+// (15s, i.e. 3 missed keepalives), the link is silently gone (a hang, not a
+// reject) - force offline so the badge/banner do not sit stale. A local timer,
+// not a poll.
+const watchdog = setInterval(() => {
+  if(Date.now() - lastLive > 15000) setOffline(true);
 }, 5000);
 
-let fwChecking = false;
 let fwWasShown = false;
-async function checkFwStatus(){
-  if(fwChecking) return;
-  fwChecking = true;
-  try {
-    const r = await fetch('/fw-status');
-    const s = await r.json();
-    setOffline(false);
-    const show = !!s.needRepair;
-    $('fwOverlay').classList.toggle('show', show);
-    if(fwWasShown && !show){ fetch('/untop', {method:'POST'}).catch(()=>{}); }
-    fwWasShown = show;
-  } catch { setOffline(true); }
-  fwChecking = false;
+// Firewall repair flag arrives as an SSE `fw` event (the server pushes only on
+// change); no /fw-status polling.
+function applyFw(needRepair){
+  const show = !!needRepair;
+  $('fwOverlay').classList.toggle('show', show);
+  if(fwWasShown && !show){ fetch('/untop', {method:'POST'}).catch(()=>{}); }
+  fwWasShown = show;
 }
 $('fwRepair').onclick = async () => {
   $('fwRepair').disabled = true;
@@ -1715,15 +1758,12 @@ $('fwRepair').onclick = async () => {
   $('fwQuit').disabled = false;
 };
 $('fwQuit').onclick = () => { fetch('/quit', {method:'POST'}).catch(()=>{}); };
-checkFwStatus();
-const fwTimer = setInterval(checkFwStatus, 2500);
 
 function supersede(){
   if(superseded) return;
   superseded = true;
   try { es.close(); } catch {}
-  clearInterval(refreshTimer);
-  clearInterval(fwTimer);
+  clearInterval(watchdog);
   $('deadOverlay').classList.add('show');
   setTimeout(() => window.close(), 300);
 }
@@ -1747,38 +1787,12 @@ $('qrBox').onclick = openQrLightbox;
 $('qrLightbox').onclick = closeQrLightbox;
 
 if(isPC){
-  let everConnected = false;
-  let missedPolls = 0;
   // User dismissed the gate to browse the inbox without a device connected;
   // a real connection resets it so a later drop re-shows the scan screen.
-  let gateDismissed = false;
-  const updateMobile = () => {
-    fetch('/info').then(r=>r.json()).then(d => {
-      if(!d) return;
-      if(d.mobileConnected){
-        if(!everConnected) toast('Device connected');
-        everConnected = true;
-        missedPolls = 0;
-        gateDismissed = false;
-        $('gateTitle').textContent = 'Scan to connect';
-      } else if(everConnected && ++missedPolls >= 20){
-        everConnected = false;
-        $('gateTitle').textContent = 'Connection lost — Scan again';
-      }
-      $('gate').classList.toggle('show', !everConnected && !gateDismissed);
-      $('badge').classList.toggle('wait', !d.mobileConnected);
-      $('badgeTxt').textContent = d.mobileConnected ? 'Connected' : 'Waiting for device';
-      if(d.url){ 
-        $('qrUrl').textContent = d.url; 
-        $('gateUrl').querySelector('span').textContent = d.url; 
-        $('qlUrl').textContent = d.url; 
-      }
-    }).catch(()=>{});
-  };
+  // Everything else (badge, gate visibility, connection toast) comes from the
+  // SSE `info` events handled by applyInfo().
   $('gate').classList.add('show');
   $('gateInbox').onclick = () => { gateDismissed = true; $('gate').classList.remove('show'); };
-  updateMobile();
-  setInterval(updateMobile, 3000);
 }
 
 // Report client-side exceptions into the server log, so a failure on the phone
