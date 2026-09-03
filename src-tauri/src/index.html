@@ -1598,9 +1598,22 @@ es.onopen = () => { setLink(true); refresh(); resyncProgress(); };
 es.onerror = () => setLink(false);
 es.addEventListener('list', e => { applyList(JSON.parse(e.data)); });
 es.addEventListener('progress', e => { syncProgress([JSON.parse(e.data)]); });
-es.addEventListener('resync', () => resyncProgress());
+// A `resync` means this client fell behind and may have dropped pushes (the
+// server broadcasts it on lag and on transfers that end without a list change).
+// Re-fetch BOTH the file list and the transfer mirrors so nothing stays stale.
+es.addEventListener('resync', () => { refresh(); resyncProgress(); });
 es.addEventListener('fw', e => { applyFw(JSON.parse(e.data).needRepair); });
 es.addEventListener('info', e => { applyInfo(JSON.parse(e.data)); });
+
+// A backgrounded phone/browser can have its EventSource suspended (Chrome keeps
+// it "open" but delivers nothing), so on return to the foreground there is no
+// new SSE event to nudge a refresh. Re-fetch the list + transfer mirrors here.
+document.addEventListener('visibilitychange', () => {
+  if(document.visibilityState === 'visible'){
+    refresh();
+    resyncProgress();
+  }
+});
 
 let fwWasShown = false;
 // Firewall repair flag arrives as an SSE `fw` event (the server pushes only on
