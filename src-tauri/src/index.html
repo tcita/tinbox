@@ -279,8 +279,16 @@
     backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
     transition: background 0.15s, transform 0.15s;
   }
-  .dlcardbtn:hover { background: rgba(0,0,0,0.72); }
-  .dlcardbtn:active { transform: scale(0.9); }
+  /* Press feedback only (this button only ever shows on the touch phone side).
+     No `:hover` darkening: on a touch screen Chromium keeps `:hover` on the
+     last-tapped element until another tap, and since the button is hidden while
+     a download runs and re-shown at that same tap point, the stuck darker
+     background read as a black button until the next tap or a reload. `:active`
+     ends on release, so it can't stick. */
+  .dlcardbtn:active {
+    transform: scale(0.9);
+    background: rgba(255,255,255,0.3);
+  }
   .dlcardbtn svg { width: 14px; height: 14px; display: block; }
   .dlcardbtn.hidden { display: none; }
   .msg.me .dlcardbtn { background: rgba(0,0,0,0.45); }
@@ -1078,6 +1086,13 @@ const BTN_DL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strok
 // and then pop back as "paused" a moment later.
 const RING_LIVE_MS = 8000;
 
+// How long a just-tapped native download may live in the mirror before the
+// server registers it in /dl-status. If the id is still absent after this, the
+// transfer is dead (cancelled/aborted in the browser), so the corner should fall
+// back to the Download button rather than idle on a dark 0% ring until
+// RING_LIVE_MS elapses.
+const NATIVE_REGISTER_GRACE_MS = 1500;
+
 // What a card's corner should show right now:
 //   null -> idle (no transfer) — the Download button may show instead
 //   {pct, paused, done} -> a live transfer — draw the ring at pct%
@@ -1338,8 +1353,11 @@ function reconcileMirrors(snap){
   for(const id of Object.keys(serverPaused)) if(!known.has(id)) delete serverPaused[id];
   for(const id of Object.keys(progCache))    if(!known.has(id) && !doneIds[id]) delete progCache[id];
   // A phone tap that just landed may not have registered server-side yet; keep
-  // its corner live until the window passes rather than dropping it mid-start.
-  for(const id of Object.keys(nativeDl)) if(!known.has(id) && now - nativeDl[id] > RING_LIVE_MS) delete nativeDl[id];
+  // its corner live for a short window rather than dropping it mid-start. Once
+  // that window passes with the id still absent, the transfer is dead — drop it
+  // so the corner returns to the Download button instead of idling on a dark 0%
+  // ring until RING_LIVE_MS elapses.
+  for(const id of Object.keys(nativeDl)) if(!known.has(id) && now - nativeDl[id] > NATIVE_REGISTER_GRACE_MS) delete nativeDl[id];
 }
 
 // Phone-only self-heal for the corner ring. The mirror is normally fed by SSE
