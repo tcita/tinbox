@@ -810,10 +810,12 @@ async function copyText(it){
 async function delItem(it){
   const msgtxt = it.kind === 'text'
     ? 'Delete this message?'
-    : 'Remove "'+it.name+'" from list? (File on disk will stay)';
+    : (it.source_kind === 'local'
+        ? 'Remove "'+it.name+'" from list? (Original file on your PC is kept)'
+        : 'Delete "'+it.name+'"? Its copy in the Inbox folder will be removed from disk.');
   if(!confirm(msgtxt)) return;
   const res = await fetch('/rm?id='+encodeURIComponent(it.id), {method:'POST'});
-  if(res.ok) toast(it.kind === 'text' ? 'Deleted' : 'Removed');
+  if(res.ok) toast(it.kind === 'text' ? 'Deleted' : 'Deleted from Inbox');
   else toast('Delete failed');
   refresh();
 }
@@ -1445,11 +1447,12 @@ $('plus').onclick = () => {
   $('fileInput').click();
 };
 
-// Register real PC paths as zero-copy local references (from="pc"), like the
-// plus button. Used by the file dialog and by PC drag-and-drop (the webview
-// exposes the dropped file's path via the non-standard File.path). A short
-// dedup window absorbs the drop being delivered both as an HTML5 drop AND as
-// the tauri://drag-drop event, so the file is not registered twice.
+// Send real PC paths to /add-local (the plus button and PC drag-and-drop; the
+// webview exposes the dropped file's path via the non-standard File.path). The
+// server copies each one into the Inbox folder and only then adds its card, so a
+// file appears in the timeline once the copy is done. A short dedup window
+// absorbs the drop being delivered both as an HTML5 drop AND as the
+// tauri://drag-drop event, so the file is not copied twice.
 const recentLocal = new Map();
 async function addLocalPaths(paths){
   if(!paths.length) return;
@@ -1464,7 +1467,7 @@ async function addLocalPaths(paths){
     method:'POST', headers:{'Content-Type':'application/json'},
     body: JSON.stringify({ paths: fresh })
   });
-  if(!r.ok) toast('Registration failed');
+  if(!r.ok) toast('Could not add file(s)');
 }
 // Tauri fires tauri://drag-drop with the real paths in parallel with the HTML5
 // drop. Listening to it covers platforms where the File.path injection is
@@ -1521,9 +1524,9 @@ window.addEventListener('drop', e => {
   dOverlay.classList.remove('active');
   const files = [...e.dataTransfer.files];
   if(!files.length) return;
-  // PC drag-and-drop behaves like the plus button: zero-copy local references
-  // when the webview exposes real paths, so no local copy/upload happens. Only
-  // falls back to uploading when paths are unavailable (e.g. the phone side).
+  // PC drag-and-drop behaves like the plus button: real paths go to /add-local,
+  // which copies them into the Inbox locally (no network upload). Only falls
+  // back to an upload when real paths are unavailable (e.g. the phone side).
   if(isPC){
     const paths = files.map(f => f.path).filter(p => typeof p === 'string' && p);
     if(paths.length === files.length){

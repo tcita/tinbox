@@ -50,8 +50,9 @@ pub fn run() {
             .center()
             // Keep Tauri's drag-drop handler ENABLED: it injects the real
             // `path` onto dropped File objects (that is what lets the frontend
-            // register a zero-copy reference instead of uploading a copy). It
-            // also preventDefaults the drop, so no navigation to the file.
+            // send the path to /add-local, which copies it into Inbox locally
+            // instead of the phone uploading a copy). It also preventDefaults
+            // the drop, so no navigation to the file.
             .build()?;
 
             Ok(())

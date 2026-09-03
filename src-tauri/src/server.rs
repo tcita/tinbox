@@ -481,7 +481,7 @@ fn migrate_legacy_shared() {
                 // shared and inbox are on the same disk, so rename is an
                 // instant move, not a copy.
                 if std::fs::rename(entry.path(), &stored).is_ok() {
-                    catalog::add_remote(&id, &stored, &safe);
+                    catalog::add_remote("phone", &id, &stored, &safe);
                     moved += 1;
                 }
             }
@@ -654,16 +654,115 @@ struct AddLocalPayload {
 }
 
 /// After the PC side's plus button picks real paths via the Tauri dialog, POST
-/// them here to register as local references (zero-copy). Not routed through a
-/// custom command, avoiding the ACL restrictions on external URLs.
-async fn add_local(axum::Json(payload): axum::Json<AddLocalPayload>) -> impl IntoResponse {
-    let paths: Vec<_> = payload.paths.into_iter().map(PathBuf::from).collect();
-    let n = catalog::add_local(paths);
-    if n > 0 {
-        logf(&format!("add-local: registered {} local references", n));
-        let _ = notifier().send(PushEvent::List(catalog::all_items()));
+/// them here. Each chosen file is COPIED into the inbox folder (`{id}__{name}`)
+/// and only then registered as a ready from="pc" entry — a card appears only once
+/// the copy is complete, so there is no intermediate "copying" state to confuse
+/// with a real transfer. Not routed through a custom command, avoiding the ACL
+/// restrictions on external URLs.
+///
+/// Copying reads arbitrary PC-local paths, so this endpoint is PC-only (the same
+/// guard /cancel and /rm use): the phone must not be able to reach it.
+async fn add_local(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Json(payload): axum::Json<AddLocalPayload>,
+) -> impl IntoResponse {
+    if from_by_peer(peer) != "pc" {
+        logw("add-local: rejected from phone (would copy PC-local paths)");
+        return (StatusCode::FORBIDDEN, "phone cannot add PC-local files").into_response();
     }
-    (StatusCode::OK, format!("added: {n}")).into_response()
+    let inbox = catalog::inbox_dir();
+    if let Err(e) = std::fs::create_dir_all(&inbox) {
+        loge(&format!("add-local: inbox unavailable: {e}"));
+        return (StatusCode::INTERNAL_SERVER_ERROR, "inbox unavailable").into_response();
+    }
+    // Canonical inbox path, so a re-drag of a file already inside inbox is skipped.
+    let inbox_canon = std::fs::canonicalize(&inbox).unwrap_or_else(|_| inbox.clone());
+
+    // Expand directories into a flat file list.
+    let mut files: Vec<PathBuf> = Vec::new();
+    for raw in payload.paths {
+        let p = PathBuf::from(raw);
+        if p.is_dir() {
+            catalog::collect_files(&p, &mut files);
+        } else if p.is_file() {
+            files.push(p);
+        } else {
+            logw(&format!("add-local: skipped (not a file/dir): {}", p.display()));
+        }
+    }
+
+    let mut added = 0usize;
+    let mut attempted = 0usize;
+    for src in files {
+        // Re-adding a path that already lives in inbox would copy inbox into
+        // itself; skip it.
+        let Ok(canon) = std::fs::canonicalize(&src) else {
+            logw(&format!("add-local: source missing: {}", src.display()));
+            continue;
+        };
+        if canon.starts_with(&inbox_canon) {
+            logf(&format!("add-local: skip already-in-inbox {}", canon.display()));
+            continue;
+        }
+        attempted += 1;
+        match copy_into_inbox(&canon).await {
+            Ok((id, dest, safe)) => {
+                catalog::add_remote("pc", &id, &dest, &safe);
+                added += 1;
+                // The card appears now that the file is fully in inbox.
+                let _ = notifier().send(PushEvent::List(catalog::all_items()));
+                logf(&format!(
+                    "add-local: copied {} -> {}",
+                    canon.display(),
+                    dest.display()
+                ));
+            }
+            Err(e) => logw(&format!("add-local: copy failed {}: {}", canon.display(), e)),
+        }
+    }
+    if attempted > 0 && added == 0 {
+        return (StatusCode::BAD_REQUEST, "could not add any file").into_response();
+    }
+    logf(&format!("add-local: added {added} file(s) to inbox"));
+    (StatusCode::OK, format!("added: {added}")).into_response()
+}
+
+/// Stream one file into inbox as `{id}__{safe_name}` with async I/O (never
+/// blocks a runtime thread). Returns (id, inbox path, display name) only once the
+/// whole file is on disk; on error the partial destination is removed so no
+/// half-written file lingers.
+async fn copy_into_inbox(src: &Path) -> std::io::Result<(String, PathBuf, String)> {
+    let safe = safe_name(
+        src.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unnamed"),
+    );
+    if safe.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bad file name",
+        ));
+    }
+    let id = catalog::new_id();
+    let dest = catalog::inbox_dir().join(format!("{id}__{safe}"));
+
+    let src_f = tokio::fs::File::open(src).await?;
+    let dst_f = tokio::fs::File::create(&dest).await?;
+    let mut reader = tokio::io::BufReader::with_capacity(512 * 1024, src_f);
+    let mut writer = tokio::io::BufWriter::with_capacity(512 * 1024, dst_f);
+    if let Err(e) = tokio::io::copy_buf(&mut reader, &mut writer).await {
+        drop(writer); // release the handle so remove_file works on Windows
+        let _ = tokio::fs::remove_file(&dest).await;
+        return Err(e);
+    }
+    // Flush to surface disk-full / late write errors before registering ready.
+    if let Err(e) = writer.flush().await {
+        drop(writer);
+        let _ = tokio::fs::remove_file(&dest).await;
+        return Err(e);
+    }
+    drop(writer);
+    Ok((id, dest, safe))
 }
 
 /// For frontend error reporting: write client-side exceptions into the server
@@ -791,8 +890,8 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
     };
     let mut file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
-        // The original file of a local reference may have been moved/deleted ->
-        // friendly message.
+        // The backing file may be missing: a Remote inbox copy was deleted, or a
+        // legacy Local original was moved/deleted -> friendly message.
         Err(_) => {
             logw(&format!("serve: file not on disk {} ({})", name, path));
             return (StatusCode::NOT_FOUND, "file missing").into_response();
@@ -1181,26 +1280,50 @@ async fn remove(
         logw(&format!("remove: rejected delete request from phone id={}", p.id));
         return (StatusCode::FORBIDDEN, "phone cannot delete").into_response();
     }
-    match catalog::remove(&p.id) {
-        // Principle: tinbox never deletes files on disk - removal only removes
-        // the record. Local references leave the original file untouched;
-        // remote files stay in inbox (managed by the user via the inbox entry).
-        Some(entry) => {
-            let label = match &entry.body {
-                catalog::MsgBody::File { name, .. } => {
-                    format!("{name} record removed (file kept)")
-                }
-                catalog::MsgBody::Text { .. } => "text message deleted".to_string(),
-            };
-            logf(&format!("remove: {}", label));
-            // Drop its progress entry so no further `progress` events advertise
-            // a deleted file to whichever side is still downloading it.
-            dl_progress().lock().unwrap().remove(&p.id);
-            let _ = notifier().send(PushEvent::List(catalog::all_items()));
-            (StatusCode::OK, "deleted").into_response()
-        }
-        None => (StatusCode::NOT_FOUND, "not found").into_response(),
+    // Resolve the entry first so a materialized inbox file can be deleted before
+    // the record is dropped.
+    let Some(entry) = catalog::find(&p.id) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+
+    let label = match &entry.body {
+        catalog::MsgBody::File { source, name, .. } => match source {
+            // Every Remote file is a tinbox-owned inbox copy (a phone upload, or a
+            // PC file copied in on add): deleting the record deletes the copy too.
+            catalog::Source::Remote { path } => {
+                let ok = match std::fs::remove_file(path) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        logw(&format!("remove: could not delete inbox file {}: {}", path, e));
+                        false
+                    }
+                };
+                format!(
+                    "{name}: record removed (inbox file {})",
+                    if ok { "deleted" } else { "left on disk (delete failed)" }
+                )
+            }
+            // Legacy zero-copy rows point at an original PC path tinbox does not
+            // own: remove the record only.
+            catalog::Source::Local { path } => format!(
+                "{name}: record removed (original kept: {path})"
+            ),
+        },
+        catalog::MsgBody::Text { .. } => "text message deleted".to_string(),
+    };
+
+    // Deleting an in-flight upload's pending row directly: flag it so the upload
+    // writer tears down on its next chunk and removes its own partial file.
+    if entry.pending {
+        cancelled().lock().unwrap().insert(entry.id.clone());
     }
+    catalog::remove(&entry.id);
+    // Drop its progress entry so no further `progress` events advertise a
+    // deleted file to whichever side is still downloading it.
+    dl_progress().lock().unwrap().remove(&entry.id);
+    logf(&format!("remove: {}", label));
+    let _ = notifier().send(PushEvent::List(catalog::all_items()));
+    (StatusCode::OK, "deleted").into_response()
 }
 
 /// Locate a file in Explorer: on Windows use `explorer /select,`, with a
@@ -1258,8 +1381,9 @@ async fn open_file(Query(p): Query<IdParam>) -> impl IntoResponse {
     }
 }
 
-/// Reveal a file's location on the PC side by id (local = original directory,
-/// remote = inbox). Only File messages.
+/// Reveal a file's location on the PC side by id: Remote rows select the inbox
+/// copy (phone upload or PC add), legacy Local rows the original PC file. Only
+/// File messages.
 async fn reveal(Query(p): Query<IdParam>) -> impl IntoResponse {
     let Some(entry) = catalog::find(&p.id) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();

@@ -1,6 +1,8 @@
 // Catalog index layer: uniformly manages "message entries" (files and text).
-//   File messages: reuse Source (Local = zero-copy reference to a PC-local
-//     file / Remote = pushed from the phone, materialized into inbox).
+//   File messages: reuse Source. Remote = materialized into the inbox folder (a
+//     phone upload, or a PC file the app copied in when it was added). Local is
+//     legacy only: pre-change rows that reference an original PC path by
+//     zero-copy and are never file-deleted.
 //   Text messages: content inlined directly, no source.
 // Each message carries from("pc"/"phone") and ts; the frontend renders them
 // on a timeline with left/right bubbles per sender.
@@ -18,7 +20,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "type")]
 pub enum Source {
+    /// Legacy zero-copy reference to an original PC path (registered before adds
+    /// started copying into inbox). `/rm` removes only the record, never the file.
     Local { path: String },
+    /// A tinbox-owned file materialized in the inbox folder — a phone upload, or
+    /// a PC file copied in when it was added. `/rm` deletes it with the record.
     Remote { path: String },
 }
 
@@ -251,66 +257,15 @@ pub fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-/// Register several PC-local paths as from="pc" file messages (zero-copy).
-/// Returns the number of newly added entries. If a directory is passed in, all
-/// files under it are collected recursively.
-pub fn add_local(paths: Vec<PathBuf>) -> usize {
-    if paths.is_empty() {
-        return 0;
-    }
-    // Expand directories into a flat file list.
-    let mut all = Vec::new();
-    for p in paths {
-        if p.is_dir() {
-            collect_files(&p, &mut all);
-        } else {
-            all.push(p);
-        }
-    }
-    if all.is_empty() {
-        return 0;
-    }
-    let mut v = catalog().lock().unwrap();
-    let mut added = 0;
-    for p in all {
-        let Ok(meta) = std::fs::metadata(&p) else { continue };
-        if !meta.is_file() {
-            continue;
-        }
-        let name = p
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unnamed")
-            .to_string();
-        v.push(Entry {
-            id: new_id(),
-            ts: now_ts(),
-            from: "pc".to_string(),
-            body: MsgBody::File {
-                source: Source::Local {
-                    path: p.to_string_lossy().to_string(),
-                },
-                size: meta.len(),
-                name,
-            },
-            pending: false,
-        });
-        added += 1;
-    }
-    drop(v);
-    if added > 0 {
-        save();
-    }
-    added
-}
-
-/// Register a file already written to inbox as a from="phone" file message.
-pub fn add_remote(id: &str, inbox_path: &Path, display_name: &str) -> Entry {
+/// Register a file already materialized in inbox as a from="<from>" file message:
+/// "pc" for a file the PC added (the app copied it into inbox), "phone" for an
+/// inbound upload. The row is ready immediately (never pending).
+pub fn add_remote(from: &str, id: &str, inbox_path: &Path, display_name: &str) -> Entry {
     let size = std::fs::metadata(inbox_path).map(|m| m.len()).unwrap_or(0);
     let entry = Entry {
         id: id.to_string(),
         ts: now_ts(),
-        from: "phone".to_string(),
+        from: from.to_string(),
         body: MsgBody::File {
             source: Source::Remote {
                 path: inbox_path.to_string_lossy().to_string(),
