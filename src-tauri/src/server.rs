@@ -577,7 +577,7 @@ async fn upload(Query(q): Query<UpQuery>, mut multipart: Multipart) -> impl Into
                         e.sent += n;
                         e.last_ts = now_unix();
                     }
-                    push_progress(&mut *map, &id, now_ms(), false);
+                    push_progress(&mut map, &id, now_ms(), false);
                 }
                 Some(Err(e)) => break Err(format!("read: {e}")),
                 None => {
@@ -599,7 +599,7 @@ async fn upload(Query(q): Query<UpQuery>, mut multipart: Multipart) -> impl Into
                         e.sent = e.total.max(e.sent);
                         e.last_ts = now_unix();
                     }
-                    push_progress(&mut *map, &id, now_ms(), true);
+                    push_progress(&mut map, &id, now_ms(), true);
                 }
                 let _ = notifier().send(PushEvent::List(catalog::all_items()));
                 return (StatusCode::OK, format!("uploaded: {filename}")).into_response();
@@ -670,7 +670,7 @@ async fn client_log(axum::Json(payload): axum::Json<ClientLogPayload>) -> impl I
 async fn repair(State(_app): State<tauri::AppHandle>) -> impl IntoResponse {
     // repair() blocks synchronously waiting for UAC + Block removal (can take
     // 10s+), so run it in spawn_blocking to keep the axum runtime responsive.
-    let ok = tokio::task::spawn_blocking(|| crate::firewall::repair())
+    let ok = tokio::task::spawn_blocking(crate::firewall::repair)
         .await
         .unwrap_or(false);
     logf(if ok { "/repair: repair succeeded" } else { "/repair: not fixed (UAC cancelled or failed)" });
@@ -856,7 +856,7 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
                         }
                         // Push throttled ~1/s per transfer (instant on completion)
                         // so both ends get live progress without polling.
-                        push_progress(&mut *map, &id, now_ms(), false);
+                        push_progress(&mut map, &id, now_ms(), false);
                     }
                     Err(err) => {
                         // The peer closed/cut this Range stream (pause, tab
@@ -1040,7 +1040,7 @@ async fn dl_pause(Query(p): Query<PauseParam>) -> impl IntoResponse {
     }
     // Push immediately (force, not throttled) so the downloading side
     // aborts/relaunches right away instead of waiting for the next progress tick.
-    push_progress(&mut *map, &p.id, now_ms(), true);
+    push_progress(&mut map, &p.id, now_ms(), true);
     logf(&format!(
         "dl-pause {} -> paused={} ({} bytes)",
         p.id,
@@ -1060,7 +1060,7 @@ async fn dl_reset(Query(p): Query<IdParam>) -> impl IntoResponse {
     map.insert(p.id.clone(), DlProg::default());
     // Announce the zeroed counter so the other end clears any stale row right
     // away instead of waiting for the first real chunk to tick.
-    push_progress(&mut *map, &p.id, now_ms(), true);
+    push_progress(&mut map, &p.id, now_ms(), true);
     (StatusCode::OK, "ok").into_response()
 }
 
@@ -1303,14 +1303,14 @@ async fn events(
 fn list_event() -> Event {
     Event::default()
         .event("list")
-        .json_data(&catalog::all_items())
+        .json_data(catalog::all_items())
         .unwrap()
 }
 
 fn fw_event() -> Event {
     Event::default()
         .event("fw")
-        .json_data(&serde_json::json!({ "needRepair": crate::firewall::need_repair() }))
+        .json_data(serde_json::json!({ "needRepair": crate::firewall::need_repair() }))
         .unwrap()
 }
 
@@ -1319,7 +1319,7 @@ fn info_event() -> Event {
     let online = lan_peer_connected();
     Event::default()
         .event("info")
-        .json_data(&serde_json::json!({
+        .json_data(serde_json::json!({
             "mobileConnected": online, "ip": ip, "port": port, "url": url
         }))
         .unwrap()
@@ -1330,15 +1330,15 @@ fn push_event_to_sse(ev: PushEvent) -> Event {
         PushEvent::List(items) => Event::default().event("list").json_data(&items).unwrap(),
         PushEvent::Progress { id, total, sent, paused } => Event::default()
             .event("progress")
-            .json_data(&serde_json::json!({ "id": id, "total": total, "sent": sent, "paused": paused }))
+            .json_data(serde_json::json!({ "id": id, "total": total, "sent": sent, "paused": paused }))
             .unwrap(),
         PushEvent::Fw(need) => Event::default()
             .event("fw")
-            .json_data(&serde_json::json!({ "needRepair": need }))
+            .json_data(serde_json::json!({ "needRepair": need }))
             .unwrap(),
         PushEvent::Info { mobile_connected, url, ip, port } => Event::default()
             .event("info")
-            .json_data(&serde_json::json!({
+            .json_data(serde_json::json!({
                 "mobileConnected": mobile_connected, "url": url, "ip": ip, "port": port
             }))
             .unwrap(),
@@ -1441,7 +1441,7 @@ async fn monitor_loop() {
                         "auto-paused stalled download {} at {}/{} bytes",
                         id, e.sent, e.total
                     ));
-                    push_progress(&mut *map, &id, now_ms(), true);
+                    push_progress(&mut map, &id, now_ms(), true);
                 }
             }
         }
@@ -1664,8 +1664,9 @@ fn virtual_adapter(s: &str) -> bool {
 fn probe_gateways(
     probes: &[(Ipv4Addr, Ipv4Addr)],
 ) -> std::collections::HashMap<(Ipv4Addr, Ipv4Addr), bool> {
-    static CACHE: OnceLock<Mutex<(u64, std::collections::HashMap<(Ipv4Addr, Ipv4Addr), bool>)>> =
-        OnceLock::new();
+    // (last probe unix, (src addr, gateway)) -> reachable, invalidated after 60s
+    type ProbeCache = (u64, std::collections::HashMap<(Ipv4Addr, Ipv4Addr), bool>);
+    static CACHE: OnceLock<Mutex<ProbeCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new((0, Default::default())));
     let mut g = cache.lock().unwrap();
     let now = now_unix();
