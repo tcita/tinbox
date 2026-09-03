@@ -49,6 +49,11 @@ pub(crate) enum PushEvent {
     /// A LAN device connected/disconnected, or the server address changed (the
     /// PC badge + gate).
     Info { mobile_connected: bool, url: String, ip: String, port: u16 },
+    /// The transfer map lost an entry without a terminal `progress` tick (a
+    /// stream was cut, a download was cancelled, or a paused/dead entry was
+    /// pruned): ask every client to re-fetch /dl-status and reconcile its mirror,
+    /// so no corner freezes on a stale percent or a pause/cancel affordance.
+    Resync,
 }
 
 /// Live download progress keyed by message id, aggregated across the parallel
@@ -67,7 +72,14 @@ struct DlProg {
     /// Last time a progress event was pushed for this transfer, to throttle SSE
     /// emissions to ~1/s per transfer (the frontend used to poll /dl-status).
     last_emit_ms: u64,
+    /// Owner token of the stream currently serving this transfer (see
+    /// StreamCutGuard): bumped on every /dl registration so a dropped older
+    /// stream cannot reap an entry a newer resume has just re-registered.
+    owner: u64,
 }
+
+/// Monotonic source of the owner tokens above.
+static DL_OWNER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 static DL_PROGRESS: OnceLock<Mutex<std::collections::HashMap<String, DlProg>>> = OnceLock::new();
 
@@ -730,6 +742,35 @@ fn mime_for(name: &str) -> String {
     m.to_string()
 }
 
+/// Drop-guard on a served download body. When hyper drops the response body
+/// before the file was fully sent, the downloading peer is gone (browser cancel,
+/// killed tab, WiFi drop) — axum surfaces a disconnect as the body being dropped,
+/// not as an error inside the stream, so a per-chunk error arm never sees it.
+/// This guard removes the shared counter and asks every client to reconcile its
+/// mirror, so a dead transfer cannot leave a corner stuck on a stale percent or
+/// a pause/cancel affordance. It only reaps its OWN stream's entry (checked via
+/// the owner token), so a Range resume that has already re-registered the id is
+/// never clobbered.
+struct StreamCutGuard {
+    id: String,
+    owner: u64,
+}
+impl Drop for StreamCutGuard {
+    fn drop(&mut self) {
+        let mut map = dl_progress().lock().unwrap();
+        let owned_incomplete = match map.get(&self.id) {
+            Some(e) => e.owner == self.owner && e.sent < e.total,
+            None => false,
+        };
+        if owned_incomplete {
+            map.remove(&self.id);
+            drop(map);
+            logf(&format!("download aborted by peer {}: counter dropped", self.id));
+            let _ = notifier().send(PushEvent::Resync);
+        }
+    }
+}
+
 /// Shared file dispatch: inline=true previews in the browser (/view), false
 /// forces a download (/dl). Looks up the message by id; only File messages can
 /// be dispatched, Text returns 400.
@@ -795,6 +836,7 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
     // counted and pushed as a `progress` event, so both ends show the same
     // bar/speed. Parallel Range requests accumulate into the same entry.
     let prog_id = if inline { None } else { Some(p.id.clone()) };
+    let mut owner = 0u64;
     if let Some(id) = &prog_id {
         // Any /dl request is a fresh transfer (or an OS resume of one): clear an
         // earlier stop so it can run — a cancelled download must not silently
@@ -811,11 +853,20 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
             // new stream also clears a stale auto-pause.
             let fresh = !partial || e.total == 0;
             if fresh {
-                e.sent = 0;
+                // A full-body request re-downloads from byte 0. A Range resume of a
+                // file the peer already partially holds (whose earlier entry was
+                // dropped on a stream cut) seeds the counter with the bytes it has,
+                // so the resumed transfer reads true progress instead of restarting
+                // at 0 and never reaching 100%.
+                e.sent = if partial { start } else { 0 };
             }
             e.paused = false;
             e.total = len;
             e.last_ts = now_unix();
+            // This stream now owns the entry: bump the token so an older dropped
+            // stream's guard cannot reap it (see StreamCutGuard).
+            e.owner = DL_OWNER_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+            owner = e.owner;
             fresh
         };
         if fresh {
@@ -833,7 +884,13 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
     > = match &prog_id {
         Some(id) => {
             let id = id.clone();
+            // Held for the stream's whole life: on drop (peer gone mid-transfer)
+            // it removes the counter and tells clients to reconcile.
+            let cut = StreamCutGuard { id: id.clone(), owner };
             Box::pin(base.map(move |chunk| {
+                // Referencing `cut` keeps it captured, so it is dropped only when
+                // the whole stream (and thus this closure) is dropped by hyper.
+                let _alive = &cut;
                 // The PC asked to stop this download (/cancel): end the stream so
                 // the receiver's in-flight download is cut (its OS then reports it
                 // interrupted) instead of being allowed to drain.
@@ -859,9 +916,10 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
                         push_progress(&mut map, &id, now_ms(), false);
                     }
                     Err(err) => {
-                        // The peer closed/cut this Range stream (pause, tab
-                        // killed, WiFi drop): the entry stays partial and the
-                        // monitor auto-pauses it if nothing resumes it.
+                        // The peer closed/cut this stream (pause, tab killed, WiFi
+                        // drop) or a /cancel interrupted it. hyper surfaces a real
+                        // disconnect as the response body being dropped, not as an
+                        // error here, so cleanup happens in StreamCutGuard::drop.
                         logw(&format!("download stream cut {id}: {err}"));
                     }
                 }
@@ -1099,6 +1157,10 @@ async fn cancel(
         }
         let _ = notifier().send(PushEvent::List(catalog::all_items()));
     }
+    // A cancelled download pushes no terminal progress tick, so broadcast a
+    // resync: every client reconciles its mirror corner away instead of leaving
+    // it frozen on a pause/cancel affordance.
+    let _ = notifier().send(PushEvent::Resync);
     logf(&format!(
         "cancel {}: {} stopped",
         p.id,
@@ -1342,6 +1404,7 @@ fn push_event_to_sse(ev: PushEvent) -> Event {
                 "mobileConnected": mobile_connected, "url": url, "ip": ip, "port": port
             }))
             .unwrap(),
+        PushEvent::Resync => Event::default().event("resync").data("1"),
     }
 }
 
@@ -1399,12 +1462,22 @@ async fn monitor_loop() {
             prev_repair = Some(repair);
             let _ = notifier().send(PushEvent::Fw(repair));
         }
-        // Prune completed transfers whose entries went stale (was pruned in
-        // /dl-status before; the frontend no longer polls it).
+        // Prune transfers whose entries went stale: finished ones after 30s, and
+        // auto-paused (abandoned) ones nobody resumed within a minute. Broadcast
+        // `resync` when anything drops so clients reconcile their mirror corners
+        // back to idle (a silent prune would otherwise leave a paused ring stuck).
         let now = now_unix();
         {
             let mut map = dl_progress().lock().unwrap();
-            map.retain(|_, e| !(e.sent >= e.total && now.saturating_sub(e.last_ts) > 30));
+            let before = map.len();
+            map.retain(|_, e| {
+                let stale = now.saturating_sub(e.last_ts);
+                !(e.sent >= e.total && stale > 30)
+                    && !(e.paused && e.sent < e.total && stale > 60)
+            });
+            if map.len() < before {
+                let _ = notifier().send(PushEvent::Resync);
+            }
         }
         // Auto-pause a download whose bytes have stopped moving: the peer died
         // or its connection went silent, so the sender should show "Paused"

@@ -1317,13 +1317,46 @@ function syncProgress(list){
     paintCorner(d.id);
   }
 }
-// One-shot recovery fetch: after an SSE push was missed (the server sends
-// `resync` when a subscriber lags) and once on connect, to re-sync progress.
+// Fetch the server's live-transfer snapshot, apply it, then reconcile the local
+// mirror with it: refresh counters for ids the server is still serving, and drop
+// mirror state for ids it no longer tracks. The server pushes nothing on a
+// stream cut, a PC /cancel, or a dead-transfer prune — it broadcasts `resync`
+// instead — so this reconcile is what lets a corner return to idle instead of
+// freezing on its last value (0%, or a pause/cancel affordance) forever.
 async function resyncProgress(){
-  try {
-    syncProgress(await (await fetch('/dl-status')).json());
-  } catch {}
+  let snap;
+  try { snap = await (await fetch('/dl-status')).json(); } catch { return; }
+  snap = snap || [];
+  syncProgress(snap);
+  reconcileMirrors(snap);
+  repaintTransfers();
 }
+function reconcileMirrors(snap){
+  const known = new Set(snap.map(d => d.id));
+  const now = Date.now();
+  for(const id of Object.keys(dlInFlight))   if(!known.has(id)) delete dlInFlight[id];
+  for(const id of Object.keys(serverPaused)) if(!known.has(id)) delete serverPaused[id];
+  for(const id of Object.keys(progCache))    if(!known.has(id) && !doneIds[id]) delete progCache[id];
+  // A phone tap that just landed may not have registered server-side yet; keep
+  // its corner live until the window passes rather than dropping it mid-start.
+  for(const id of Object.keys(nativeDl)) if(!known.has(id) && now - nativeDl[id] > RING_LIVE_MS) delete nativeDl[id];
+}
+
+// Phone-only self-heal for the corner ring. The mirror is normally fed by SSE
+// `progress` pushes, but a phone whose browser throttles/freezes the EventSource
+// while it runs a native download stops receiving pushes, so the ring would sit
+// at its last value (often 0%) forever. While the phone holds any live transfer
+// state, re-pull /dl-status every 2s so the ring tracks the server's real counter
+// and reconciles away transfers the server already dropped. The PC never does
+// this: its SSE rides loopback and is reliable (it still reconciles on every
+// `resync` the server sends, and on (re)connect).
+setInterval(() => {
+  if(isPC) return;
+  if(!Object.keys(dlInFlight).length && !Object.keys(nativeDl).length
+     && !Object.keys(serverPaused).length
+     && !Object.values(progCache).some(p => p.sent < p.total)) return;
+  resyncProgress();
+}, 2000);
 
 function sendText(){
   const t = $('txt');
