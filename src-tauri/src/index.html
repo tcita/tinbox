@@ -1297,7 +1297,6 @@ function nativeDownload(it){
   a.href = '/dl?id='+encodeURIComponent(it.id);
   a.download = it.name;
   document.body.appendChild(a); a.click(); a.remove();
-  toast('Downloading…');
   paintCorner(it.id);   // corner opens at 0% now; the first progress tick fills it
 }
 
