@@ -62,10 +62,13 @@ pub(crate) enum PushEvent {
     ///   - StreamCutGuard::drop: a stream was cut/cancelled and its live
     ///     entry was reaped,
     ///   - monitor_loop: stale entries were pruned (finished, or paused/
-    ///     abandoned past the prune window).
-    /// Clients additionally reconcile on (re)connect and on visibilitychange;
-    /// the phone also polls /dl-status at 1s while it holds transfer state
-    /// (its EventSource can be frozen while a native download runs).
+    ///     abandoned past the prune window),
+    ///   - cancel(): a transfer was stopped by the PC — it pushes no terminal
+    ///     progress tick, so clients must reconcile their mirrors away.
+    /// Clients additionally reconcile on (re)connect and on visibilitychange
+    /// (each pass pulls /list and /dl-status once). The phone keeps no
+    /// /dl-status poll: its only transfer mirror is its own upload (page-owned,
+    /// see the corner block), so the connect/resync passes cover it.
     Resync,
 }
 
@@ -262,8 +265,8 @@ fn now_mono() -> u64 {
 ///   reconcile     PushEvent::Resync — the one catch-up event for "you may
 ///                 have missed pushes"; its full trigger list lives on that
 ///                 variant's doc. Clients also reconcile on (re)connect and
-///                 on visibilitychange, and the phone polls /dl-status at 1s
-///                 while it holds transfer state.
+///                 on visibilitychange, each pass pulling /list and
+///                 /dl-status once; there are no polling timers.
 ///
 /// Desk-range profile: both devices are in hand and sessions are short, so
 /// the numbers below are tight. One floor to respect: the presence window
@@ -332,6 +335,28 @@ pub(crate) fn transfer_active_recently(secs: u64) -> bool {
                 && e.last_ts != 0  // 0 = never touched (defensive; creators always touch)
                 && now.saturating_sub(e.last_ts) < secs
         })
+}
+
+/// One-line snapshot of the three presence evidence sources, for the monitor's
+/// transition log: how many /events streams are open, how long ago the last
+/// LAN request arrived, how long ago an in-flight transfer last wrote a byte.
+/// "never" marks a still-0 stamp (see now_mono's sentinel). Mirrors what
+/// lan_peer_connected() actually reads — completed transfers are not evidence,
+/// so xfer only tracks entries with sent < total.
+fn presence_evidence() -> String {
+    let now = now_mono();
+    let streams = LAN_EVENTS_OPEN.load(Ordering::Relaxed);
+    let req = match LAST_PHONE_ACT.load(Ordering::Relaxed) {
+        0 => "never".to_string(),
+        t => format!("{}s ago", now.saturating_sub(t)),
+    };
+    let xfer = dl_lock()
+        .values()
+        .filter(|e| e.sent < e.total && e.last_ts != 0)
+        .map(|e| e.last_ts)
+        .max()
+        .map_or("never".to_string(), |t| format!("{}s ago", now.saturating_sub(t)));
+    format!("streams={streams} req={req} xfer={xfer}")
 }
 
 /// Log every incoming HTTP request and its source IP (key diagnostic: if a
@@ -479,7 +504,6 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 .route("/dl", get(download))
                 .route("/dl-status", get(dl_status))
                 .route("/dl-pause", post(dl_pause))
-                .route("/dl-reset", post(dl_reset))
                 .route("/cancel", post(cancel))
                 .route("/view", get(view))
                 .route("/open", post(open_file))
@@ -1321,20 +1345,6 @@ async fn dl_pause(Query(p): Query<PauseParam>) -> impl IntoResponse {
     (StatusCode::OK, "ok").into_response()
 }
 
-/// A fresh download restarts the shared counter: without this, re-downloading a
-/// file whose previous entry still holds sent>=total (kept alive ~30s after it
-/// finished) makes the pushed progress immediately look complete and the
-/// progress row vanishes. The phone POSTs this when it starts from byte 0.
-async fn dl_reset(Query(p): Query<IdParam>) -> impl IntoResponse {
-    logf(&format!("dl-reset {}", p.id));
-    let mut map = dl_lock();
-    map.insert(p.id.clone(), DlProg::default());
-    // Announce the zeroed counter so the other end clears any stale row right
-    // away instead of waiting for the first real chunk to tick.
-    push_progress(&mut map, &p.id, now_ms(), true);
-    (StatusCode::OK, "ok").into_response()
-}
-
 /// Stop a transfer by id. Only the PC can do this — it is the role that hosts a
 /// download the phone is pulling (revoke it) and the one receiving a phone
 /// upload (refuse it). The id is flagged so the in-flight upload writer /
@@ -1530,11 +1540,20 @@ async fn open_dir() -> impl IntoResponse {
 
 /// RAII guard that decrements LAN_EVENTS_OPEN when its /events stream ends. It
 /// rides inside GuardedStream, which axum drops when the client disconnects, so
-/// the counter tracks exactly the currently-open LAN streams.
-struct PresenceGuard;
+/// the counter tracks exactly the currently-open LAN streams. Logs the close so
+/// a dead page's stream (tab swiped away) is distinguishable in tinbox.log from
+/// the other two presence evidence sources still holding the bit.
+struct PresenceGuard {
+    /// Source of the stream, for the open/close diagnostic lines.
+    ip: String,
+}
 impl Drop for PresenceGuard {
     fn drop(&mut self) {
-        LAN_EVENTS_OPEN.fetch_sub(1, Ordering::Relaxed);
+        let n = LAN_EVENTS_OPEN.fetch_sub(1, Ordering::Relaxed) - 1;
+        logf(&format!(
+            "events stream closed from {} ({n} open)",
+            self.ip
+        ));
     }
 }
 
@@ -1572,8 +1591,12 @@ async fn events(
     // transition report, and arrival within one 1s tick is plenty.
     let is_lan = !peer.ip().is_loopback();
     let guard = if is_lan {
-        LAN_EVENTS_OPEN.fetch_add(1, Ordering::Relaxed);
-        Some(PresenceGuard)
+        let n = LAN_EVENTS_OPEN.fetch_add(1, Ordering::Relaxed) + 1;
+        logf(&format!(
+            "events stream open from {} ({n} open)",
+            peer.ip()
+        ));
+        Some(PresenceGuard { ip: peer.ip().to_string() })
     } else {
         None
     };
@@ -1691,11 +1714,12 @@ async fn monitor_loop() {
             prev_online = Some(online);
             if was_online != online {
                 let (ip, port, url) = current_url();
+                let evidence = presence_evidence();
                 if online {
-                    logf("device present: LAN device reachable");
+                    logf(&format!("device present: LAN device reachable ({evidence})"));
                     let _ = notifier().send(PushEvent::Info { mobile_connected: true, url, ip, port });
                 } else {
-                    logf("device disconnected: no LAN device present");
+                    logf(&format!("device disconnected: no LAN device present ({evidence})"));
                     let _ = notifier().send(PushEvent::Info { mobile_connected: false, url, ip, port });
                 }
             }

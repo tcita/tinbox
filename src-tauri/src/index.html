@@ -1501,8 +1501,12 @@ function applyInfo(d){
 let es;
 // Last time ANY SSE event arrived, heartbeats included. EventSource has no
 // read timeout, so a server that dies without a FIN (PC asleep, hard crash)
-// never fires `error`; the watchdog below uses heartbeat silence to force a
-// fresh connection instead of trusting a half-open socket forever.
+// never fires `error`; the watchdog below uses event silence to force a fresh
+// connection instead of trusting a half-open socket forever. Named events
+// count too (kept true in every listener below): the server suppresses
+// heartbeats while named events flow faster than 1/s (axum resets the
+// keep-alive timer on every event), so counting heartbeats alone would read a
+// busy, healthy stream as dead.
 let lastSeen = 0;
 // True while the channel is visibly failing (EventSource retrying on its own
 // after an `error`); the watchdog then stands down — a retry loop is already
@@ -1515,14 +1519,14 @@ function connect(){
   // The server heartbeats as unnamed `message` events (see /events keep_alive);
   // this is the only hook that sees them.
   es.onmessage = () => { lastSeen = Date.now(); };
-  es.addEventListener('list', e => { applyList(JSON.parse(e.data)); });
-  es.addEventListener('progress', e => { syncProgress([JSON.parse(e.data)]); });
+  es.addEventListener('list', e => { lastSeen = Date.now(); applyList(JSON.parse(e.data)); });
+  es.addEventListener('progress', e => { lastSeen = Date.now(); syncProgress([JSON.parse(e.data)]); });
   // A `resync` means this client fell behind and may have dropped pushes (see
   // PushEvent::Resync for the full trigger list). Re-fetch BOTH the file list
   // and the transfer mirrors so nothing stays stale.
-  es.addEventListener('resync', () => { reconcile(); });
-  es.addEventListener('fw', e => { applyFw(JSON.parse(e.data).needRepair); });
-  es.addEventListener('info', e => { applyInfo(JSON.parse(e.data)); });
+  es.addEventListener('resync', () => { lastSeen = Date.now(); reconcile(); });
+  es.addEventListener('fw', e => { lastSeen = Date.now(); applyFw(JSON.parse(e.data).needRepair); });
+  es.addEventListener('info', e => { lastSeen = Date.now(); applyInfo(JSON.parse(e.data)); });
 }
 connect();
 
@@ -1534,9 +1538,11 @@ function reconcile(){
   resyncProgress();
 }
 
-// Watchdog: the server heartbeats every 1s, so >3s of total silence with the
-// channel NOT already failing means the socket is half-open — EventSource will
-// never notice on its own. Force a fresh connection; its `open` replays state.
+// Watchdog: the server heartbeats every 1s when the stream is idle, and any
+// named event also proves the link alive (see lastSeen above), so >3s of total
+// silence with the channel NOT already failing means the socket is half-open —
+// EventSource will never notice on its own. Force a fresh connection; its
+// `open` replays state.
 setInterval(() => {
   if(superseded) return;
   if(!esDown && lastSeen && Date.now() - lastSeen > 3000){

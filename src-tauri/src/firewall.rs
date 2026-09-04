@@ -326,7 +326,9 @@ pub fn need_repair() -> bool {
         if !PENDING_REPAIR.load(Ordering::SeqCst) {
             return false;
         }
-        // Throttle: the frontend polls every 2s; one check per 4s is plenty.
+        // Throttle: the monitor loop calls this every 1s (the result is pushed
+        // to clients as an SSE `fw` event), so one powershell check per 4s is
+        // plenty; interim callers just re-read the pending flag.
         let now = now_unix();
         let last = LAST_RULE_CHECK.load(Ordering::SeqCst);
         if now.saturating_sub(last) < 4 {
