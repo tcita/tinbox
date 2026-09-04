@@ -41,9 +41,16 @@ static LOGO: &[u8] = include_bytes!("logo.svg");
 pub(crate) enum PushEvent {
     /// The full message list, on any add/delete/reference change.
     List(Vec<catalog::MsgItem>),
-    /// Download progress for one transfer (throttled to ~1/s server-side; the
-    /// final `sent >= total` tick fires immediately).
-    Progress { id: String, total: u64, sent: u64, paused: bool },
+    /// Upload progress for one pending row (throttled to ~1/s server-side; the
+    /// final `sent >= total` tick fires immediately). Receiver-side only: the
+    /// PC is the receiver of pushes and draws the ring from these; download
+    /// progress is never pushed — the puller's browser owns that UI, and the
+    /// server's only download output is the terminal Delivered event.
+    Progress { id: String, total: u64, sent: u64 },
+    /// A download just completed (every requested byte left the socket). The
+    /// PC stamps its '已下载到手机' delivery marker from this; the phone
+    /// ignores it (its browser owns the download UI).
+    Delivered { id: String },
     /// Firewall repair flag changed.
     Fw(bool),
     /// A LAN device connected/disconnected, or the server address changed.
@@ -55,53 +62,44 @@ pub(crate) enum PushEvent {
     Info { mobile_connected: bool, url: String, ip: String, port: u16 },
     /// [LIVENESS/reconcile] The one catch-up event: "you may have missed
     /// pushes — re-fetch /dl-status and reconcile your mirror, so no corner
-    /// freezes on a stale percent or a pause/cancel affordance". The complete
-    /// server trigger list:
+    /// freezes on a stale percent". The complete server trigger list:
     ///   - events(): a subscriber lagged the broadcast channel and dropped
     ///     events (surfaced as BroadcastStream lag),
-    ///   - StreamCutGuard::drop: a stream was cut/cancelled and its live
-    ///     entry was reaped,
-    ///   - monitor_loop: stale entries were pruned (finished, or paused/
-    ///     abandoned past the prune window),
-    ///   - cancel(): a transfer was stopped by the PC — it pushes no terminal
+    ///   - monitor_loop: stale entries were pruned (finished past 15s, or
+    ///     silent past 30s),
+    ///   - cancel(): a push was refused by the PC — it pushes no terminal
     ///     progress tick, so clients must reconcile their mirrors away.
     /// Clients additionally reconcile on (re)connect and on visibilitychange
     /// (each pass pulls /list and /dl-status once). The phone keeps no
-    /// /dl-status poll: its only transfer mirror is its own upload (page-owned,
-    /// see the corner block), so the connect/resync passes cover it.
+    /// /dl-status poll and no transfer mirror at all (rings are the
+    /// receiver's — see the corner block), so the connect/resync passes
+    /// cover it.
     Resync,
 }
 
-/// Live download progress keyed by message id, aggregated across the parallel
-/// Range requests of one transfer. Both the PC and the phone render a shared
-/// progress bar + speed on the timeline from pushed `progress` events (which
-/// also covers browser-native downloads the client cannot measure itself).
+/// Live transfer counters. Two key spaces share the map:
+///   - uploads are keyed by their message id (the pending row IS the transfer;
+///     the PC — the receiver of the push — draws its ring from these),
+///   - downloads are keyed by a unique per-request transfer id ("msg#n"), so
+///     two concurrent pulls of the same file are two independent counters and
+///     dropping one can never disturb the other. No UI consumes download
+///     entries: they feed the outcome log and presence only, and are pruned
+///     by the monitor's time windows.
 #[derive(Clone, Default)]
 struct DlProg {
     total: u64,
     sent: u64,
-    /// Monotonic seconds-since-start of the last byte written / registration /
-    /// pause flip (see touch_entry). Compared against now_mono() by the
-    /// monitor's stall scan and prune, and by presence.
+    /// Monotonic seconds-since-start of the last byte written / registration
+    /// (see touch_entry). Compared against now_mono() by the monitor's prune,
+    /// and by presence (transfer_active_recently).
     last_ts: u64,
-    /// Stall state, owned by the monitor's scan (server-side only: the peer
-    /// died or stopped reading). Set on a 3s byte-silence; cleared by that
-    /// same transfer's stream the moment bytes resume flowing (e.g. the phone
-    /// confirmed the browser's download prompt), and made moot by the
-    /// stream's death, which reaps the entry outright. Rides every progress
-    /// push.
-    paused: bool,
     /// Last time a progress event was pushed for this transfer, to throttle SSE
     /// emissions to ~1/s per transfer (the frontend used to poll /dl-status).
     last_emit_ms: u64,
-    /// Owner token of the stream currently serving this transfer (see
-    /// StreamCutGuard): bumped on every /dl registration so a dropped older
-    /// stream cannot reap an entry a newer resume has just re-registered.
-    owner: u64,
 }
 
-/// Monotonic source of the owner tokens above.
-static DL_OWNER_SEQ: AtomicU64 = AtomicU64::new(0);
+/// Monotonic source of per-request download transfer ids ("msg#n").
+static DL_XFER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 static DL_PROGRESS: OnceLock<Mutex<std::collections::HashMap<String, DlProg>>> = OnceLock::new();
 
@@ -110,17 +108,17 @@ fn dl_progress() -> &'static Mutex<std::collections::HashMap<String, DlProg>> {
 }
 
 /// [LIVENESS/death] Mark a transfer as alive. The single writer of
-/// DlProg::last_ts: registration, every chunk (either direction), pause flips
-/// and the monitor's auto-pause all go through here. Read by the monitor's
-/// stall scan and prune, and by presence (transfer_active_recently).
+/// DlProg::last_ts: registration, every chunk (either direction) and the
+/// upload-silence timeout all go through here. Read by the monitor's prune,
+/// and by presence (transfer_active_recently).
 fn touch_entry(e: &mut DlProg) {
     e.last_ts = now_mono();
 }
 
-/// Ids whose transfer the PC asked to stop (/cancel). The upload writer and the
-/// download stream poll this on every chunk and tear down when they see their
-/// id. A fresh /dl request for the same id clears it, so stopping one download
-/// never silently kills a later one of the same file.
+/// Ids of uploads the PC (receiver) refused via /cancel. The upload writer
+/// polls this on every chunk and tears down when it sees its id, dropping the
+/// pending row and the partial file. Only uploads can be refused: pulls are
+/// the puller's business — their only cancel is the receiver's own browser UI.
 static CANCELLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 fn cancelled() -> &'static Mutex<HashSet<String>> {
     CANCELLED.get_or_init(|| Mutex::new(HashSet::new()))
@@ -168,7 +166,6 @@ fn push_progress(
             id: id.to_string(),
             total: e.total,
             sent: e.sent,
-            paused: e.paused,
         });
     }
 }
@@ -262,14 +259,22 @@ fn now_mono() -> u64 {
 ///                 a GLOBAL aggregate, not per-device, so with several phones
 ///                 one active device covers the others. Fine because nothing
 ///                 destructive or user-facing depends on the bit.
-///   death         a transfer ends only through its stream: cut ->
-///                 StreamCutGuard (the only reaper of live entries), silence
-///                 -> monitor auto-pause scan.
+///   death         a transfer ends only through its own stream: an upload dies
+///                 via the writer's per-chunk silence timeout (or a refusal
+///                 flag), a pull dies when hyper drops the response body —
+///                 StreamCutGuard reaps its counter and writes the outcome to
+///                 the log; a hanging entry is reaped by the monitor's prune.
 ///   reconcile     PushEvent::Resync — the one catch-up event for "you may
 ///                 have missed pushes"; its full trigger list lives on that
 ///                 variant's doc. Clients also reconcile on (re)connect and
 ///                 on visibilitychange, each pass pulling /list and
 ///                 /dl-status once; there are no polling timers.
+///
+/// Ownership follows the receiver: rings and cancel live on the device that
+/// receives a transfer (the PC for pushes — its refuse is /cancel; the phone
+/// for pulls — the browser's own download UI), and the sender gets only an
+/// event log. No cross-device transfer state is mirrored anywhere, so there
+/// is nothing to sync.
 ///
 /// Desk-range profile: both devices are in hand and sessions are short, so
 /// the numbers below are tight. One floor to respect: the presence window
@@ -277,14 +282,15 @@ fn now_mono() -> u64 {
 /// replayed event in events()) or a stream blip flaps the presence bit.
 const SSE_HEARTBEAT_SECS: u64 = 1;
 
-/// [LIVENESS/death] Seconds a served download may go without a byte written
-/// before the monitor auto-pauses it: the peer died or its connection went
-/// silent (a killed browser, a half-open TCP, a download prompt held open).
-/// Without this the sender would show a stuck "Transferring…" forever;
-/// pausing makes the row read "Paused", and the flag re-arms itself the
-/// moment bytes resume flowing. Floor: the longest legitimate write gap of
-/// a healthy LAN transfer (milliseconds), with margin.
-const STALL_AUTO_PAUSE_SECS: u64 = 3;
+/// [LIVENESS/death] Seconds an upload body may go silent before the upload
+/// handler aborts it: the peer died or its connection went silent (a killed
+/// phone, a half-open TCP), and hyper has no body read timeout, so the
+/// actively-awaited read needs this wrapper. Without it the pending row would
+/// hang forever. Floor: the longest legitimate chunk gap of a healthy LAN
+/// push (milliseconds), with margin. The download side needs no mirror of
+/// this: a stalled pull's socket write simply stops draining, and the
+/// monitor's prune reaps its entry after the idle window.
+const UPLOAD_SILENCE_SECS: u64 = 3;
 
 /// [LIVENESS/presence] Seconds of LAN silence (no request at all) before a
 /// device that holds no /events stream is treated as gone. A download or page
@@ -699,14 +705,14 @@ async fn upload(Query(q): Query<UpQuery>, mut multipart: Multipart) -> impl Into
             }
             // [LIVENESS/death] A peer that dies without a FIN (WiFi drop, phone
             // crash) leaves this await pending forever — hyper has no body read
-            // timeout. Wrap each chunk in a silence timeout so the upload tears
-            // down exactly like the download side's stall auto-pause; the Err
-            // arm below then drops the pending row + partial file. This works
-            // here because the handler actively awaits the body — unlike the
-            // download body stream, which backpressure stops polling, so it
-            // needs the monitor's scan instead.
+            // timeout. Wrap each chunk in a silence timeout so a dead push
+            // tears down on its own; the Err arm below then drops the pending
+            // row + partial file. This works here because the handler
+            // actively awaits the body — unlike the download body stream,
+            // which backpressure stops polling, so its cleanup rides the
+            // monitor's prune instead.
             match tokio::time::timeout(
-                Duration::from_secs(STALL_AUTO_PAUSE_SECS),
+                Duration::from_secs(UPLOAD_SILENCE_SECS),
                 field.next(),
             )
             .await
@@ -980,36 +986,34 @@ fn mime_for(name: &str) -> String {
     m.to_string()
 }
 
-/// [LIVENESS/death] Drop-guard on a served download body, and the only reaper
-/// of live transfer entries. When hyper drops the response body before the
-/// file was fully sent, the downloading peer is gone (browser cancel, killed
-/// tab, WiFi drop, or a declined auto-receive prompt): axum surfaces a
-/// disconnect as the body being dropped, not as an error inside the stream,
-/// so a per-chunk error arm never sees it. This guard removes the shared
-/// counter and asks every client to reconcile its mirror, so a dead transfer
-/// cannot leave a corner stuck on a stale percent or a pause/cancel
-/// affordance. It only reaps its OWN stream's entry, checked via the owner
-/// token so a re-registration (a Range resume, or simply a second Download
-/// tap) that has already claimed the id is never clobbered. Stalled-paused
-/// entries are reaped too: paused belongs to the stall-watchdog and a dead
-/// stream contradicts it — with no intentional pause flow left, there is
-/// nothing to preserve past the stream's death.
+/// [LIVENESS/death] Drop-guard on a served download body. When hyper drops the
+/// response body before the file was fully sent, the receiving peer is gone
+/// (a declined or cancelled browser download, a killed tab, a WiFi drop): axum
+/// surfaces a disconnect as the body being dropped, not as an error inside
+/// the stream, so a per-chunk error arm never sees it. The guard reaps THIS
+/// transfer's counter — its own per-request id, so a sibling pull of the same
+/// file is never touched — and writes the outcome into the log, which is the
+/// sender side's only record of a pull. No broadcast: no UI mirrors a pull.
 struct StreamCutGuard {
-    id: String,
-    owner: u64,
+    tid: String,
+    name: String,
 }
 impl Drop for StreamCutGuard {
     fn drop(&mut self) {
         let mut map = dl_lock();
-        let owned_incomplete = match map.get(&self.id) {
-            Some(e) => e.owner == self.owner && e.sent < e.total,
+        let incomplete = match map.get(&self.tid) {
+            Some(e) => e.sent < e.total,
             None => false,
         };
-        if owned_incomplete {
-            map.remove(&self.id);
+        if incomplete {
+            let sent = map.get(&self.tid).map(|e| e.sent).unwrap_or(0);
+            let total = map.get(&self.tid).map(|e| e.total).unwrap_or(0);
+            map.remove(&self.tid);
             drop(map);
-            logf(&format!("download aborted by peer {}: counter dropped", self.id));
-            let _ = notifier().send(PushEvent::Resync);
+            logf(&format!(
+                "download closed by receiver {} ({}): {}/{} bytes",
+                self.tid, self.name, sent, total
+            ));
         }
     }
 }
@@ -1082,46 +1086,32 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
         }
     }
     // Progress tracking: real downloads (not inline previews) register a
-    // shared counter per message id, and each chunk written to the socket is
-    // counted and pushed as a `progress` event, so both ends show the same
-    // bar/speed. Parallel Range requests accumulate into the same entry.
-    let prog_id = if inline { None } else { Some(p.id.clone()) };
-    let mut owner = 0u64;
+    // per-request transfer counter — a fresh unique id per /dl, so two
+    // concurrent pulls of the same file are two independent entries and
+    // dropping one can never disturb the other. No progress is pushed: the
+    // puller's browser owns that UI, and the server's only UI output for a
+    // pull is the terminal Delivered event on completion.
+    let prog_id = if inline {
+        None
+    } else {
+        Some(format!(
+            "{}#{}",
+            p.id,
+            DL_XFER_SEQ.fetch_add(1, Ordering::Relaxed) + 1
+        ))
+    };
     if let Some(id) = &prog_id {
-        // Any /dl request is a fresh transfer (or an OS resume of one): clear an
-        // earlier stop so it can run — a cancelled download must not silently
-        // kill the next attempt at the same file.
-        cancel_lock().remove(id);
         let mut map = dl_lock();
-        let fresh = {
+        {
             let e = map.entry(id.clone()).or_default();
-            // A full-body (no-Range) request means "fetch the whole file from 0":
-            // reset the counter so a re-download (or a download that restarted)
-            // never looks complete because an older entry still holds sent==total.
-            // Range requests instead continue the existing counter — an
-            // interrupted native download resuming exactly where it stopped. Any
-            // new stream also clears a stale auto-pause.
-            let fresh = !partial || e.total == 0;
-            if fresh {
-                // A full-body request re-downloads from byte 0. A Range resume of a
-                // file the peer already partially holds (whose earlier entry was
-                // dropped on a stream cut) seeds the counter with the bytes it has,
-                // so the resumed transfer reads true progress instead of restarting
-                // at 0 and never reaching 100%.
-                e.sent = if partial { start } else { 0 };
-            }
-            e.paused = false;
+            // A Range request seeds the counter with the byte offset it asks
+            // from, so the outcome log reads true bytes-served instead of
+            // always-from-zero. A full body starts at 0.
+            e.sent = start;
             e.total = len;
             touch_entry(e);
-            // This stream now owns the entry: bump the token so an older dropped
-            // stream's guard cannot reap it (see StreamCutGuard).
-            e.owner = DL_OWNER_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
-            owner = e.owner;
-            fresh
-        };
-        if fresh {
-            logf(&format!("download start {id}: {name} [{start}-{end}]/{len}"));
         }
+        logf(&format!("download start {id}: {name} [{start}-{end}]/{len}"));
     }
     // Take() caps the read at the range end so a partial response carries
     // exactly end-start+1 bytes, not the rest of the file. A large read buffer
@@ -1132,53 +1122,39 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
     let stream: std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send>,
     > = match &prog_id {
-        Some(id) => {
-            let id = id.clone();
+        Some(tid) => {
+            let tid = tid.clone();
+            let msg_id = p.id.clone();
+            let name = name.to_string();
             // Held for the stream's whole life: on drop (peer gone mid-transfer)
-            // it removes the counter and tells clients to reconcile.
-            let cut = StreamCutGuard { id: id.clone(), owner };
+            // it reaps this transfer's counter and logs the outcome.
+            let cut = StreamCutGuard { tid: tid.clone(), name: name.clone() };
             Box::pin(base.map(move |chunk| {
                 // Referencing `cut` keeps it captured, so it is dropped only when
                 // the whole stream (and thus this closure) is dropped by hyper.
                 let _alive = &cut;
-                // The PC asked to stop this download (/cancel): end the stream so
-                // the receiver's in-flight download is cut (its OS then reports it
-                // interrupted) instead of being allowed to drain.
-                if cancel_lock().contains(&id) {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "transfer cancelled by PC",
-                    ));
-                }
                 match &chunk {
                     Ok(b) => {
                         let mut map = dl_lock();
-                        if let Some(e) = map.get_mut(&id) {
-                            let before = e.sent;
+                        if let Some(e) = map.get_mut(&tid) {
                             e.sent += b.len() as u64;
-                            // Bytes moving again after a stall auto-pause (e.g. the
-                            // browser's download confirm was held open, then
-                            // accepted): the flag is the stall-watchdog's state and
-                            // flow contradicts it. Clear and announce so the host's
-                            // ring leaves "Paused" right away. No intentional pause
-                            // flow exists, so there is no user intent to trample.
-                            let resumed = e.paused;
-                            e.paused = false;
                             touch_entry(e);
-                            if before < e.total && e.sent >= e.total {
-                                logf(&format!("download done {id}: {} bytes", e.sent));
+                            if e.sent >= e.total && e.total > 0 {
+                                logf(&format!("download done {tid}: {} bytes", e.sent));
+                                // The receiver just got the whole file: stamp the
+                                // PC's delivery marker. No progress is pushed —
+                                // the puller's browser owns that UI.
+                                let _ = notifier().send(PushEvent::Delivered { id: msg_id.clone() });
                             }
-                            // Push immediately on a resume tick so the other end
-                            // un-pauses without waiting out the throttle.
-                            push_progress(&mut map, &id, now_ms(), resumed);
                         }
                     }
                     Err(err) => {
-                        // The peer closed/cut this stream (pause, tab killed, WiFi
-                        // drop) or a /cancel interrupted it. hyper surfaces a real
-                        // disconnect as the response body being dropped, not as an
-                        // error here, so cleanup happens in StreamCutGuard::drop.
-                        logw(&format!("download stream cut {id}: {err}"));
+                        // The receiver closed/cut this stream (a declined or
+                        // cancelled browser download, a killed tab, a WiFi
+                        // drop). hyper surfaces a real disconnect as the body
+                        // being dropped, not as an error here, so the outcome
+                        // logging happens in StreamCutGuard::drop.
+                        logw(&format!("download stream cut {tid}: {err}"));
                     }
                 }
                 chunk
@@ -1341,21 +1317,17 @@ async fn dl_status() -> impl IntoResponse {
     let map = dl_lock();
     let items: Vec<_> = map
         .iter()
-        .map(|(id, e)| {
-            serde_json::json!({ "id": id, "total": e.total, "sent": e.sent, "paused": e.paused })
-        })
+        .map(|(id, e)| serde_json::json!({ "id": id, "total": e.total, "sent": e.sent }))
         .collect();
     Json(items)
 }
 
-/// Stop a transfer by id. Only the PC can do this — it is the role that hosts a
-/// download the phone is pulling (revoke it) and the one receiving a phone
-/// upload (refuse it). The id is flagged so the in-flight upload writer /
-/// download stream tear down on their next chunk; shared progress is dropped
-/// right away. For a pending upload the record and partial file are also removed
-/// so the sending phone (which sees its row vanish and aborts) is not left
-/// streaming into nothing. A ready file's record is kept — cancelling a download
-/// must not delete the file.
+/// Refuse an incoming upload (receiver-side cancel). Only the PC can do this —
+/// it is the device receiving the push. The id is flagged so the in-flight
+/// upload writer tears down on its next chunk; the pending row and the partial
+/// file are removed right away, so the sending phone (which sees its row
+/// vanish and aborts) is not left streaming into nothing. Downloads have no
+/// server-side cancel at all: the puller's own browser UI is that cancel.
 async fn cancel(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(p): Query<IdParam>,
@@ -1365,33 +1337,23 @@ async fn cancel(
         return (StatusCode::FORBIDDEN, "phone cannot stop transfers").into_response();
     }
     cancel_lock().insert(p.id.clone());
-    let was_pending = catalog::find(&p.id).map(|e| e.pending).unwrap_or(false);
-    // Drop the shared counter so neither end keeps mirroring a dead transfer.
-    dl_lock().remove(&p.id);
-    if was_pending {
-        // An incoming upload: remove the pending row and best-effort the partial
-        // file. If the writer still holds the handle open (Windows), it deletes
-        // the file itself when it wakes on the cancel flag.
-        if let Some(e) = catalog::remove(&p.id) {
-            if let catalog::MsgBody::File {
-                source: catalog::Source::Remote { path },
-                ..
-            } = &e.body
-            {
-                let _ = std::fs::remove_file(path);
-            }
+    // Remove the pending row and best-effort the partial file. If the writer
+    // still holds the handle open (Windows), it deletes the file itself when
+    // it wakes on the cancel flag.
+    if let Some(e) = catalog::remove(&p.id) {
+        if let catalog::MsgBody::File {
+            source: catalog::Source::Remote { path },
+            ..
+        } = &e.body
+        {
+            let _ = std::fs::remove_file(path);
         }
-        let _ = notifier().send(PushEvent::List(catalog::all_items()));
     }
-    // A cancelled download pushes no terminal progress tick, so broadcast a
-    // resync: every client reconciles its mirror corner away instead of leaving
-    // it frozen on a pause/cancel affordance.
-    let _ = notifier().send(PushEvent::Resync);
-    logf(&format!(
-        "cancel {}: {} stopped",
-        p.id,
-        if was_pending { "upload" } else { "download" }
-    ));
+    // Drop the shared counter so neither end keeps mirroring a dead transfer,
+    // then push the corrected list.
+    dl_lock().remove(&p.id);
+    let _ = notifier().send(PushEvent::List(catalog::all_items()));
+    logf(&format!("cancel {}: upload refused", p.id));
     (StatusCode::OK, "stopped").into_response()
 }
 
@@ -1659,9 +1621,13 @@ fn info_event() -> Event {
 fn push_event_to_sse(ev: PushEvent) -> Event {
     match ev {
         PushEvent::List(items) => Event::default().event("list").json_data(&items).unwrap(),
-        PushEvent::Progress { id, total, sent, paused } => Event::default()
+        PushEvent::Progress { id, total, sent } => Event::default()
             .event("progress")
-            .json_data(serde_json::json!({ "id": id, "total": total, "sent": sent, "paused": paused }))
+            .json_data(serde_json::json!({ "id": id, "total": total, "sent": sent }))
+            .unwrap(),
+        PushEvent::Delivered { id } => Event::default()
+            .event("delivered")
+            .json_data(serde_json::json!({ "id": id }))
             .unwrap(),
         PushEvent::Fw(need) => Event::default()
             .event("fw")
@@ -1733,63 +1699,29 @@ async fn monitor_loop() {
             prev_repair = Some(repair);
             let _ = notifier().send(PushEvent::Fw(repair));
         }
-        // Prune transfers whose entries went stale: finished ones after 15s, and
-        // auto-paused (abandoned) ones nobody resumed within 30s. The paused
-        // branch is a backstop for entries with no living stream (a dying
-        // stream reaps its own entry — see StreamCutGuard); what survives here
-        // is a stall nobody ever resumed. Broadcast `resync` when anything
-        // drops so clients reconcile their mirror corners back to idle (a
-        // silent prune would otherwise leave a paused ring stuck).
+        // Prune transfer counters on pure time windows: finished ones after 15s
+        // (a lingering completion would keep reappearing in /dl-status), and
+        // in-flight ones after 30s of silence — a dead pull's socket write can
+        // hang past any timeout, so its entry dies here rather than through
+        // the stream (a living stream that resumes simply re-touches its entry
+        // and never goes stale). Upload entries whose writer already failed
+        // were removed by the writer itself. Broadcast `resync` when anything
+        // drops so clients reconcile their upload rings back to idle (a silent
+        // prune would otherwise leave a ring stuck).
         let now = now_mono();
         {
             let mut map = dl_lock();
             let before = map.len();
             map.retain(|_, e| {
                 let stale = now.saturating_sub(e.last_ts);
-                !(e.sent >= e.total && stale > 15)
-                    && !(e.paused && e.sent < e.total && stale > 30)
+                if e.sent >= e.total {
+                    stale <= 15
+                } else {
+                    stale <= 30
+                }
             });
             if map.len() < before {
                 let _ = notifier().send(PushEvent::Resync);
-            }
-        }
-        // Auto-pause a download whose bytes have stopped moving: the peer died
-        // or its connection went silent, so the sender should show "Paused"
-        // instead of a stuck "Transferring…". Uploads are NOT considered here —
-        // a stalled upload is caught by its own per-chunk timeout in upload()
-        // (which errors and self-cleans) — only served downloads (non-pending
-        // files) need the scan; the paused flag clears itself when the stream's
-        // bytes resume flowing.
-        let stalled: Vec<String> = dl_lock()
-            .iter()
-            .filter(|(_, e)| {
-                e.total > 0
-                    && e.sent < e.total
-                    && !e.paused
-                    && now.saturating_sub(e.last_ts) >= STALL_AUTO_PAUSE_SECS
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in stalled {
-            let is_upload = catalog::find(&id).map(|e| e.pending).unwrap_or(false);
-            if is_upload {
-                continue;
-            }
-            let mut map = dl_lock();
-            if let Some(e) = map.get_mut(&id) {
-                if e.total > 0
-                    && e.sent < e.total
-                    && !e.paused
-                    && now.saturating_sub(e.last_ts) >= STALL_AUTO_PAUSE_SECS
-                {
-                    e.paused = true;
-                    touch_entry(e);
-                    logf(&format!(
-                        "auto-paused stalled download {} at {}/{} bytes",
-                        id, e.sent, e.total
-                    ));
-                    push_progress(&mut map, &id, now_ms(), true);
-                }
             }
         }
     }

@@ -262,10 +262,9 @@
   /* Corner transfer ring, drawn like a browser's download chip: a thin accent
      arc sweeping clockwise from 12 o'clock (SVG, round caps, animates between
      the ~1/s ticks) on a dark disc. The center carries STATE, not decoration:
-     a big ✕ wherever this end may act on the transfer — the whole 30px circle
-     is the cancel tap target — a green check flashed at completion, and
-     nothing at all when this end is only watching. No percentage is painted;
-     the number lives in the tooltip. A stalled transfer dims the whole ring. */
+     a big ✕ — this end is the receiver and this is its refuse affordance, the
+     whole 30px circle the tap target — and a green check flashed at
+     completion. No percentage is painted; the number lives in the tooltip. */
   .cardring {
     position: absolute; top: 8px; right: 8px; z-index: 4;
     width: 30px; height: 30px; border-radius: 50%;
@@ -288,7 +287,6 @@
   .cardring .cr-glyph { position: relative; color: #fff; display: flex; }
   .cardring .cr-glyph svg { width: 13px; height: 13px; display: block; }
   .cardring .cr-glyph.stop { font-size: 13px; font-weight: 600; line-height: 1; }
-  .cardring.paused { opacity: 0.55; }
   .cardring.show { display: flex; }
   /* A transferring upload card stops its idle pulse so the ring is the only
      motion signal (higher specificity than .file-card.pending). */
@@ -836,11 +834,9 @@ async function refresh(){
 // is what tells us the row is gone.
 function pruneTransfers(items){
   const ids = new Set(items.map(i => i.id));
-  for(const key of Object.keys(dlInFlight))  if(!ids.has(key)) delete dlInFlight[key];
-  for(const key of Object.keys(serverPaused)) if(!ids.has(key)) delete serverPaused[key];
-  for(const key of Object.keys(progCache))    if(!ids.has(key)) delete progCache[key];
-  for(const key of Object.keys(doneIds))      if(!ids.has(key)) delete doneIds[key];
-  for(const key of Object.keys(hideTimers))   if(!ids.has(key)){ clearTimeout(hideTimers[key]); delete hideTimers[key]; }
+  for(const key of Object.keys(progCache)) if(!ids.has(key)) delete progCache[key];
+  for(const key of Object.keys(doneIds))   if(!ids.has(key)) delete doneIds[key];
+  for(const key of Object.keys(hideTimers)) if(!ids.has(key)){ clearTimeout(hideTimers[key]); delete hideTimers[key]; }
 }
 
 // Auto-receive on the phone: the moment a List event carries a file the PC just
@@ -1012,10 +1008,9 @@ async function openDefault(it){
 
 // Downloads are NATIVE-ONLY: every file is handed to the browser's own
 // downloader (it writes to real disk and shows its own progress). The in-app
-// ring below is a MIRROR of the server's transmitted-byte counter, drawn on the
-// PC for BOTH directions and on the phone for uploads only (see the corner
-// block below for the split). There is no JS chunk/OPFS downloader anymore —
-// that engine was removed.
+// ring below is the PC's receiver ring for pushes arriving from phones (see
+// the corner block). There is no JS chunk/OPFS downloader anymore — that
+// engine was removed.
 // Delivery record: file id -> unix seconds when a phone last pulled it (PC
 // side only, survives reloads). Rendered as "已下载到手机 HH:MM" on the card.
 const delivered = loadDelivered();
@@ -1051,73 +1046,43 @@ function withOptimistic(serverItems){
 function clearOptUploads(){ optUploads.length = 0; reapply(); }
 
 // ---- Corner transfer ring ----------------------------------------------
-// Every file card carries a small circle in its top-right corner, and WHO it
-// serves follows ownership of the bytes:
-//   PC        — mirrors every transfer the machine hosts (uploads arriving,
-//               downloads phones pull): the ring rides the server's ~1/s
-//               transmitted-byte counter (`progress` events) and its ✕ is the
-//               only stop control.
-//   Phone     — uploads only: those bytes belong to the page's own XHR and the
-//               pending row's lifecycle is list-driven, so a ring cannot freeze
-//               on a dead transfer. Phone DOWNLOADS are delegated wholesale to
-//               the browser's native downloader — which has its own progress
-//               and cancel UI — so the page keeps NO download state: the
-//               Download button is permanent, every tap starts a fresh full
-//               download, and there is no mirror to go stale.
-const progCache = {};   // id -> {sent,total,paused,t} latest server snapshot
+// Rings are drawn by the RECEIVER of a transfer, and only it can cancel:
+//   PC        — the receiver of phone pushes: its ring rides the server's
+//               received-byte counter (`progress` events for the pending row)
+//               and its ✕ is the refuse affordance (/cancel).
+//   Phone     — the receiver of pulls, whose progress and cancel live entirely
+//               in the browser's own download UI; the page keeps NO transfer
+//               state at all — no rings, no mirrors, nothing to sync. Its own
+//               uploads are sender-side: the optimistic "Uploading…" card is
+//               the feedback, and completion arrives as the row turning real.
+// Everything else (pull outcomes) is the server's event log, not UI.
+const progCache = {};   // id -> {sent,total,t} latest server snapshot (uploads)
 const doneIds = {};     // transfers already flashed complete -> corner stays idle
 const hideTimers = {};  // per-id "hide the finished ring" timers
 function itemById(id){ for(const it of curItems) if(it.id === id) return it; return null; }
-
-// The paused flag lives server-side (either end or the stall-watchdog sets it)
-// and rides each `progress` push; dlInFlight mirrors "the server is serving
-// this download right now" so the PC's ring can tell a live pull from a dead
-// one (and reconcile it away).
-const serverPaused = {};
-const dlInFlight = {};
 const BTN_DL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
 // The ring's only glyph is the completion check (Chrome's download-chip
-// pattern); cancel is the center ✕ text, watching ends get no glyph at all.
+// pattern); cancel is the center ✕ text.
 const GLYPH_DONE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
-
-// How recent a server counter must be for the PC's download ring to stay up.
-// The server pushes ~1/s while bytes flow; this window is kept wider than the
-// stall auto-pause so a stalling download fades into its paused state instead
-// of dropping and popping back a moment later.
-const RING_LIVE_MS = 8000;
 
 // What a card's corner should show right now:
 //   null -> idle (no transfer) — the Download button may show instead
-//   {pct, paused, done} -> a live transfer — draw the ring at pct%
+//   {pct, done} -> a live transfer — draw the ring at pct%
 // `done` is true only on the tick the counter crosses 100%, so the caller can
 // flash a full ring once before going idle again.
 function cornerState(id){
   const it = itemById(id);
   if(!it || it.kind !== 'file') return null;
+  // Only the receiver draws, and on this page the receiver is only ever the
+  // PC receiving a phone push (the pending row IS the transfer). Pulls draw
+  // nothing here — the puller's browser owns that UI — and uploads on the
+  // sending phone draw nothing either (sender-side).
+  if(!isPC || !it.pending || it.from !== 'phone') return null;
   const prog = progCache[id];
-  // Upload (from this or another phone): the pending row IS the transfer, and
-  // both ends draw the same counter until the server marks the file ready.
-  if(it.pending && it.from === 'phone'){
-    const total = (prog && prog.total) || it.size || 1;
-    const sent = prog ? Math.min(prog.sent, total) : 0;
-    return { pct: total ? sent / total * 100 : 0,
-             paused: false,
-             done: !!(prog && total > 0 && prog.sent >= total) };
-  }
-  // Ready file being pulled by a phone: PC-only mirror (the host's window is
-  // where the pull is watched and stopped). Live while the counter is fresh or
-  // while the stall-watchdog paused it (a frozen ring the host can ✕ away or
-  // that the prune will reap).
-  if(!isPC) return null;
-  if(serverPaused[id] || (prog && Date.now() - prog.t < RING_LIVE_MS)){
-    if(!prog || !(prog.total > 0)){
-      return { pct: 0, paused: !!serverPaused[id], done: false }; // started, no count yet
-    }
-    return { pct: Math.min(100, prog.sent / prog.total * 100),
-             paused: !!serverPaused[id],
-             done: prog.sent >= prog.total };
-  }
-  return null;
+  const total = (prog && prog.total) || it.size || 1;
+  const sent = prog ? Math.min(prog.sent, total) : 0;
+  return { pct: total ? sent / total * 100 : 0,
+           done: !!(prog && total > 0 && prog.sent >= total) };
 }
 
 // Paint one card's corner: the ring while a transfer this end mirrors is live,
@@ -1135,11 +1100,11 @@ function paintCorner(id){
   if(st && st.done && doneIds[id]) st = null;
 
   if(!st){
-    ring.classList.remove('show', 'paused', 'done', 'p0');
+    ring.classList.remove('show', 'done', 'p0');
     card.classList.remove('transferring');
     if(!card.dataset.pending && !isPC){
-      // The phone's Download button is permanent — it never yields the corner
-      // to a download ring, because the page mirrors no download state.
+      // The phone's Download button is permanent — it never yields the corner,
+      // because the page draws no rings at all (rings are the receiver's).
       btn.classList.remove('hidden');
       btn.innerHTML = BTN_DL;
       btn.title = 'Download';
@@ -1154,7 +1119,6 @@ function paintCorner(id){
   btn.classList.add('hidden');
   card.classList.add('transferring');
   ring.classList.add('show');
-  ring.classList.toggle('paused', !!st.paused);
   ring.classList.toggle('done', !!st.done);
   const p = Math.max(0, Math.min(100, st.pct));
   // A zero-length dash with round caps would paint a stray dot at 0% — hide
@@ -1162,20 +1126,16 @@ function paintCorner(id){
   ring.classList.toggle('p0', !(p > 0));
   ring.querySelector('.cr-arc').style.strokeDasharray = p + ' ' + (100 - p);
   // The number lives in the tooltip, not on the ring.
-  ring.title = Math.round(p) + '%' + (st.paused ? ' · paused' : '');
-  // Center carries state: a big ✕ wherever the device can meaningfully act on
-  // the transfer (the PC cuts anything it hosts — an upload it is receiving or
-  // a download a phone is pulling, paused or not — the phone aborts its own
-  // upload); a green check at completion; nothing when this end is only
-  // watching. Phone downloads have no ring at all (see the corner block).
-  const stopping = isPC || (!isPC && isMyUpload(itemById(id)));
+  ring.title = Math.round(p) + '%';
+  // Center carries state: a big ✕ (this page IS the receiver — refuse the
+  // push) while moving; a green check at completion.
   const glyph = ring.querySelector('.cr-glyph');
-  glyph.classList.toggle('stop', !!stopping && !st.done);
+  glyph.classList.toggle('stop', !st.done);
   if(st.done){
     glyph.innerHTML = GLYPH_DONE;
   } else {
     glyph.innerHTML = '';
-    glyph.textContent = stopping ? '✕' : '';
+    glyph.textContent = '✕';
   }
 
   if(!st.done && hideTimers[id]){ clearTimeout(hideTimers[id]); hideTimers[id] = null; }
@@ -1203,50 +1163,30 @@ function transferClick(it){
   downloadFile(it);
 }
 
-// True while `it` is THIS phone's own in-flight upload (the only transfer the
-// page controls). The pending row the server creates for it carries the same
-// name+size we declared when the upload started.
-function isMyUpload(it){
-  return !!currentUpload && !!it && it.pending && it.from === 'phone'
-    && it.name === currentUpload.name && it.size === currentUpload.size;
-}
-// Abort the phone's current upload: the server's read of the cut body errors,
-// which makes it drop the pending row, the half-written file and the progress
-// entry in one go.
-function cancelUpload(){
-  if(currentUpload){
-    try { currentUpload.xhr.abort(); } catch {}
-  }
-}
-// PC host action: stop whatever is transferring for this id — refuse an incoming
-// upload or cut a download a phone is pulling. The server flags the id (the
-// upload writer / download stream then tear down) and we clear the local mirror
-// so the ring vanishes right away.
+// PC host action: refuse the incoming push for this id. The server flags the
+// id (the upload writer tears down on its next chunk, dropping the pending row
+// and the partial file) and we clear the local mirror so the ring vanishes
+// right away.
 async function stopTransfer(id){
   try { await fetch('/cancel?id='+encodeURIComponent(id), {method:'POST'}); } catch {}
   clearMirror(id);
 }
-// Drop this end's mirror of one transfer (counter, paused flag, flash timers).
-// The PC is the only mirror-keeper left: a stalled phone-side download holds no
-// page state to clear (see the corner block).
+// Drop this end's mirror of one transfer (counter, flash timers).
 function clearMirror(id){
   delete progCache[id];
-  delete serverPaused[id];
-  delete dlInFlight[id];
   delete doneIds[id];
   if(hideTimers[id]){ clearTimeout(hideTimers[id]); hideTimers[id] = null; }
   paintCorner(id);
 }
-// Corner-ring tap dispatcher: ✕ belongs to whoever can act on the transfer —
-// the PC cuts what it hosts, the phone aborts its own upload. Phone downloads
-// have no ring; their lifecycle is the browser's.
+// Corner-ring tap: this page draws only its own receiving uploads, so a tap
+// is always "refuse this push". The phone draws no rings at all.
 function ringTap(it){
-  if(isPC){ stopTransfer(it.id); return; }
-  if(isMyUpload(it)){ cancelUpload(); return; }
+  if(isPC){ stopTransfer(it.id); }
 }
-// The PC can stop this phone's upload (see /cancel). Watch the server list: once
-// our pending row has been seen, its disappearance means the other end revoked
-// the transfer — abort locally so we stop streaming into nothing and say so.
+// The PC can refuse this phone's push (see /cancel). Watch the server list:
+// once our pending row has been seen, its disappearance means the other end
+// revoked the transfer — abort locally so we stop streaming into nothing and
+// say so.
 function checkUploadGone(items){
   if(!currentUpload) return;
   const mine = items.filter(i => i.from === 'phone'
@@ -1299,42 +1239,28 @@ function nativeDownload(it){
   document.body.appendChild(f);
 }
 
-// Transfer snapshots arrive as `progress` SSE events (~1/s per transfer) and a
-// one-shot /dl-status resync on connect. The PC mirrors every entry; the phone
-// mirrors only its own uploads (downloads are the browser's business — see the
-// corner block), so download pushes are skipped there entirely.
+// Transfer snapshots arrive as `progress` SSE events (~1/s per upload) and a
+// one-shot /dl-status resync on connect. Rings are receiver-side: the PC
+// applies pushes for the pending rows it is receiving; download progress is
+// never pushed (the puller's browser owns that UI), and the sending phone
+// draws nothing — its send feedback is the optimistic card + the row turning
+// real.
 function syncProgress(list){
+  if(!isPC) return;
   const now = Date.now();
   for(const d of list){
     const item = itemById(d.id);
-    if(!isPC && !(item && item.pending && item.from === 'phone')) continue;
-    const prev = progCache[d.id];
-    // First sight of a completed counter (the /dl-status resync on connect, or a
-    // file too small to ever have ticked partial) is a finished transfer — do not
-    // flash a full ring for it.
-    if(!prev && d.total > 0 && d.sent >= d.total) doneIds[d.id] = true;
-    // A ready file being pulled again restarts the counter (the server resets
-    // sent to 0 on a fresh full-body /dl): let the ring reappear.
-    if(prev && item && !item.pending && prev.total > 0 && prev.sent >= prev.total && d.sent < d.total){
-      delete doneIds[d.id];
-      if(hideTimers[d.id]){ clearTimeout(hideTimers[d.id]); hideTimers[d.id] = null; }
-    }
-    progCache[d.id] = { sent: d.sent, total: d.total, paused: d.paused, t: now };
-    if(d.sent < d.total) dlInFlight[d.id] = true; else delete dlInFlight[d.id];
-    serverPaused[d.id] = d.paused;
-    // A download just crossed the finish line -> record the delivery marker.
-    if(prev && item && !item.pending && d.total > 0 && prev.sent < d.total && d.sent >= d.total){
-      markDelivered(d.id);
-    }
+    if(!item || !item.pending || item.from !== 'phone') continue;
+    progCache[d.id] = { sent: d.sent, total: d.total, t: now };
     paintCorner(d.id);
   }
 }
-// Fetch the server's live-transfer snapshot, apply it, then reconcile the local
-// mirror with it: refresh counters for ids the server is still serving, and drop
-// mirror state for ids it no longer tracks. The server pushes nothing on a
-// stream cut, a PC /cancel, or a dead-transfer prune — it broadcasts `resync`
-// instead — so this reconcile is what lets a corner return to idle instead of
-// freezing on its last value (0%, or a pause/cancel affordance) forever.
+// Fetch the server's live-transfer snapshot, apply it, then reconcile the
+// local mirror with it: refresh counters for rows the server is still
+// receiving, and drop mirror state for ids it no longer tracks. The server
+// pushes nothing on a refused push or a dead-transfer prune — it broadcasts
+// `resync` instead — so this reconcile is what lets a corner return to idle
+// instead of freezing on its last value forever.
 async function resyncProgress(){
   let snap;
   try { snap = await (await fetch('/dl-status')).json(); } catch { return; }
@@ -1345,9 +1271,7 @@ async function resyncProgress(){
 }
 function reconcileMirrors(snap){
   const known = new Set(snap.map(d => d.id));
-  for(const id of Object.keys(dlInFlight))   if(!known.has(id)) delete dlInFlight[id];
-  for(const id of Object.keys(serverPaused)) if(!known.has(id)) delete serverPaused[id];
-  for(const id of Object.keys(progCache))    if(!known.has(id) && !doneIds[id]) delete progCache[id];
+  for(const id of Object.keys(progCache)) if(!known.has(id) && !doneIds[id]) delete progCache[id];
 }
 
 function sendText(){
@@ -1385,8 +1309,8 @@ function uploadFiles(files){
   const size = f0 && f0.size ? f0.size : 0;
   const xhr = new XMLHttpRequest();
   xhr.open('POST', '/upload?size='+size);
-  // Remember this upload so the corner ring can cancel it (see cancelUpload),
-  // BEFORE the optimistic card renders — that first frame already shows the ✕.
+  // Remember this upload so checkUploadGone can notice a receiver-side refusal:
+  // once our pending row is seen and then vanishes, the push was refused.
   currentUpload = { xhr, name: f0.name, size: f0.size || 0, seen: false, stoppedByPeer: false };
   reapply();
   const finish = (msg) => {
@@ -1567,6 +1491,8 @@ function connect(){
   es.onmessage = () => { lastSeen = Date.now(); };
   es.addEventListener('list', e => { lastSeen = Date.now(); applyList(JSON.parse(e.data)); });
   es.addEventListener('progress', e => { lastSeen = Date.now(); syncProgress([JSON.parse(e.data)]); });
+  // A pull just completed on some receiver: the PC stamps its delivery marker.
+  es.addEventListener('delivered', e => { lastSeen = Date.now(); markDelivered(JSON.parse(e.data).id); });
   // A `resync` means this client fell behind and may have dropped pushes (see
   // PushEvent::Resync for the full trigger list). Re-fetch BOTH the file list
   // and the transfer mirrors so nothing stays stale.
