@@ -815,6 +815,7 @@ function applyList(items){
   render(view);
   checkUploadGone(items);
   pruneTransfers(items);
+  autoReceive(items);
   // render() rebuilt the DOM and wiped every corner; repaint the ones that are
   // still mid-transfer so their ring comes straight back.
   repaintTransfers();
@@ -842,9 +843,28 @@ function pruneTransfers(items){
   for(const key of Object.keys(hideTimers))   if(!ids.has(key)){ clearTimeout(hideTimers[key]); delete hideTimers[key]; }
 }
 
-// PC pushes are never auto-pulled on the phone: a native browser download needs
-// a user gesture to start, so a new PC file simply lands as a row the user taps
-// Download on (see downloadFile / nativeDownload).
+// Auto-receive on the phone: the moment a List event carries a file the PC just
+// added, fire the browser's download for it — the user should meet only the
+// browser's own download confirm, with no in-page button to find first. Whether
+// the browser honors a script-initiated download with no user gesture is the
+// platform's call (drive-by-download protection): if it blocks, nothing fires
+// and the card's Download button stays as the manual path. The seen-set makes
+// this fire-once per file: the first snapshot after a page load is baseline
+// (no retroactive downloads), and every later List event fires only for ids
+// new since the previous one — resyncs, reconnects and re-renders are no-ops.
+let seenFileIds = null;
+function autoReceive(items){
+  if(isPC) return;
+  if(seenFileIds){
+    for(const it of items){
+      if(seenFileIds.has(it.id)) continue;
+      if(it.kind !== 'file' || it.from !== 'pc' || it.pending) continue;
+      reportClientError('auto-receive: firing download for ' + it.name);
+      nativeDownload(it);
+    }
+  }
+  seenFileIds = new Set(items.map(i => i.id));
+}
 function render(items){
   const chat = $('chat');
   const prev = chat.scrollTop;

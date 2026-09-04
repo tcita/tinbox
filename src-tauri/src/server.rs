@@ -84,9 +84,11 @@ struct DlProg {
     /// pause flip (see touch_entry). Compared against now_mono() by the
     /// monitor's stall scan and prune, and by presence.
     last_ts: u64,
-    /// Either side can pause a transfer via /dl-pause; the flag rides the next
-    /// progress push so both devices converge on a shared paused state. The
-    /// downloading side reacts by aborting (pause) or relaunching (resume).
+    /// Stall state, owned by the monitor's scan (server-side only: the peer
+    /// died or stopped reading). Set on a 3s byte-silence, cleared again by
+    /// that same transfer's stream the moment bytes resume flowing (e.g. the
+    /// phone confirmed the browser's download prompt), so both ends converge
+    /// on live truth instead of a stale pause. Rides every progress push.
     paused: bool,
     /// Last time a progress event was pushed for this transfer, to throttle SSE
     /// emissions to ~1/s per transfer (the frontend used to poll /dl-status).
@@ -276,10 +278,11 @@ const SSE_HEARTBEAT_SECS: u64 = 1;
 
 /// [LIVENESS/death] Seconds a served download may go without a byte written
 /// before the monitor auto-pauses it: the peer died or its connection went
-/// silent (a killed browser, a half-open TCP). Without this the sender would
-/// show a stuck "Transferring…" forever; pausing makes the row read "Paused"
-/// and a later resume (/dl-pause paused=0) re-arms it. Floor: the longest
-/// legitimate write gap of a healthy LAN transfer (milliseconds), with margin.
+/// silent (a killed browser, a half-open TCP, a download prompt held open).
+/// Without this the sender would show a stuck "Transferring…" forever;
+/// pausing makes the row read "Paused", and the flag re-arms itself the
+/// moment bytes resume flowing. Floor: the longest legitimate write gap of
+/// a healthy LAN transfer (milliseconds), with margin.
 const STALL_AUTO_PAUSE_SECS: u64 = 3;
 
 /// [LIVENESS/presence] Seconds of LAN silence (no request at all) before a
@@ -503,7 +506,6 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 .route("/log", post(client_log))
                 .route("/dl", get(download))
                 .route("/dl-status", get(dl_status))
-                .route("/dl-pause", post(dl_pause))
                 .route("/cancel", post(cancel))
                 .route("/view", get(view))
                 .route("/open", post(open_file))
@@ -1150,14 +1152,23 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
                         if let Some(e) = map.get_mut(&id) {
                             let before = e.sent;
                             e.sent += b.len() as u64;
+                            // Bytes moving again after a stall auto-pause (e.g. the
+                            // browser's download confirm was held open, then
+                            // accepted): the flag is the stall-watchdog's state and
+                            // flow contradicts it. Clear and announce so the host's
+                            // ring leaves "Paused" right away. No intentional pause
+                            // flow exists (nothing calls /dl-pause), so there is no
+                            // user intent to trample.
+                            let resumed = e.paused;
+                            e.paused = false;
                             touch_entry(e);
                             if before < e.total && e.sent >= e.total {
                                 logf(&format!("download done {id}: {} bytes", e.sent));
                             }
+                            // Push immediately on a resume tick so the other end
+                            // un-pauses without waiting out the throttle.
+                            push_progress(&mut map, &id, now_ms(), resumed);
                         }
-                        // Push throttled ~1/s per transfer (instant on completion)
-                        // so both ends get live progress without polling.
-                        push_progress(&mut map, &id, now_ms(), false);
                     }
                     Err(err) => {
                         // The peer closed/cut this stream (pause, tab killed, WiFi
@@ -1332,36 +1343,6 @@ async fn dl_status() -> impl IntoResponse {
         })
         .collect();
     Json(items)
-}
-
-/// Pause/resume a transfer from either end (POST /dl-pause?id=X&paused=1|0).
-/// Flips the shared paused flag, which is pushed to both devices immediately as
-/// a `progress` event; the downloading side aborts (pause) or relaunches
-/// unfinished chunks (resume). The entry may not exist yet if a pause races the
-/// first request - create it so the flag survives until the transfer registers.
-#[derive(serde::Deserialize)]
-struct PauseParam {
-    id: String,
-    paused: u8,
-}
-
-async fn dl_pause(Query(p): Query<PauseParam>) -> impl IntoResponse {
-    let mut map = dl_lock();
-    {
-        let e = map.entry(p.id.clone()).or_default();
-        e.paused = p.paused != 0;
-        touch_entry(e);
-    }
-    // Push immediately (force, not throttled) so the downloading side
-    // aborts/relaunches right away instead of waiting for the next progress tick.
-    push_progress(&mut map, &p.id, now_ms(), true);
-    logf(&format!(
-        "dl-pause {} -> paused={} ({} bytes)",
-        p.id,
-        p.paused != 0,
-        map.get(&p.id).map(|e| e.sent).unwrap_or(0)
-    ));
-    (StatusCode::OK, "ok").into_response()
 }
 
 /// Stop a transfer by id. Only the PC can do this — it is the role that hosts a
@@ -1771,8 +1752,8 @@ async fn monitor_loop() {
         // instead of a stuck "Transferring…". Uploads are NOT considered here —
         // a stalled upload is caught by its own per-chunk timeout in upload()
         // (which errors and self-cleans) — only served downloads (non-pending
-        // files) need the scan; a later resume (/dl-pause paused=0) clears the
-        // paused flag.
+        // files) need the scan; the paused flag clears itself when the stream's
+        // bytes resume flowing.
         let stalled: Vec<String> = dl_lock()
             .iter()
             .filter(|(_, e)| {
