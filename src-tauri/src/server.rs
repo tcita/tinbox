@@ -85,10 +85,11 @@ struct DlProg {
     /// monitor's stall scan and prune, and by presence.
     last_ts: u64,
     /// Stall state, owned by the monitor's scan (server-side only: the peer
-    /// died or stopped reading). Set on a 3s byte-silence, cleared again by
-    /// that same transfer's stream the moment bytes resume flowing (e.g. the
-    /// phone confirmed the browser's download prompt), so both ends converge
-    /// on live truth instead of a stale pause. Rides every progress push.
+    /// died or stopped reading). Set on a 3s byte-silence; cleared by that
+    /// same transfer's stream the moment bytes resume flowing (e.g. the phone
+    /// confirmed the browser's download prompt), and made moot by the
+    /// stream's death, which reaps the entry outright. Rides every progress
+    /// push.
     paused: bool,
     /// Last time a progress event was pushed for this transfer, to throttle SSE
     /// emissions to ~1/s per transfer (the frontend used to poll /dl-status).
@@ -982,14 +983,17 @@ fn mime_for(name: &str) -> String {
 /// [LIVENESS/death] Drop-guard on a served download body, and the only reaper
 /// of live transfer entries. When hyper drops the response body before the
 /// file was fully sent, the downloading peer is gone (browser cancel, killed
-/// tab, WiFi drop) — axum surfaces a disconnect as the body being dropped, not
-/// as an error inside the stream, so a per-chunk error arm never sees it.
-/// This guard removes the shared counter and asks every client to reconcile
-/// its mirror, so a dead transfer cannot leave a corner stuck on a stale
-/// percent or a pause/cancel affordance. It only reaps its OWN stream's entry
-/// (checked via the owner token, so a Range resume that has already
-/// re-registered the id is never clobbered), and never a paused one — pause
-/// state must survive the stream and is retired by the monitor's prune.
+/// tab, WiFi drop, or a declined auto-receive prompt): axum surfaces a
+/// disconnect as the body being dropped, not as an error inside the stream,
+/// so a per-chunk error arm never sees it. This guard removes the shared
+/// counter and asks every client to reconcile its mirror, so a dead transfer
+/// cannot leave a corner stuck on a stale percent or a pause/cancel
+/// affordance. It only reaps its OWN stream's entry, checked via the owner
+/// token so a re-registration (a Range resume, or simply a second Download
+/// tap) that has already claimed the id is never clobbered. Stalled-paused
+/// entries are reaped too: paused belongs to the stall-watchdog and a dead
+/// stream contradicts it — with no intentional pause flow left, there is
+/// nothing to preserve past the stream's death.
 struct StreamCutGuard {
     id: String,
     owner: u64,
@@ -998,7 +1002,7 @@ impl Drop for StreamCutGuard {
     fn drop(&mut self) {
         let mut map = dl_lock();
         let owned_incomplete = match map.get(&self.id) {
-            Some(e) => e.owner == self.owner && e.sent < e.total && !e.paused,
+            Some(e) => e.owner == self.owner && e.sent < e.total,
             None => false,
         };
         if owned_incomplete {
@@ -1157,8 +1161,7 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
                             // accepted): the flag is the stall-watchdog's state and
                             // flow contradicts it. Clear and announce so the host's
                             // ring leaves "Paused" right away. No intentional pause
-                            // flow exists (nothing calls /dl-pause), so there is no
-                            // user intent to trample.
+                            // flow exists, so there is no user intent to trample.
                             let resumed = e.paused;
                             e.paused = false;
                             touch_entry(e);
@@ -1731,9 +1734,12 @@ async fn monitor_loop() {
             let _ = notifier().send(PushEvent::Fw(repair));
         }
         // Prune transfers whose entries went stale: finished ones after 15s, and
-        // auto-paused (abandoned) ones nobody resumed within 30s. Broadcast
-        // `resync` when anything drops so clients reconcile their mirror corners
-        // back to idle (a silent prune would otherwise leave a paused ring stuck).
+        // auto-paused (abandoned) ones nobody resumed within 30s. The paused
+        // branch is a backstop for entries with no living stream (a dying
+        // stream reaps its own entry — see StreamCutGuard); what survives here
+        // is a stall nobody ever resumed. Broadcast `resync` when anything
+        // drops so clients reconcile their mirror corners back to idle (a
+        // silent prune would otherwise leave a paused ring stuck).
         let now = now_mono();
         {
             let mut map = dl_lock();
