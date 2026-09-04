@@ -1192,6 +1192,18 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
     };
     let disp = if inline { "inline" } else { "attachment" };
     let cd = format!("{}; filename=\"{}\"", disp, name);
+    // Inline previews may be cached for good: a message id never changes
+    // content (the file behind it is written once; a re-upload gets a new id),
+    // so list re-renders stop re-pulling every visible image over the LAN.
+    // Pending files answer 404 (uncached), so the cache only ever holds final
+    // bytes. Attachment downloads are the opposite: their URLs carry a fresh
+    // &r= cache-buster, so caching would only pile multi-GB bodies into the
+    // browser cache with no reuse — forbid it.
+    let cc = if inline {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-store"
+    };
     let mut resp = (
         StatusCode::OK,
         [
@@ -1199,6 +1211,7 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
             (header::CONTENT_DISPOSITION, cd),
             (header::CONTENT_LENGTH, len.to_string()),
             (header::CONTENT_TYPE, ct),
+            (header::CACHE_CONTROL, cc.to_string()),
         ],
         body,
     )
