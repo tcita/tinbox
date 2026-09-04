@@ -624,8 +624,14 @@ fn safe_name(s: &str) -> String {
     }
 }
 
-async fn index() -> Html<&'static str> {
-    Html(include_str!("index.html"))
+async fn index() -> impl IntoResponse {
+    // The page is compiled into this binary; a browser-cached copy would drift
+    // from the server's behavior after an update (phone Safari caches
+    // heuristically), so forbid reuse and always re-fetch.
+    (
+        [(header::CACHE_CONTROL, "no-cache")],
+        Html(include_str!("index.html")),
+    )
 }
 
 async fn list() -> impl IntoResponse {

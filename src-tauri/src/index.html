@@ -259,29 +259,36 @@
   .dlcardbtn svg { width: 14px; height: 14px; display: block; }
   .dlcardbtn.hidden { display: none; }
   .msg.me .dlcardbtn { background: rgba(0,0,0,0.45); }
-  /* Corner transfer ring: the same top-right circle as the Download button
-     turns into a live progress ring whenever a file moves in EITHER direction
-     (upload or download) on EITHER end. The arc is a conic-gradient sized by
-     --p; an inner disc leaves just the ring band and carries the percent. */
+  /* Corner transfer ring, drawn like a browser's download chip: a thin accent
+     arc sweeping clockwise from 12 o'clock (SVG, round caps, animates between
+     the ~1/s ticks) on a dark disc. The center carries STATE, not decoration:
+     a big ✕ wherever this end may act on the transfer — the whole 30px circle
+     is the cancel tap target — a green check flashed at completion, and
+     nothing at all when this end is only watching. No percentage is painted;
+     the number lives in the tooltip. A stalled transfer dims the whole ring. */
   .cardring {
     position: absolute; top: 8px; right: 8px; z-index: 4;
     width: 30px; height: 30px; border-radius: 50%;
     display: none; align-items: center; justify-content: center;
-    background: conic-gradient(#fff calc(var(--p, 0) * 1%), rgba(255,255,255,0.32) 0);
+    background: rgba(0,0,0,0.6);
     box-shadow: 0 1px 4px rgba(0,0,0,0.28);
     backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
   }
-  .cardring::before {
-    content: ""; position: absolute; inset: 3px; border-radius: 50%;
-    background: rgba(0,0,0,0.6);
+  .cardring > svg {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    transform: rotate(-90deg);
   }
-  .cardring .cr-txt {
-    position: relative; color: #fff; font-weight: 700;
-    font-size: 8px; font-variant-numeric: tabular-nums; line-height: 1;
+  .cardring .cr-track { fill: none; stroke: rgba(255,255,255,0.22); stroke-width: 3; }
+  .cardring .cr-arc {
+    fill: none; stroke: var(--accent); stroke-width: 3; stroke-linecap: round;
+    stroke-dasharray: 0 100; transition: stroke-dasharray .35s ease;
   }
-  /* Cancel affordance on the sending phone's own upload ring. */
-  .cardring .cr-txt.cancel { font-size: 13px; font-weight: 600; }
-  .cardring.paused .cr-txt { font-size: 9px; letter-spacing: 1px; }
+  .cardring.p0 .cr-arc { display: none; }
+  .cardring.done .cr-arc { stroke: #30d158; }
+  .cardring .cr-glyph { position: relative; color: #fff; display: flex; }
+  .cardring .cr-glyph svg { width: 13px; height: 13px; display: block; }
+  .cardring .cr-glyph.stop { font-size: 13px; font-weight: 600; line-height: 1; }
+  .cardring.paused { opacity: 0.55; }
   .cardring.show { display: flex; }
   /* A transferring upload card stops its idle pulse so the ring is the only
      motion signal (higher specificity than .file-card.pending). */
@@ -934,7 +941,10 @@ function render(items){
       card.appendChild(btn);
       const ring = document.createElement('div');
       ring.className = 'cardring';
-      ring.innerHTML = '<div class="cr-txt"></div>';
+      ring.innerHTML = '<svg viewBox="0 0 30 30">'
+        + '<circle class="cr-track" cx="15" cy="15" r="12" pathLength="100"/>'
+        + '<circle class="cr-arc" cx="15" cy="15" r="12" pathLength="100"/>'
+        + '</svg><span class="cr-glyph"></span>';
       // Ring is only shown while something is moving; tapping it dispatches to
       // whichever stop the local device owns (see ringTap).
       ring.onclick = (e) => { e.stopPropagation(); ringTap(it); };
@@ -1046,6 +1056,9 @@ function itemById(id){ for(const it of curItems) if(it.id === id) return it; ret
 const serverPaused = {};
 const dlInFlight = {};
 const BTN_DL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
+// The ring's only glyph is the completion check (Chrome's download-chip
+// pattern); cancel is the center ✕ text, watching ends get no glyph at all.
+const GLYPH_DONE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
 
 // How recent a server counter must be for the PC's download ring to stay up.
 // The server pushes ~1/s while bytes flow; this window is kept wider than the
@@ -1102,7 +1115,7 @@ function paintCorner(id){
   if(st && st.done && doneIds[id]) st = null;
 
   if(!st){
-    ring.classList.remove('show', 'paused');
+    ring.classList.remove('show', 'paused', 'done', 'p0');
     card.classList.remove('transferring');
     if(!card.dataset.pending && !isPC){
       // The phone's Download button is permanent — it never yields the corner
@@ -1120,21 +1133,34 @@ function paintCorner(id){
   // its idle pulse so the ring is the only motion signal.
   btn.classList.add('hidden');
   card.classList.add('transferring');
-  ring.classList.toggle('paused', !!st.paused);
   ring.classList.add('show');
-  ring.style.setProperty('--p', Math.max(0, Math.min(100, st.pct)));
-  // The corner shows ✕ wherever the device can meaningfully act on the
-  // transfer: the PC can cut anything it hosts (an upload it is receiving, or a
-  // download a phone is pulling — paused or not), the phone can abort its own
-  // upload. Phone downloads have no ring at all (see the corner block).
+  ring.classList.toggle('paused', !!st.paused);
+  ring.classList.toggle('done', !!st.done);
+  const p = Math.max(0, Math.min(100, st.pct));
+  // A zero-length dash with round caps would paint a stray dot at 0% — hide
+  // the arc there instead (class p0) and let the glyph say "started".
+  ring.classList.toggle('p0', !(p > 0));
+  ring.querySelector('.cr-arc').style.strokeDasharray = p + ' ' + (100 - p);
+  // The number lives in the tooltip, not on the ring.
+  ring.title = Math.round(p) + '%' + (st.paused ? ' · paused' : '');
+  // Center carries state: a big ✕ wherever the device can meaningfully act on
+  // the transfer (the PC cuts anything it hosts — an upload it is receiving or
+  // a download a phone is pulling, paused or not — the phone aborts its own
+  // upload); a green check at completion; nothing when this end is only
+  // watching. Phone downloads have no ring at all (see the corner block).
   const stopping = isPC || (!isPC && isMyUpload(itemById(id)));
-  const txt = ring.querySelector('.cr-txt');
-  txt.textContent = stopping ? '✕' : Math.round(st.pct) + '%';
-  txt.classList.toggle('cancel', !!stopping);
+  const glyph = ring.querySelector('.cr-glyph');
+  glyph.classList.toggle('stop', !!stopping && !st.done);
+  if(st.done){
+    glyph.innerHTML = GLYPH_DONE;
+  } else {
+    glyph.innerHTML = '';
+    glyph.textContent = stopping ? '✕' : '';
+  }
 
   if(!st.done && hideTimers[id]){ clearTimeout(hideTimers[id]); hideTimers[id] = null; }
   if(st.done && !doneIds[id]){
-    // Crossed 100%: hold the full ring a beat, then go idle.
+    // Crossed 100%: hold the check a beat, then go idle.
     doneIds[id] = true;
     hideTimers[id] = setTimeout(() => paintCorner(id), 1200);
   }
