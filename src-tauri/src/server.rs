@@ -6,7 +6,7 @@
 use axum::{
     body::Body,
     extract::{connect_info::ConnectInfo, Multipart, Query, Request, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     middleware::{from_fn, Next},
     response::{Html, IntoResponse, Json, Response, sse::{Event, Sse, KeepAlive}},
     routing::{get, post},
@@ -46,13 +46,26 @@ pub(crate) enum PushEvent {
     Progress { id: String, total: u64, sent: u64, paused: bool },
     /// Firewall repair flag changed.
     Fw(bool),
-    /// A LAN device connected/disconnected, or the server address changed (the
-    /// PC badge + gate).
+    /// A LAN device connected/disconnected, or the server address changed.
+    /// Consumers: the PC scan gate's first-connect latch + URL display, and
+    /// the presence logs. There is no ambient online/offline UI on either end
+    /// anymore (see the LIVENESS block — connectivity feedback is action-
+    /// coupled), so a later `info` transition past the first connect only
+    /// refreshes the shown address.
     Info { mobile_connected: bool, url: String, ip: String, port: u16 },
-    /// The transfer map lost an entry without a terminal `progress` tick (a
-    /// stream was cut, a download was cancelled, or a paused/dead entry was
-    /// pruned): ask every client to re-fetch /dl-status and reconcile its mirror,
-    /// so no corner freezes on a stale percent or a pause/cancel affordance.
+    /// [LIVENESS/reconcile] The one catch-up event: "you may have missed
+    /// pushes — re-fetch /dl-status and reconcile your mirror, so no corner
+    /// freezes on a stale percent or a pause/cancel affordance". The complete
+    /// server trigger list:
+    ///   - events(): a subscriber lagged the broadcast channel and dropped
+    ///     events (surfaced as BroadcastStream lag),
+    ///   - StreamCutGuard::drop: a stream was cut/cancelled and its live
+    ///     entry was reaped,
+    ///   - monitor_loop: stale entries were pruned (finished, or paused/
+    ///     abandoned past the prune window).
+    /// Clients additionally reconcile on (re)connect and on visibilitychange;
+    /// the phone also polls /dl-status at 1s while it holds transfer state
+    /// (its EventSource can be frozen while a native download runs).
     Resync,
 }
 
@@ -64,6 +77,9 @@ pub(crate) enum PushEvent {
 struct DlProg {
     total: u64,
     sent: u64,
+    /// Monotonic seconds-since-start of the last byte written / registration /
+    /// pause flip (see touch_entry). Compared against now_mono() by the
+    /// monitor's stall scan and prune, and by presence.
     last_ts: u64,
     /// Either side can pause a transfer via /dl-pause; the flag rides the next
     /// progress push so both devices converge on a shared paused state. The
@@ -87,6 +103,14 @@ fn dl_progress() -> &'static Mutex<std::collections::HashMap<String, DlProg>> {
     DL_PROGRESS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
+/// [LIVENESS/death] Mark a transfer as alive. The single writer of
+/// DlProg::last_ts: registration, every chunk (either direction), pause flips
+/// and the monitor's auto-pause all go through here. Read by the monitor's
+/// stall scan and prune, and by presence (transfer_active_recently).
+fn touch_entry(e: &mut DlProg) {
+    e.last_ts = now_mono();
+}
+
 /// Ids whose transfer the PC asked to stop (/cancel). The upload writer and the
 /// download stream poll this on every chunk and tear down when they see their
 /// id. A fresh /dl request for the same id clears it, so stopping one download
@@ -94,6 +118,21 @@ fn dl_progress() -> &'static Mutex<std::collections::HashMap<String, DlProg>> {
 static CANCELLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 fn cancelled() -> &'static Mutex<HashSet<String>> {
     CANCELLED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Poison-safe lock for the transfer map. A handler that panics while holding
+/// this lock poisons the Mutex, after which every unwrap() would panic in turn
+/// and take down the whole transfer + presence pipeline. DlProg holds only
+/// counters with no cross-field invariant, so recovering the guard is safe:
+/// the partial write is a stale progress value at worst, healed by the next
+/// push or resync.
+fn dl_lock() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, DlProg>> {
+    dl_progress().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Poison-safe lock for the cancelled-ids set (same rationale as dl_lock).
+fn cancel_lock() -> std::sync::MutexGuard<'static, HashSet<String>> {
+    cancelled().lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Millisecond clock for throttling progress pushes (wall clock; fine for a
@@ -171,40 +210,82 @@ fn from_by_peer(peer: SocketAddr) -> &'static str {
     }
 }
 
-/// Timestamp (unix seconds) of the most recent request from a non-local
-/// (phone) device. The firewall module reads it as positive proof that inbound
-/// traffic reaches this machine. The PC's own requests go over loopback and
-/// never update it, so the PC never counts itself.
+/// Monotonic seconds-since-start of the most recent request from a non-local
+/// (phone) device; 0 means no LAN request has ever arrived. The firewall
+/// module reads it as positive proof that inbound traffic reaches this
+/// machine. The PC's own requests go over loopback and never update it, so
+/// the PC never counts itself.
 static LAST_PHONE_ACT: AtomicU64 = AtomicU64::new(0);
 
 /// Peers already warned about coming from a different subnet than the QR IP.
 static SUBNET_WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// Monotonic seconds since process start, offset to begin at 1 so that 0 can
+/// serve as the permanent "never" sentinel for stamped values (LAST_PHONE_ACT,
+/// DlProg::last_ts). With a 0-based clock, `now - 0` = uptime, which made a
+/// freshly started process read as "a device was seen PRESENCE_ACT_SECS ago":
+/// a phantom `device present` that latched the PC scan gate away before any
+/// phone ever connected, and 30s of fake inbound-proof for the firewall. Every
+/// liveness stamp in the pipeline is only ever compared against a later
+/// `now_mono()`, so wall-clock jumps (NTP correction, manual clock change)
+/// cannot freeze stall detection, pruning or presence either: a backward step
+/// would otherwise make `now - stamp` saturate to 0 and hold every dead
+/// transfer "alive" for the whole step duration.
+fn now_mono() -> u64 {
+    static T0: OnceLock<std::time::Instant> = OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_secs() + 1
 }
 
-/// How often the server sends a keepalive on an otherwise-quiet /events stream.
-/// It exists purely to keep moving bytes, so a phone's EventSource socket is
-/// not silently reaped by a NAT/AP idle timeout while the page is backgrounded.
-/// Client link state is EventSource's own onopen/onerror; no client timer.
-const HEARTBEAT_SECS: u64 = 5;
+/// ── LIVENESS — the four-mechanism pipeline that keeps both ends honest ────
+/// Every timer in the app belongs to exactly one of these; do not add more.
+///
+///   keep-alive    SSE_HEARTBEAT_SECS — the server emits bytes on an idle
+///                 /events stream: NAT/AP cannot reap the socket, and the
+///                 client's watchdog measures server death by its silence.
+///   presence      PRESENCE_ACT_SECS — a LAN device is online while it holds
+///                 an open /events stream or was active recently. Evidence
+///                 writers (the only three): `log_requests` -> LAST_PHONE_ACT,
+///                 `events`/PresenceGuard -> LAN_EVENTS_OPEN, transfer chunk
+///                 writers -> DlProg::last_ts (via touch_entry). The monitor
+///                 is the single announcer of transitions.
+///                 Consumers are the PC scan gate's first-connect latch, the
+///                 firewall's inbound-proof, and the logs — no UI light.
+///                 KNOWN LIMITS (deliberate): presence is OPTIMISTIC — a phone
+///                 that dies without a FIN keeps its stream "open" (and thus
+///                 counts online) until TCP gives up, minutes later; and it is
+///                 a GLOBAL aggregate, not per-device, so with several phones
+///                 one active device covers the others. Fine because nothing
+///                 destructive or user-facing depends on the bit.
+///   death         a transfer ends only through its stream: cut ->
+///                 StreamCutGuard (the only reaper of live entries), silence
+///                 -> monitor auto-pause scan.
+///   reconcile     PushEvent::Resync — the one catch-up event for "you may
+///                 have missed pushes"; its full trigger list lives on that
+///                 variant's doc. Clients also reconcile on (re)connect and
+///                 on visibilitychange, and the phone polls /dl-status at 1s
+///                 while it holds transfer state.
+///
+/// Desk-range profile: both devices are in hand and sessions are short, so
+/// the numbers below are tight. One floor to respect: the presence window
+/// must stay above the EventSource reconnect delay (retry, 1s, set on every
+/// replayed event in events()) or a stream blip flaps the presence bit.
+const SSE_HEARTBEAT_SECS: u64 = 1;
 
-/// Seconds a download may go without a byte being written before the monitor
-/// auto-pauses it: the peer died or its connection went silent (a killed
-/// browser, a half-open TCP). Without this the sender would show a stuck
-/// "Transferring…" forever; pausing makes the row read "Paused" and a later
-/// resume (/dl-pause paused=0) re-arms it.
-const STALL_AUTO_PAUSE_SECS: u64 = 6;
+/// [LIVENESS/death] Seconds a served download may go without a byte written
+/// before the monitor auto-pauses it: the peer died or its connection went
+/// silent (a killed browser, a half-open TCP). Without this the sender would
+/// show a stuck "Transferring…" forever; pausing makes the row read "Paused"
+/// and a later resume (/dl-pause paused=0) re-arms it. Floor: the longest
+/// legitimate write gap of a healthy LAN transfer (milliseconds), with margin.
+const STALL_AUTO_PAUSE_SECS: u64 = 3;
 
-/// Seconds of LAN silence (no request at all) before a device that holds no
-/// /events stream is treated as gone. A download or page load counts as proof of
-/// presence too — "the phone can reach the server" is what the PC badge means,
-/// not just "its /events stream is open".
-const PRESENCE_ACT_SECS: u64 = 8;
+/// [LIVENESS/presence] Seconds of LAN silence (no request at all) before a
+/// device that holds no /events stream is treated as gone. A download or page
+/// load counts as proof of presence too — "the phone can reach the server" is
+/// what presence evidence means, not just "its /events stream is open". Must
+/// stay above the SSE retry delay (see the LIVENESS block) so a blip cannot
+/// flap.
+const PRESENCE_ACT_SECS: u64 = 3;
 
 /// Whether a non-loopback (LAN) device has made a request within the last
 /// `secs` seconds. This is positive proof that inbound traffic is not blocked:
@@ -212,7 +293,10 @@ const PRESENCE_ACT_SECS: u64 = 8;
 /// packets arriving. The firewall module uses it as the ground truth to clear
 /// the repair flag.
 pub(crate) fn lan_seen_recently(secs: u64) -> bool {
-    now_unix().saturating_sub(LAST_PHONE_ACT.load(Ordering::Relaxed)) < secs
+    let last = LAST_PHONE_ACT.load(Ordering::Relaxed);
+    // 0 = "never" sentinel: without this guard, `now - 0` = uptime, which read
+    // as recent activity for the first `secs` of every process start.
+    last != 0 && now_mono().saturating_sub(last) < secs
 }
 
 /// How many /events streams are currently open from a non-loopback peer. A
@@ -226,8 +310,9 @@ static LAN_EVENTS_OPEN: AtomicU64 = AtomicU64::new(0);
 /// Whether a LAN device is present: it either holds an open /events stream, or
 /// is actively reaching this machine (a request in the last few seconds, or a
 /// transfer whose bytes are still flowing — e.g. a native download running even
-/// while its page's /events is down). "The phone can reach the server" is what
-/// the PC badge means, so any of those counts.
+/// while its page's /events is down). "The phone can reach the server" is the
+/// question, so any of those counts. See the KNOWN LIMITS in the LIVENESS
+/// block: optimistic under no-FIN death, and global rather than per-device.
 fn lan_peer_connected() -> bool {
     LAN_EVENTS_OPEN.load(Ordering::Relaxed) > 0
         || lan_seen_recently(PRESENCE_ACT_SECS)
@@ -239,10 +324,14 @@ fn lan_peer_connected() -> bool {
 /// arriving (which lan_seen_recently would miss), so the firewall treats
 /// flowing bytes as positive evidence inbound is open.
 pub(crate) fn transfer_active_recently(secs: u64) -> bool {
-    let now = now_unix();
-    let map = dl_progress().lock().unwrap();
+    let now = now_mono();
+    let map = dl_lock();
     map.iter()
-        .any(|(_, e)| e.sent < e.total && now.saturating_sub(e.last_ts) < secs)
+        .any(|(_, e)| {
+            e.sent < e.total
+                && e.last_ts != 0  // 0 = never touched (defensive; creators always touch)
+                && now.saturating_sub(e.last_ts) < secs
+        })
 }
 
 /// Log every incoming HTTP request and its source IP (key diagnostic: if a
@@ -258,7 +347,7 @@ async fn log_requests(
 ) -> Response {
     let is_lan = !peer.ip().is_loopback();
     if is_lan {
-        LAST_PHONE_ACT.store(now_unix(), Ordering::Relaxed);
+        LAST_PHONE_ACT.store(now_mono(), Ordering::Relaxed);
         note_foreign_subnet(&peer);
     }
     let method = req.method().clone();
@@ -303,7 +392,7 @@ fn note_foreign_subnet(peer: &SocketAddr) {
     }
     let key = peer.ip().to_string();
     let set = SUBNET_WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-    let mut set = set.lock().unwrap();
+    let mut set = set.lock().unwrap_or_else(|e| e.into_inner());
     if set.contains(&key) {
         return;
     }
@@ -545,11 +634,11 @@ async fn upload(Query(q): Query<UpQuery>, mut multipart: Multipart) -> impl Into
         catalog::add_remote_pending(&id, &stored, &filename, size);
         let _ = notifier().send(PushEvent::List(catalog::all_items()));
         {
-            let mut map = dl_progress().lock().unwrap();
+            let mut map = dl_lock();
             let e = map.entry(id.clone()).or_default();
             e.total = size;
             e.sent = 0;
-            e.last_ts = now_unix();
+            touch_entry(e);
         }
         // Stream the body straight to disk instead of buffering it whole in
         // memory: a phone can send multi-GB videos, and buffering those would
@@ -560,7 +649,7 @@ async fn upload(Query(q): Query<UpQuery>, mut multipart: Multipart) -> impl Into
             Err(e) => {
                 loge(&format!("upload create failed {}: {}", filename, e));
                 catalog::remove(&id);
-                dl_progress().lock().unwrap().remove(&id);
+                dl_lock().remove(&id);
                 let _ = notifier().send(PushEvent::List(catalog::all_items()));
                 return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}"))
                     .into_response();
@@ -572,11 +661,24 @@ async fn upload(Query(q): Query<UpQuery>, mut multipart: Multipart) -> impl Into
             // The PC (receiver) asked to stop this upload (/cancel): drop it as a
             // failure so the row + partial file are cleaned up below. Noticed per
             // chunk, so latency is one body chunk once the flag is set.
-            if cancelled().lock().unwrap().contains(&id) {
+            if cancel_lock().contains(&id) {
                 break Err("cancelled by peer".to_string());
             }
-            match field.next().await {
-                Some(Ok(chunk)) => {
+            // [LIVENESS/death] A peer that dies without a FIN (WiFi drop, phone
+            // crash) leaves this await pending forever — hyper has no body read
+            // timeout. Wrap each chunk in a silence timeout so the upload tears
+            // down exactly like the download side's stall auto-pause; the Err
+            // arm below then drops the pending row + partial file. This works
+            // here because the handler actively awaits the body — unlike the
+            // download body stream, which backpressure stops polling, so it
+            // needs the monitor's scan instead.
+            match tokio::time::timeout(
+                Duration::from_secs(STALL_AUTO_PAUSE_SECS),
+                field.next(),
+            )
+            .await
+            {
+                Ok(Some(Ok(chunk))) => {
                     let n = chunk.len() as u64;
                     total += n;
                     if let Err(e) = file.write_all(&chunk).await {
@@ -584,19 +686,23 @@ async fn upload(Query(q): Query<UpQuery>, mut multipart: Multipart) -> impl Into
                     }
                     // Count received bytes and push ~1/s, mirroring download
                     // progress, so the ring on both ends tracks this counter.
-                    let mut map = dl_progress().lock().unwrap();
+                    let mut map = dl_lock();
                     if let Some(e) = map.get_mut(&id) {
                         e.sent += n;
-                        e.last_ts = now_unix();
+                        touch_entry(e);
                     }
                     push_progress(&mut map, &id, now_ms(), false);
                 }
-                Some(Err(e)) => break Err(format!("read: {e}")),
-                None => {
+                Ok(Some(Err(e))) => break Err(format!("read: {e}")),
+                Ok(None) => {
                     break match file.flush().await {
                         Ok(()) => Ok(()),
                         Err(e) => Err(format!("flush: {e}")),
                     }
+                }
+                Err(_) => {
+                    logf(&format!("upload stalled {id} after {total} bytes"));
+                    break Err("peer stalled".to_string());
                 }
             }
         };
@@ -606,10 +712,10 @@ async fn upload(Query(q): Query<UpQuery>, mut multipart: Multipart) -> impl Into
                 logf(&format!("upload done: {} ({} bytes) -> inbox", filename, total));
                 // Final tick (sent == total) closes the ring on both ends.
                 {
-                    let mut map = dl_progress().lock().unwrap();
+                    let mut map = dl_lock();
                     if let Some(e) = map.get_mut(&id) {
                         e.sent = e.total.max(e.sent);
-                        e.last_ts = now_unix();
+                        touch_entry(e);
                     }
                     push_progress(&mut map, &id, now_ms(), true);
                 }
@@ -622,7 +728,7 @@ async fn upload(Query(q): Query<UpQuery>, mut multipart: Multipart) -> impl Into
                 drop(file);
                 catalog::remove(&id);
                 let _ = std::fs::remove_file(&stored);
-                dl_progress().lock().unwrap().remove(&id);
+                dl_lock().remove(&id);
                 let _ = notifier().send(PushEvent::List(catalog::all_items()));
                 logw(&format!("upload failed {} after {} bytes: {}", filename, total, e));
                 return (StatusCode::BAD_REQUEST, e).into_response();
@@ -841,24 +947,26 @@ fn mime_for(name: &str) -> String {
     m.to_string()
 }
 
-/// Drop-guard on a served download body. When hyper drops the response body
-/// before the file was fully sent, the downloading peer is gone (browser cancel,
-/// killed tab, WiFi drop) — axum surfaces a disconnect as the body being dropped,
-/// not as an error inside the stream, so a per-chunk error arm never sees it.
-/// This guard removes the shared counter and asks every client to reconcile its
-/// mirror, so a dead transfer cannot leave a corner stuck on a stale percent or
-/// a pause/cancel affordance. It only reaps its OWN stream's entry (checked via
-/// the owner token), so a Range resume that has already re-registered the id is
-/// never clobbered.
+/// [LIVENESS/death] Drop-guard on a served download body, and the only reaper
+/// of live transfer entries. When hyper drops the response body before the
+/// file was fully sent, the downloading peer is gone (browser cancel, killed
+/// tab, WiFi drop) — axum surfaces a disconnect as the body being dropped, not
+/// as an error inside the stream, so a per-chunk error arm never sees it.
+/// This guard removes the shared counter and asks every client to reconcile
+/// its mirror, so a dead transfer cannot leave a corner stuck on a stale
+/// percent or a pause/cancel affordance. It only reaps its OWN stream's entry
+/// (checked via the owner token, so a Range resume that has already
+/// re-registered the id is never clobbered), and never a paused one — pause
+/// state must survive the stream and is retired by the monitor's prune.
 struct StreamCutGuard {
     id: String,
     owner: u64,
 }
 impl Drop for StreamCutGuard {
     fn drop(&mut self) {
-        let mut map = dl_progress().lock().unwrap();
+        let mut map = dl_lock();
         let owned_incomplete = match map.get(&self.id) {
-            Some(e) => e.owner == self.owner && e.sent < e.total,
+            Some(e) => e.owner == self.owner && e.sent < e.total && !e.paused,
             None => false,
         };
         if owned_incomplete {
@@ -873,7 +981,7 @@ impl Drop for StreamCutGuard {
 /// Shared file dispatch: inline=true previews in the browser (/view), false
 /// forces a download (/dl). Looks up the message by id; only File messages can
 /// be dispatched, Text returns 400.
-async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> impl IntoResponse {
+async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: Uri) -> impl IntoResponse {
     let Some(entry) = catalog::find(&p.id) else {
         logw(&format!("serve: id {} not found", p.id));
         return (StatusCode::NOT_FOUND, "not found").into_response();
@@ -905,6 +1013,13 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
     // bytes=N- instead of re-fetching the whole file, and media previews get
     // seekable playback for free. Malformed / multi-range headers fall through
     // to a full 200 body.
+    logf(&format!(
+        "serve {} q={:?} range={:?} ua={:?}",
+        p.id,
+        uri.query(),
+        headers.get(header::RANGE).and_then(|v| v.to_str().ok()),
+        headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok())
+    ));
     let (start, end, partial) = match headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
@@ -940,8 +1055,8 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
         // Any /dl request is a fresh transfer (or an OS resume of one): clear an
         // earlier stop so it can run — a cancelled download must not silently
         // kill the next attempt at the same file.
-        cancelled().lock().unwrap().remove(id);
-        let mut map = dl_progress().lock().unwrap();
+        cancel_lock().remove(id);
+        let mut map = dl_lock();
         let fresh = {
             let e = map.entry(id.clone()).or_default();
             // A full-body (no-Range) request means "fetch the whole file from 0":
@@ -961,7 +1076,7 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
             }
             e.paused = false;
             e.total = len;
-            e.last_ts = now_unix();
+            touch_entry(e);
             // This stream now owns the entry: bump the token so an older dropped
             // stream's guard cannot reap it (see StreamCutGuard).
             e.owner = DL_OWNER_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
@@ -993,7 +1108,7 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
                 // The PC asked to stop this download (/cancel): end the stream so
                 // the receiver's in-flight download is cut (its OS then reports it
                 // interrupted) instead of being allowed to drain.
-                if cancelled().lock().unwrap().contains(&id) {
+                if cancel_lock().contains(&id) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
                         "transfer cancelled by PC",
@@ -1001,11 +1116,11 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap) -> im
                 }
                 match &chunk {
                     Ok(b) => {
-                        let mut map = dl_progress().lock().unwrap();
+                        let mut map = dl_lock();
                         if let Some(e) = map.get_mut(&id) {
                             let before = e.sent;
                             e.sent += b.len() as u64;
-                            e.last_ts = now_unix();
+                            touch_entry(e);
                             if before < e.total && e.sent >= e.total {
                                 logf(&format!("download done {id}: {} bytes", e.sent));
                             }
@@ -1106,12 +1221,12 @@ fn parse_range(range: &str, len: u64) -> Option<Result<(u64, u64), ()>> {
     Some(Ok((start, end)))
 }
 
-async fn download(q: Query<IdParam>, headers: HeaderMap) -> impl IntoResponse {
-    serve(q, false, headers).await
+async fn download(q: Query<IdParam>, headers: HeaderMap, uri: Uri) -> impl IntoResponse {
+    serve(q, false, headers, uri).await
 }
 
-async fn view(q: Query<IdParam>, headers: HeaderMap) -> impl IntoResponse {
-    serve(q, true, headers).await
+async fn view(q: Query<IdParam>, headers: HeaderMap, uri: Uri) -> impl IntoResponse {
+    serve(q, true, headers, uri).await
 }
 
 /// Wraps a download stream and logs server-side throughput when it completes.
@@ -1161,13 +1276,12 @@ where
 }
 
 /// Live transfer progress snapshot: every download the server is currently
-/// serving (or finished within the last 30s). Now only hit once on SSE connect
-/// (and on a one-shot resync after a lagged push) - steady-state progress rides
-/// /events `progress` pushes. Stale completed entries are pruned.
+/// serving (or recently finished — the monitor prunes finished entries after
+/// 15s). Now only hit once on SSE connect (and on a one-shot resync after a
+/// lagged push) - steady-state progress rides /events `progress` pushes.
+/// Pruning lives in the monitor alone, so the map has exactly one janitor.
 async fn dl_status() -> impl IntoResponse {
-    let now = now_unix();
-    let mut map = dl_progress().lock().unwrap();
-    map.retain(|_, e| !(e.sent >= e.total && now.saturating_sub(e.last_ts) > 30));
+    let map = dl_lock();
     let items: Vec<_> = map
         .iter()
         .map(|(id, e)| {
@@ -1189,11 +1303,11 @@ struct PauseParam {
 }
 
 async fn dl_pause(Query(p): Query<PauseParam>) -> impl IntoResponse {
-    let mut map = dl_progress().lock().unwrap();
+    let mut map = dl_lock();
     {
         let e = map.entry(p.id.clone()).or_default();
         e.paused = p.paused != 0;
-        e.last_ts = now_unix();
+        touch_entry(e);
     }
     // Push immediately (force, not throttled) so the downloading side
     // aborts/relaunches right away instead of waiting for the next progress tick.
@@ -1213,7 +1327,7 @@ async fn dl_pause(Query(p): Query<PauseParam>) -> impl IntoResponse {
 /// progress row vanishes. The phone POSTs this when it starts from byte 0.
 async fn dl_reset(Query(p): Query<IdParam>) -> impl IntoResponse {
     logf(&format!("dl-reset {}", p.id));
-    let mut map = dl_progress().lock().unwrap();
+    let mut map = dl_lock();
     map.insert(p.id.clone(), DlProg::default());
     // Announce the zeroed counter so the other end clears any stale row right
     // away instead of waiting for the first real chunk to tick.
@@ -1237,10 +1351,10 @@ async fn cancel(
         logw(&format!("cancel: rejected stop request from phone id={}", p.id));
         return (StatusCode::FORBIDDEN, "phone cannot stop transfers").into_response();
     }
-    cancelled().lock().unwrap().insert(p.id.clone());
+    cancel_lock().insert(p.id.clone());
     let was_pending = catalog::find(&p.id).map(|e| e.pending).unwrap_or(false);
     // Drop the shared counter so neither end keeps mirroring a dead transfer.
-    dl_progress().lock().unwrap().remove(&p.id);
+    dl_lock().remove(&p.id);
     if was_pending {
         // An incoming upload: remove the pending row and best-effort the partial
         // file. If the writer still holds the handle open (Windows), it deletes
@@ -1315,12 +1429,12 @@ async fn remove(
     // Deleting an in-flight upload's pending row directly: flag it so the upload
     // writer tears down on its next chunk and removes its own partial file.
     if entry.pending {
-        cancelled().lock().unwrap().insert(entry.id.clone());
+        cancel_lock().insert(entry.id.clone());
     }
     catalog::remove(&entry.id);
     // Drop its progress entry so no further `progress` events advertise a
     // deleted file to whichever side is still downloading it.
-    dl_progress().lock().unwrap().remove(&entry.id);
+    dl_lock().remove(&entry.id);
     logf(&format!("remove: {}", label));
     let _ = notifier().send(PushEvent::List(catalog::all_items()));
     (StatusCode::OK, "deleted").into_response()
@@ -1455,7 +1569,7 @@ async fn events(
     // own `info` replay (built after this increment) shows it as online. The
     // guard decrements when the connection (and thus this handler's stream)
     // ends. Deliberately no broadcast on open: that would double the monitor's
-    // transition report, and arrival within one 2s tick is plenty for a badge.
+    // transition report, and arrival within one 1s tick is plenty.
     let is_lan = !peer.ip().is_loopback();
     let guard = if is_lan {
         LAN_EVENTS_OPEN.fetch_add(1, Ordering::Relaxed);
@@ -1477,17 +1591,20 @@ async fn events(
             Err(_) => Event::default().event("resync").data("1"),
         })
     }));
-    // Keepalive every HEARTBEAT_SECS so an idle stream still moves bytes (a
-    // fully silent socket can otherwise be reaped by NAT/AP idle timeouts).
+    // [LIVENESS/keep-alive] Heartbeat every SSE_HEARTBEAT_SECS so an idle
+    // stream still moves bytes (NAT/AP idle timeouts cannot reap it) and the
+    // client watchdog has a clock (it declares the link dead after ~3x this
+    // of total silence — EventSource itself has no read timeout).
     Sse::new(GuardedStream { inner: Box::pin(stream), _guard: guard }).keep_alive(
         KeepAlive::new()
-            .interval(Duration::from_secs(HEARTBEAT_SECS))
+            .interval(Duration::from_secs(SSE_HEARTBEAT_SECS))
             .event(Event::default().data("{}")),
     )
 }
 
 fn list_event() -> Event {
     Event::default()
+        .retry(Duration::from_secs(1))
         .event("list")
         .json_data(catalog::all_items())
         .unwrap()
@@ -1495,6 +1612,7 @@ fn list_event() -> Event {
 
 fn fw_event() -> Event {
     Event::default()
+        .retry(Duration::from_secs(1))
         .event("fw")
         .json_data(serde_json::json!({ "needRepair": crate::firewall::need_repair() }))
         .unwrap()
@@ -1504,6 +1622,7 @@ fn info_event() -> Event {
     let (ip, port, url) = current_url();
     let online = lan_peer_connected();
     Event::default()
+        .retry(Duration::from_secs(1))
         .event("info")
         .json_data(serde_json::json!({
             "mobileConnected": online, "ip": ip, "port": port, "url": url
@@ -1543,25 +1662,26 @@ fn current_url() -> (String, u16, String) {
     (ip, port, url)
 }
 
-/// Background monitor: reports the live device-presence bit (the PC badge), plus
-/// the firewall repair flag and stale download entries, pushing /events on every
-/// change so the frontend never polls. Runs every 2s; need_repair() already
-/// throttles its powershell rule check.
+/// Background monitor: reports the live device-presence bit, the firewall
+/// repair flag and stale download entries, pushing /events on every change so
+/// the frontend never polls. Runs every 1s; need_repair() already throttles
+/// its powershell rule check.
 ///
 /// Presence is a single writer here. The monitor announces both ARRIVAL (a LAN
 /// peer holds an open /events stream, or is downloading/requesting without one)
 /// and the silent DEPARTURE (a closed stream has no event of its own); events()
 /// only maintains the stream count. There is deliberately no debounce counter:
-/// `online` is just `lan_peer_connected()` sampled now, and the two 8-second
-/// activity windows inside it already provide the hysteresis that keeps a phone
-/// whose stream briefly reconnects from flickering the badge. Presence only
-/// drives a cosmetic badge, so a genuinely absent device may read "Waiting"
-/// within one tick — honesty beats a state machine.
+/// `online` is just `lan_peer_connected()` sampled now, and the activity
+/// windows inside it (PRESENCE_ACT_SECS) already provide the hysteresis that
+/// keeps a phone whose stream briefly reconnects from flipping the presence
+/// bit. Presence drives no user-facing light (see the LIVENESS block), so a
+/// genuinely absent device may read "gone" within one tick — honesty beats a
+/// state machine.
 async fn monitor_loop() {
     let mut prev_online: Option<bool> = None;
     let mut prev_repair: Option<bool> = None;
     loop {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
         // Report transitions only, so a cold start with no device stays quiet
         // (prev_online starts None and the first false->false match announces
         // nothing) instead of manufacturing a spurious event.
@@ -1586,18 +1706,18 @@ async fn monitor_loop() {
             prev_repair = Some(repair);
             let _ = notifier().send(PushEvent::Fw(repair));
         }
-        // Prune transfers whose entries went stale: finished ones after 30s, and
-        // auto-paused (abandoned) ones nobody resumed within a minute. Broadcast
+        // Prune transfers whose entries went stale: finished ones after 15s, and
+        // auto-paused (abandoned) ones nobody resumed within 30s. Broadcast
         // `resync` when anything drops so clients reconcile their mirror corners
         // back to idle (a silent prune would otherwise leave a paused ring stuck).
-        let now = now_unix();
+        let now = now_mono();
         {
-            let mut map = dl_progress().lock().unwrap();
+            let mut map = dl_lock();
             let before = map.len();
             map.retain(|_, e| {
                 let stale = now.saturating_sub(e.last_ts);
-                !(e.sent >= e.total && stale > 30)
-                    && !(e.paused && e.sent < e.total && stale > 60)
+                !(e.sent >= e.total && stale > 15)
+                    && !(e.paused && e.sent < e.total && stale > 30)
             });
             if map.len() < before {
                 let _ = notifier().send(PushEvent::Resync);
@@ -1605,12 +1725,12 @@ async fn monitor_loop() {
         }
         // Auto-pause a download whose bytes have stopped moving: the peer died
         // or its connection went silent, so the sender should show "Paused"
-        // instead of a stuck "Transferring…". Uploads being absorbed self-clean
-        // on error, so only served downloads (non-pending files) are considered;
-        // a later resume (/dl-pause paused=0) clears the flag.
-        let stalled: Vec<String> = dl_progress()
-            .lock()
-            .unwrap()
+        // instead of a stuck "Transferring…". Uploads are NOT considered here —
+        // a stalled upload is caught by its own per-chunk timeout in upload()
+        // (which errors and self-cleans) — only served downloads (non-pending
+        // files) need the scan; a later resume (/dl-pause paused=0) clears the
+        // paused flag.
+        let stalled: Vec<String> = dl_lock()
             .iter()
             .filter(|(_, e)| {
                 e.total > 0
@@ -1625,7 +1745,7 @@ async fn monitor_loop() {
             if is_upload {
                 continue;
             }
-            let mut map = dl_progress().lock().unwrap();
+            let mut map = dl_lock();
             if let Some(e) = map.get_mut(&id) {
                 if e.total > 0
                     && e.sent < e.total
@@ -1633,7 +1753,7 @@ async fn monitor_loop() {
                     && now.saturating_sub(e.last_ts) >= STALL_AUTO_PAUSE_SECS
                 {
                     e.paused = true;
-                    e.last_ts = now;
+                    touch_entry(e);
                     logf(&format!(
                         "auto-paused stalled download {} at {}/{} bytes",
                         id, e.sent, e.total
@@ -1756,7 +1876,7 @@ fn collect_ips() -> Vec<String> {
                 out.push(v4.to_string());
             }
         }
-        let mut last = LAST_DECISION.lock().unwrap();
+        let mut last = LAST_DECISION.lock().unwrap_or_else(|e| e.into_inner());
         let signature = format!("{}|{}", out.join(","), dropped_virtual.join(","));
         if *last != signature {
             *last = signature;
@@ -1817,7 +1937,7 @@ fn collect_ips() -> Vec<String> {
     let best = ips.first().cloned().unwrap_or_default();
     let signature = format!("{best}|{alive:?}|{unprobed:?}|{dead:?}|{dropped_virtual:?}");
     {
-        let mut last = LAST_DECISION.lock().unwrap();
+        let mut last = LAST_DECISION.lock().unwrap_or_else(|e| e.into_inner());
         if *last != signature {
             let list = |v: &[Ipv4Addr]| {
                 v.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
@@ -1865,8 +1985,8 @@ fn probe_gateways(
     type ProbeCache = (u64, std::collections::HashMap<(Ipv4Addr, Ipv4Addr), bool>);
     static CACHE: OnceLock<Mutex<ProbeCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new((0, Default::default())));
-    let mut g = cache.lock().unwrap();
-    let now = now_unix();
+    let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let now = now_mono();
     if now.saturating_sub(g.0) >= 60 {
         g.0 = now;
         g.1.clear();
@@ -1949,8 +2069,8 @@ static LAST_DECISION: Mutex<String> = Mutex::new(String::new());
 
 fn adapter_facts() -> AdapterFacts {
     let cache = ADAPTER_FACTS.get_or_init(|| Mutex::new((0, Default::default())));
-    let mut g = cache.lock().unwrap();
-    let now = now_unix();
+    let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let now = now_mono();
     if now.saturating_sub(g.0) < 30 {
         return g.1.clone();
     }

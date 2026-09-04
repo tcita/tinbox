@@ -94,28 +94,6 @@
     width: 24px; height: 24px; display: flex; align-items: center; justify-content: center;
   }
   .brand-icon img { width: 20px; height: 20px; display: block; }
-  .head-center { display: flex; align-items: center; gap: 8px; flex: 1; margin-left: 4px; }
-  
-  .badge {
-    font-size: 11.5px; font-weight: 500; color: var(--sub);
-    padding: 3.5px 9px; border-radius: 999px; background: color-mix(in srgb, var(--card) 60%, transparent);
-    border: 1px solid var(--line);
-    display: inline-flex; align-items: center; gap: 6px; white-space: nowrap;
-    transition: all 0.3s var(--ease-out);
-  }
-  #dot {
-    width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none;
-    box-shadow: 0 0 0 0 var(--ok-glow);
-    animation: pulse 2s infinite;
-  }
-  @keyframes pulse {
-    0% { box-shadow: 0 0 0 0 var(--ok-glow); }
-    70% { box-shadow: 0 0 0 5px rgba(52, 199, 89, 0); }
-    100% { box-shadow: 0 0 0 0 rgba(52, 199, 89, 0); }
-  }
-  .badge.off #dot { background: var(--danger); animation: none; box-shadow: none; }
-  .badge.wait #dot { background: var(--sub); animation: none; box-shadow: none; }
-
   .head-actions { display: flex; align-items: center; gap: 10px; }
 
   #inboxBtn {
@@ -182,16 +160,6 @@
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   }
   .ql-hint { font-size: 11.5px; color: var(--sub); margin-top: 10px; }
-
-  /* Disconnect banner */
-  #offBanner {
-    flex: none; display: none; padding: 8px 16px; font-size: 12px; font-weight: 500;
-    text-align: center; background: #d93829; color: #ffffff;
-    box-shadow: 0 2px 8px rgba(217, 56, 41, 0.25);
-    animation: slideDown 0.3s var(--ease-out);
-  }
-  #offBanner.show { display: block; }
-  @keyframes slideDown { from { transform: translateY(-100%); } to { transform: translateY(0); } }
 
   /* Chat Area */
   #chat {
@@ -268,9 +236,8 @@
     border-radius: 12px; transition: transform 0.15s ease;
   }
   .file-card:active { transform: scale(0.98); }
-  /* Corner transfer button: download (phone idle) / pause / resume. Independent
-     of the card click (which only opens); it also drives cross-device pause on
-     the PC while the phone is downloading. */
+  /* Corner transfer button: the phone's permanent Download button — it never
+     yields to a transfer ring (downloads are the browser's business). */
   .dlcardbtn {
     position: absolute; top: 8px; right: 8px; z-index: 3;
     width: 30px; height: 30px; border-radius: 50%; border: none; cursor: pointer;
@@ -579,9 +546,6 @@
     <span class="brand-icon"><img src="/logo" alt="tinbox"></span>
     <span>tinbox</span>
   </div>
-  <div class="head-center">
-    <span class="badge" id="badge"><i id="dot"></i><span id="badgeTxt">Connected</span></span>
-  </div>
   <div class="head-actions">
     <button id="inboxBtn" title="Open inbox folder">
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
@@ -595,8 +559,6 @@
 <!-- Address strip: separate from the QR tile so the two don't crowd each
      other; shows the address for manual entry when scanning fails -->
 <div class="addrbar" id="addrbar"><span id="qrUrl">…</span></div>
-
-<div id="offBanner">⚠️ Connection lost · Reconnecting…</div>
 
 <div id="chat">
   <div class="empty" id="empty">
@@ -699,7 +661,6 @@ const $ = id => document.getElementById(id);
 
 const isPC = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
 const me = isPC ? 'pc' : 'phone';
-let busy = false;
 // The phone's in-flight upload, if any (downloads are native and out of reach).
 // Uploads are the one transfer the page actually drives, so holding the XHR lets
 // the sending phone cancel its own upload from the corner ring's ✕.
@@ -807,13 +768,11 @@ async function copyText(it){
   try { await navigator.clipboard.writeText(it.text); toast('Copied to clipboard'); }
   catch { toast('Copy failed'); }
 }
+// No confirmation dialog: window.confirm is broken inside the Tauri WebView
+// (no dialog plugin -> it resolves to a rejected Promise, which is truthy, so
+// the old guard never blocked anything anyway). Delete is a deliberate
+// context-menu action; the toast reports the outcome.
 async function delItem(it){
-  const msgtxt = it.kind === 'text'
-    ? 'Delete this message?'
-    : (it.source_kind === 'local'
-        ? 'Remove "'+it.name+'" from list? (Original file on your PC is kept)'
-        : 'Delete "'+it.name+'"? Its copy in the Inbox folder will be removed from disk.');
-  if(!confirm(msgtxt)) return;
   const res = await fetch('/rm?id='+encodeURIComponent(it.id), {method:'POST'});
   if(res.ok) toast(it.kind === 'text' ? 'Deleted' : 'Deleted from Inbox');
   else toast('Delete failed');
@@ -871,7 +830,6 @@ function pruneTransfers(items){
   const ids = new Set(items.map(i => i.id));
   for(const key of Object.keys(dlInFlight))  if(!ids.has(key)) delete dlInFlight[key];
   for(const key of Object.keys(serverPaused)) if(!ids.has(key)) delete serverPaused[key];
-  for(const key of Object.keys(nativeDl))     if(!ids.has(key)) delete nativeDl[key];
   for(const key of Object.keys(progCache))    if(!ids.has(key)) delete progCache[key];
   for(const key of Object.keys(doneIds))      if(!ids.has(key)) delete doneIds[key];
   for(const key of Object.keys(hideTimers))   if(!ids.has(key)){ clearTimeout(hideTimers[key]); delete hideTimers[key]; }
@@ -964,11 +922,11 @@ function render(items){
       }
       card.appendChild(info);
 
-      // Phone file cards get a persistent Download button (tap hands the file to
-      // the browser's own downloader). The PC has no per-file button. The same
-      // corner also hosts the transfer ring while a file moves in EITHER
-      // direction: idle it is the Download button, moving it is the ring (which,
-      // when a download is paused by the stall-watchdog, taps to retry).
+      // Phone file cards get a permanent Download button (tap hands the file to
+      // the browser's own downloader, which owns progress and cancel — the page
+      // keeps no download state, see the corner block). The PC has no per-file
+      // button. The same corner hosts the transfer ring where this end mirrors
+      // a transfer (PC: everything it hosts; phone: its own uploads).
       const btn = document.createElement('button');
       btn.className = 'dlcardbtn hidden';
       btn.type = 'button';
@@ -1024,12 +982,12 @@ async function openDefault(it){
 
 // Downloads are NATIVE-ONLY: every file is handed to the browser's own
 // downloader (it writes to real disk and shows its own progress). The in-app
-// ring below is a MIRROR of the server's transmitted-byte counter, drawn on both
-// ends for BOTH directions so an upload and a download read the same. There is
-// no JS chunk/OPFS downloader anymore — that engine was removed.
+// ring below is a MIRROR of the server's transmitted-byte counter, drawn on the
+// PC for BOTH directions and on the phone for uploads only (see the corner
+// block below for the split). There is no JS chunk/OPFS downloader anymore —
+// that engine was removed.
 // Delivery record: file id -> unix seconds when a phone last pulled it (PC
 // side only, survives reloads). Rendered as "已下载到手机 HH:MM" on the card.
-const lastTap = {};  // id -> last Download tap time (debounce double taps)
 const delivered = loadDelivered();
 function loadDelivered(){
   try { return JSON.parse(localStorage.getItem('tinbox.delivered') || '{}'); } catch { return {}; }
@@ -1063,37 +1021,37 @@ function withOptimistic(serverItems){
 function clearOptUploads(){ optUploads.length = 0; reapply(); }
 
 // ---- Corner transfer ring ----------------------------------------------
-// Every file card carries a small circle in its top-right corner. When nothing
-// is moving it is the phone's Download button; the instant a file transfers in
-// EITHER direction the same circle becomes a progress ring fed by the server's
-// ~1/s transmitted-byte counter (`progress` events). Uploads and downloads
-// therefore read identically on both devices — there is no direction
-// special-casing here, and no JS downloader left to count bytes with.
+// Every file card carries a small circle in its top-right corner, and WHO it
+// serves follows ownership of the bytes:
+//   PC        — mirrors every transfer the machine hosts (uploads arriving,
+//               downloads phones pull): the ring rides the server's ~1/s
+//               transmitted-byte counter (`progress` events) and its ✕ is the
+//               only stop control.
+//   Phone     — uploads only: those bytes belong to the page's own XHR and the
+//               pending row's lifecycle is list-driven, so a ring cannot freeze
+//               on a dead transfer. Phone DOWNLOADS are delegated wholesale to
+//               the browser's native downloader — which has its own progress
+//               and cancel UI — so the page keeps NO download state: the
+//               Download button is permanent, every tap starts a fresh full
+//               download, and there is no mirror to go stale.
 const progCache = {};   // id -> {sent,total,paused,t} latest server snapshot
-const nativeDl = {};    // id -> start time of a phone's native downloader (OS owns the bytes)
 const doneIds = {};     // transfers already flashed complete -> corner stays idle
 const hideTimers = {};  // per-id "hide the finished ring" timers
 function itemById(id){ for(const it of curItems) if(it.id === id) return it; return null; }
 
 // The paused flag lives server-side (either end or the stall-watchdog sets it)
-// and rides each `progress` push; dlInFlight mirrors "the server is serving this
-// download right now" so a tap never doubles a transfer.
+// and rides each `progress` push; dlInFlight mirrors "the server is serving
+// this download right now" so the PC's ring can tell a live pull from a dead
+// one (and reconcile it away).
 const serverPaused = {};
 const dlInFlight = {};
 const BTN_DL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
 
-// How recent a server counter must be to still count as an active transfer. The
-// server pushes ~1/s while bytes flow; this window is kept wider than the
-// server's 6s stall auto-pause so a stalling download does not drop its ring
-// and then pop back as "paused" a moment later.
+// How recent a server counter must be for the PC's download ring to stay up.
+// The server pushes ~1/s while bytes flow; this window is kept wider than the
+// stall auto-pause so a stalling download fades into its paused state instead
+// of dropping and popping back a moment later.
 const RING_LIVE_MS = 8000;
-
-// How long a just-tapped native download may live in the mirror before the
-// server registers it in /dl-status. If the id is still absent after this, the
-// transfer is dead (cancelled/aborted in the browser), so the corner should fall
-// back to the Download button rather than idle on a dark 0% ring until
-// RING_LIVE_MS elapses.
-const NATIVE_REGISTER_GRACE_MS = 1500;
 
 // What a card's corner should show right now:
 //   null -> idle (no transfer) — the Download button may show instead
@@ -1113,13 +1071,12 @@ function cornerState(id){
              paused: false,
              done: !!(prog && total > 0 && prog.sent >= total) };
   }
-  // Ready file being pulled by a phone: live while this device handed it to the
-  // native downloader (but only while that is still recent — if the PC cuts the
-  // stream, pushes stop and the mirror ring must fade instead of sticking on a
-  // stale percent), while the counter is fresh, or while the stall-watchdog
-  // paused it (a frozen ring the user can tap to retry).
-  const nativeAge = nativeDl[id] ? Date.now() - nativeDl[id] : Infinity;
-  if(serverPaused[id] || nativeAge < RING_LIVE_MS || (prog && Date.now() - prog.t < RING_LIVE_MS)){
+  // Ready file being pulled by a phone: PC-only mirror (the host's window is
+  // where the pull is watched and stopped). Live while the counter is fresh or
+  // while the stall-watchdog paused it (a frozen ring the host can ✕ away or
+  // that the prune will reap).
+  if(!isPC) return null;
+  if(serverPaused[id] || (prog && Date.now() - prog.t < RING_LIVE_MS)){
     if(!prog || !(prog.total > 0)){
       return { pct: 0, paused: !!serverPaused[id], done: false }; // started, no count yet
     }
@@ -1130,9 +1087,10 @@ function cornerState(id){
   return null;
 }
 
-// Paint one card's corner: the ring while a transfer is live, the Download
-// button when it is idle. Called after every render (cards were rebuilt) and on
-// every `progress` tick; idle cards early-return so cost scales with activity.
+// Paint one card's corner: the ring while a transfer this end mirrors is live,
+// the Download button otherwise. Called after every render (cards were rebuilt)
+// and on every `progress` tick; idle cards early-return so cost scales with
+// activity.
 function paintCorner(id){
   const card = document.querySelector('.msg[data-id="'+id+'"] .file-card');
   if(!card) return;
@@ -1147,7 +1105,8 @@ function paintCorner(id){
     ring.classList.remove('show', 'paused');
     card.classList.remove('transferring');
     if(!card.dataset.pending && !isPC){
-      // Idle + downloadable on the phone: back to the Download button.
+      // The phone's Download button is permanent — it never yields the corner
+      // to a download ring, because the page mirrors no download state.
       btn.classList.remove('hidden');
       btn.innerHTML = BTN_DL;
       btn.title = 'Download';
@@ -1164,15 +1123,13 @@ function paintCorner(id){
   ring.classList.toggle('paused', !!st.paused);
   ring.classList.add('show');
   ring.style.setProperty('--p', Math.max(0, Math.min(100, st.pct)));
-  // The corner is the stop control wherever THIS device can actually stop the
+  // The corner shows ✕ wherever the device can meaningfully act on the
   // transfer: the PC can cut anything it hosts (an upload it is receiving, or a
-  // download a phone is pulling) and the phone can stop its own upload. There
-  // the center shows ✕; elsewhere it shows the percent (or Ⅱ while a download is
-  // paused for retry — native browser downloads themselves can't be stopped from
-  // the page, so the phone shows no ✕ for those).
+  // download a phone is pulling — paused or not), the phone can abort its own
+  // upload. Phone downloads have no ring at all (see the corner block).
   const stopping = isPC || (!isPC && isMyUpload(itemById(id)));
   const txt = ring.querySelector('.cr-txt');
-  txt.textContent = stopping ? '✕' : (st.paused ? 'Ⅱ' : Math.round(st.pct) + '%');
+  txt.textContent = stopping ? '✕' : Math.round(st.pct) + '%';
   txt.classList.toggle('cancel', !!stopping);
 
   if(!st.done && hideTimers[id]){ clearTimeout(hideTimers[id]); hideTimers[id] = null; }
@@ -1191,14 +1148,12 @@ function repaintTransfers(){
   }
 }
 
-// Corner-button / ring action: start a download (phone idle), or retry one the
-// stall-watchdog paused (the frozen ring doubles as a retry button). An active
-// pull is guarded so a tap never starts a second transfer.
+// Corner-button action (phone): hand the file to the browser's native
+// downloader, every time. No guards and no mirror — an in-flight pull is the
+// browser's business (its own UI shows progress and cancel), and a second tap
+// simply starts another download; where Chrome cares it asks "download again?".
 function transferClick(it){
   if(it.pending) return;                 // still uploading, nothing to act on
-  const id = it.id;
-  if(dlInFlight[id] && !serverPaused[id]) return;  // an active pull is running
-  if(Date.now() - (lastTap[id] || 0) < 1200) return; // debounce double taps
   downloadFile(it);
 }
 
@@ -1223,21 +1178,25 @@ function cancelUpload(){
 // so the ring vanishes right away.
 async function stopTransfer(id){
   try { await fetch('/cancel?id='+encodeURIComponent(id), {method:'POST'}); } catch {}
+  clearMirror(id);
+}
+// Drop this end's mirror of one transfer (counter, paused flag, flash timers).
+// The PC is the only mirror-keeper left: a stalled phone-side download holds no
+// page state to clear (see the corner block).
+function clearMirror(id){
   delete progCache[id];
   delete serverPaused[id];
-  delete nativeDl[id];
   delete dlInFlight[id];
   delete doneIds[id];
   if(hideTimers[id]){ clearTimeout(hideTimers[id]); hideTimers[id] = null; }
   paintCorner(id);
 }
-// Corner-ring tap dispatcher: whichever transfer THIS device can stop gets the
-// ✕ — the PC cuts what it hosts, the phone aborts its own upload. Everything
-// else falls through to the download/retry logic.
+// Corner-ring tap dispatcher: ✕ belongs to whoever can act on the transfer —
+// the PC cuts what it hosts, the phone aborts its own upload. Phone downloads
+// have no ring; their lifecycle is the browser's.
 function ringTap(it){
   if(isPC){ stopTransfer(it.id); return; }
   if(isMyUpload(it)){ cancelUpload(); return; }
-  transferClick(it);
 }
 // The PC can stop this phone's upload (see /cancel). Watch the server list: once
 // our pending row has been seen, its disappearance means the other end revoked
@@ -1282,35 +1241,28 @@ function downloadFile(it){
   nativeDownload(it);
 }
 
-// Native download: the page cannot count the browser's bytes, so the ring shown
-// here is fed by the server's transmitted-byte counter over SSE. A full-body GET
-// restarts that counter (see serve()), so no /dl-reset round-trip is needed.
+// Native download: hand the file to the browser's own downloader — it owns
+// progress, cancel and error UI, so the page keeps no state at all. Every tap
+// is a fresh full GET; the server's transmitted-byte counter (which still
+// feeds the PC's ring) resets itself via the fresh branch in serve().
 function nativeDownload(it){
-  // Fresh start: drop leftover ring state from any earlier transfer of this file
-  // so the ring opens at 0%, not at an old full/partial counter.
-  delete progCache[it.id];
-  delete doneIds[it.id];
-  if(hideTimers[it.id]){ clearTimeout(hideTimers[it.id]); hideTimers[it.id] = null; }
-  nativeDl[it.id] = Date.now();
-  lastTap[it.id] = Date.now();
-  const a = document.createElement('a');
-  a.href = '/dl?id='+encodeURIComponent(it.id);
-  a.download = it.name;
-  document.body.appendChild(a); a.click(); a.remove();
-  paintCorner(it.id);   // corner opens at 0% now; the first progress tick fills it
+  const f = document.createElement('iframe');
+  f.className = 'dlframe';
+  f.style.display = 'none';
+  f.src = '/dl?id='+encodeURIComponent(it.id)+'&r='+Date.now();
+  document.body.appendChild(f);
 }
 
 // Transfer snapshots arrive as `progress` SSE events (~1/s per transfer) and a
-// one-shot /dl-status resync on connect. They drive the corner ring for every
-// transfer in BOTH directions: downloads are native (the page cannot count the
-// browser's bytes, so the server's transmitted counter is the only source) and
-// uploads are counted by the server as it writes them. There is no JS downloader
-// left to mirror a pause onto.
+// one-shot /dl-status resync on connect. The PC mirrors every entry; the phone
+// mirrors only its own uploads (downloads are the browser's business — see the
+// corner block), so download pushes are skipped there entirely.
 function syncProgress(list){
   const now = Date.now();
   for(const d of list){
-    const prev = progCache[d.id];
     const item = itemById(d.id);
+    if(!isPC && !(item && item.pending && item.from === 'phone')) continue;
+    const prev = progCache[d.id];
     // First sight of a completed counter (the /dl-status resync on connect, or a
     // file too small to ever have ticked partial) is a finished transfer — do not
     // flash a full ring for it.
@@ -1322,8 +1274,6 @@ function syncProgress(list){
       if(hideTimers[d.id]){ clearTimeout(hideTimers[d.id]); hideTimers[d.id] = null; }
     }
     progCache[d.id] = { sent: d.sent, total: d.total, paused: d.paused, t: now };
-    // The OS finished receiving a native download the server has fully sent.
-    if(d.total > 0 && d.sent >= d.total) delete nativeDl[d.id];
     if(d.sent < d.total) dlInFlight[d.id] = true; else delete dlInFlight[d.id];
     serverPaused[d.id] = d.paused;
     // A download just crossed the finish line -> record the delivery marker.
@@ -1349,47 +1299,22 @@ async function resyncProgress(){
 }
 function reconcileMirrors(snap){
   const known = new Set(snap.map(d => d.id));
-  const now = Date.now();
   for(const id of Object.keys(dlInFlight))   if(!known.has(id)) delete dlInFlight[id];
   for(const id of Object.keys(serverPaused)) if(!known.has(id)) delete serverPaused[id];
   for(const id of Object.keys(progCache))    if(!known.has(id) && !doneIds[id]) delete progCache[id];
-  // A phone tap that just landed may not have registered server-side yet; keep
-  // its corner live for a short window rather than dropping it mid-start. Once
-  // that window passes with the id still absent, the transfer is dead — drop it
-  // so the corner returns to the Download button instead of idling on a dark 0%
-  // ring until RING_LIVE_MS elapses.
-  for(const id of Object.keys(nativeDl)) if(!known.has(id) && now - nativeDl[id] > NATIVE_REGISTER_GRACE_MS) delete nativeDl[id];
 }
-
-// Phone-only self-heal for the corner ring. The mirror is normally fed by SSE
-// `progress` pushes, but a phone whose browser throttles/freezes the EventSource
-// while it runs a native download stops receiving pushes, so the ring would sit
-// at its last value (often 0%) forever. While the phone holds any live transfer
-// state, re-pull /dl-status every 2s so the ring tracks the server's real counter
-// and reconciles away transfers the server already dropped. The PC never does
-// this: its SSE rides loopback and is reliable (it still reconciles on every
-// `resync` the server sends, and on (re)connect).
-setInterval(() => {
-  if(isPC) return;
-  if(!Object.keys(dlInFlight).length && !Object.keys(nativeDl).length
-     && !Object.keys(serverPaused).length
-     && !Object.values(progCache).some(p => p.sent < p.total)) return;
-  resyncProgress();
-}, 2000);
 
 function sendText(){
   const t = $('txt');
   const text = t.value.trim();
-  if(!text || busy) return;
-  busy = true;
+  if(!text) return;
   fetch('/send-text', {
     method: 'POST', headers: {'Content-Type':'application/json'},
     body: JSON.stringify({ text })
   }).then(r => {
-    busy = false;
     if(r.ok){ t.value = ''; autoSize(); updateSendBtn(); }
     else toast('Send failed');
-  }).catch(() => { busy = false; toast('Network error'); });
+  }).catch(() => toast('Network error'));
 }
 
 function autoSize(){
@@ -1402,8 +1327,7 @@ function updateSendBtn(){
 }
 
 function uploadFiles(files){
-  if(!files.length || busy) return;
-  busy = true;
+  if(!files.length) return;
   const f0 = files[0];
   // Draw the sending side's card immediately ("Uploading…") before the server
   // round-trips; withOptimistic() replaces it with the server's pending row as
@@ -1420,7 +1344,6 @@ function uploadFiles(files){
   currentUpload = { xhr, name: f0.name, size: f0.size || 0, seen: false, stoppedByPeer: false };
   reapply();
   const finish = (msg) => {
-    busy = false;
     if(currentUpload && currentUpload.xhr === xhr) currentUpload = null;
     clearOptUploads();
     if(msg) toast(msg);
@@ -1441,10 +1364,20 @@ $('inboxBtn').onclick = () => {
   fetch('/open-dir', {method:'POST'}).catch(()=>toast('Could not open inbox'));
 };
 
+// iOS quirk (observed on both Safari and Chrome via log traces): the OS picker
+// service intermittently drops the presentation — showPicker()/click() are
+// accepted without error, but no sheet appears and no change/cancel event ever
+// fires. The next tap presents normally; nothing page-side can detect or fix
+// the dropped one.
 $('plus').onclick = () => {
   if(isPC){ pickLocal(); return; }
-  $('fileInput').click();
+  try { $('fileInput').showPicker(); }
+  catch { $('fileInput').click(); }
 };
+$('fileInput').addEventListener('change', e => {
+  if(e.target.files.length) uploadFiles([...e.target.files]);
+  e.target.value = '';
+});
 
 // Send real PC paths to /add-local (the plus button and PC drag-and-drop; the
 // webview exposes the dropped file's path via the non-standard File.path). The
@@ -1495,10 +1428,6 @@ async function pickLocal(){
     toast('Add failed');
   }
 }
-$('fileInput').addEventListener('change', e => {
-  if(e.target.files.length) uploadFiles([...e.target.files]);
-  e.target.value = '';
-});
 
 // Drag and drop overlay
 let dragCounter = 0;
@@ -1536,48 +1465,26 @@ window.addEventListener('drop', e => {
   uploadFiles(files);
 });
 
-// PC gate state: two SEPARATE facts, both fed by the same discrete `info`
-// events but never sharing one sampler:
-//  - everConnected: the gate. Has a device EVER connected this session? Latches
-//    true on the first `online` and never resets, so the full-screen scan gate
-//    shows only before the first device (adding a later device is the header QR
-//    job, not a re-shown gate).
-//  - deviceOnline : the badge. Is a device connected RIGHT NOW? Follows the
-//    online/offline events live.
+// PC scan gate: shows full-screen until the FIRST LAN device connects this
+// session (`everConnected` latches on the first `info` online and never
+// resets), so it appears only before the first device — adding a later device
+// is the header QR's job, not a re-shown gate.
+//
+// There is deliberately NO ambient link/connection light on either side. A
+// status derived from heartbeat absence always lags reality by its detection
+// window, in both directions ("why still green / why still red"), and an
+// unreliable reference is worse than none. All connectivity feedback is
+// therefore action-coupled: a send/download either succeeds or fails loudly in
+// the moment. The SSE channel below still reconnects + replays state
+// invisibly; it just never paints.
 let everConnected = false;
-let deviceOnline = false;
 let gateDismissed = false;
-// Connection light (phone only): simply mirrors whether the SSE /events link is
-// up. No timers — EventSource fires `error` when it loses (or cannot reach) the
-// link and `open` on every (re)connect, and it reconnects on its own. A link
-// that dies silently (half-open TCP) shows stale here, but every real action
-// then fails loudly, which is how the user actually notices.
-let linkUp = true;
-function setLink(up){
-  if(linkUp === up) return;
-  linkUp = up;
-  $('offBanner').classList.toggle('show', !up);
-  if(isPC) return; // PC badge reflects device presence only, driven by `info`
-  $('badge').classList.toggle('off', !up);
-  $('badgeTxt').textContent = up ? 'Connected' : 'Disconnected';
-}
-// Device presence update (PC only). The server emits two discrete events:
-// `info`{mobileConnected:true} the instant a LAN device's /events stream opens,
-// and {mobileConnected:false} once the last one has been gone for the debounce
-// window. They feed the two facts above:
-//   everConnected -> scan gate (latched once, never unlatched);
-//   deviceOnline  -> badge (follows each event live).
-// Keeping them apart means a reconnect is just another `online` event — the gate
-// cannot get stuck on a stale "offline" snapshot taken at page load.
 function applyInfo(d){
   if(!isPC || !d) return;
   const online = !!d.mobileConnected;
   if(online && !everConnected) toast('Device connected');
   if(online) everConnected = true;
-  deviceOnline = online;
   $('gate').classList.toggle('show', !everConnected && !gateDismissed);
-  $('badge').classList.toggle('wait', !deviceOnline);
-  $('badgeTxt').textContent = deviceOnline ? 'Connected' : 'Waiting for device';
   if(d.url){
     $('qrUrl').textContent = d.url;
     $('gateUrl').querySelector('span').textContent = d.url;
@@ -1586,33 +1493,64 @@ function applyInfo(d){
 }
 
 // Single SSE push channel: named events carry the actual state, so the page
-// polls no state endpoints. On open the server replays list/fw/info and we
-// additionally pull /list and /dl-status once to cover the replay race.
-const es = new EventSource('/events');
-// The connection light is driven purely by EventSource state: `open` = up,
-// `error` = lost or unreachable (EventSource keeps retrying on its own and
-// fires `open` again on each successful reconnect). The server's keepalives
-// keep the socket from being silently reaped while backgrounded; no client-side
-// timer remains.
-es.onopen = () => { setLink(true); refresh(); resyncProgress(); };
-es.onerror = () => setLink(false);
-es.addEventListener('list', e => { applyList(JSON.parse(e.data)); });
-es.addEventListener('progress', e => { syncProgress([JSON.parse(e.data)]); });
-// A `resync` means this client fell behind and may have dropped pushes (the
-// server broadcasts it on lag and on transfers that end without a list change).
-// Re-fetch BOTH the file list and the transfer mirrors so nothing stays stale.
-es.addEventListener('resync', () => { refresh(); resyncProgress(); });
-es.addEventListener('fw', e => { applyFw(JSON.parse(e.data).needRepair); });
-es.addEventListener('info', e => { applyInfo(JSON.parse(e.data)); });
+// polls no state endpoints. On open the server replays list/fw/info (each
+// carrying a 1s retry hint) and we additionally pull /list and /dl-status once
+// to cover the replay race. This channel is pure transport maintenance: it
+// reconnects, replays state and reconciles, but never paints any link UI (see
+// the scan-gate comment above) — connectivity is judged by actions.
+let es;
+// Last time ANY SSE event arrived, heartbeats included. EventSource has no
+// read timeout, so a server that dies without a FIN (PC asleep, hard crash)
+// never fires `error`; the watchdog below uses heartbeat silence to force a
+// fresh connection instead of trusting a half-open socket forever.
+let lastSeen = 0;
+// True while the channel is visibly failing (EventSource retrying on its own
+// after an `error`); the watchdog then stands down — a retry loop is already
+// probing, so closing/reopening would only double the churn.
+let esDown = false;
+function connect(){
+  es = new EventSource('/events');
+  es.onopen = () => { esDown = false; lastSeen = Date.now(); reconcile(); };
+  es.onerror = () => { esDown = true; };
+  // The server heartbeats as unnamed `message` events (see /events keep_alive);
+  // this is the only hook that sees them.
+  es.onmessage = () => { lastSeen = Date.now(); };
+  es.addEventListener('list', e => { applyList(JSON.parse(e.data)); });
+  es.addEventListener('progress', e => { syncProgress([JSON.parse(e.data)]); });
+  // A `resync` means this client fell behind and may have dropped pushes (see
+  // PushEvent::Resync for the full trigger list). Re-fetch BOTH the file list
+  // and the transfer mirrors so nothing stays stale.
+  es.addEventListener('resync', () => { reconcile(); });
+  es.addEventListener('fw', e => { applyFw(JSON.parse(e.data).needRepair); });
+  es.addEventListener('info', e => { applyInfo(JSON.parse(e.data)); });
+}
+connect();
+
+// One reconcile pass: everything that can fall behind re-pulls both mirrors.
+// Driven by the `resync` event, a (re)connect and a return to the foreground —
+// never by per-state timers.
+function reconcile(){
+  refresh();
+  resyncProgress();
+}
+
+// Watchdog: the server heartbeats every 1s, so >3s of total silence with the
+// channel NOT already failing means the socket is half-open — EventSource will
+// never notice on its own. Force a fresh connection; its `open` replays state.
+setInterval(() => {
+  if(superseded) return;
+  if(!esDown && lastSeen && Date.now() - lastSeen > 3000){
+    lastSeen = Date.now();
+    try { es.close(); } catch {}
+    connect();
+  }
+}, 1000);
 
 // A backgrounded phone/browser can have its EventSource suspended (Chrome keeps
 // it "open" but delivers nothing), so on return to the foreground there is no
-// new SSE event to nudge a refresh. Re-fetch the list + transfer mirrors here.
+// new SSE event to nudge a refresh. Reconcile here.
 document.addEventListener('visibilitychange', () => {
-  if(document.visibilityState === 'visible'){
-    refresh();
-    resyncProgress();
-  }
+  if(document.visibilityState === 'visible') reconcile();
 });
 
 let fwWasShown = false;
@@ -1674,10 +1612,9 @@ $('qrBox').onclick = openQrLightbox;
 $('qrLightbox').onclick = closeQrLightbox;
 
 if(isPC){
-  // User dismissed the gate to browse the inbox without a device connected;
-  // a real connection resets it so a later drop re-shows the scan screen.
-  // Everything else (badge, gate visibility, connection toast) comes from the
-  // SSE `info` events handled by applyInfo().
+  // The gate hides either when the user browses without a device
+  // (gateDismissed) or once the first device connects (everConnected latches
+  // inside applyInfo); it never comes back after that.
   $('gate').classList.add('show');
   $('gateInbox').onclick = () => { gateDismissed = true; $('gate').classList.remove('show'); };
 }

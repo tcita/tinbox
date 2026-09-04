@@ -162,6 +162,16 @@ pub fn catalog() -> &'static Arc<Mutex<Vec<Entry>>> {
     CATALOG.get_or_init(|| Arc::new(Mutex::new(Vec::new())))
 }
 
+/// Poison-safe lock for the catalog. A handler that panics while holding this
+/// lock poisons the Mutex, after which every unwrap() would panic in turn and
+/// take down every list/upload/delete/reference handler. Entries are plain
+/// rows with no cross-field invariants, so recovering the guard is safe: the
+/// partial write is a missing or stale row at worst, healed by the next save
+/// or list push.
+fn cat_lock() -> std::sync::MutexGuard<'static, Vec<Entry>> {
+    catalog().lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Convert a legacy entry (top-level source/size/name/mtime, no body/from) to
 /// a new-format Entry. Local -> from="pc", Remote -> from="phone"; ts takes the
 /// legacy mtime.
@@ -192,7 +202,7 @@ fn migrate_old_entry(v: &serde_json::Value) -> Option<Entry> {
 }
 
 pub fn load() {
-    let mut v = catalog().lock().unwrap();
+    let mut v = cat_lock();
     v.clear();
     match std::fs::read_to_string(catalog_path()) {
         Ok(txt) => match serde_json::from_str::<Vec<serde_json::Value>>(&txt) {
@@ -227,7 +237,7 @@ pub fn load() {
 }
 
 pub fn save() {
-    let v = catalog().lock().unwrap();
+    let v = cat_lock();
     match serde_json::to_string_pretty(&*v) {
         Ok(json) => {
             if let Err(e) = std::fs::write(catalog_path(), json) {
@@ -275,7 +285,7 @@ pub fn add_remote(from: &str, id: &str, inbox_path: &Path, display_name: &str) -
         },
         pending: false,
     };
-    let mut v = catalog().lock().unwrap();
+    let mut v = cat_lock();
     v.push(entry.clone());
     drop(v);
     save();
@@ -300,7 +310,7 @@ pub fn add_remote_pending(id: &str, inbox_path: &Path, display_name: &str, size:
         },
         pending: true,
     };
-    let mut v = catalog().lock().unwrap();
+    let mut v = cat_lock();
     v.push(entry.clone());
     drop(v);
     save();
@@ -311,7 +321,7 @@ pub fn add_remote_pending(id: &str, inbox_path: &Path, display_name: &str, size:
 /// clears the flag and fixes `size` to the actual on-disk length. No-op (false)
 /// if the id is gone or not a pending remote file.
 pub fn mark_remote_ready(id: &str) -> bool {
-    let mut v = catalog().lock().unwrap();
+    let mut v = cat_lock();
     let Some(e) = v.iter_mut().find(|e| e.id == id) else {
         return false;
     };
@@ -332,7 +342,7 @@ pub fn mark_remote_ready(id: &str) -> bool {
 /// Drop catalog entries left pending by a crashed/interrupted upload and delete
 /// their partial files. Called once at startup.
 pub fn purge_pending() {
-    let mut v = catalog().lock().unwrap();
+    let mut v = cat_lock();
     let before = v.len();
     v.retain(|e| {
         if e.pending {
@@ -367,7 +377,7 @@ pub fn add_text(from: &str, text: &str) -> Entry {
         },
         pending: false,
     };
-    let mut v = catalog().lock().unwrap();
+    let mut v = cat_lock();
     v.push(entry.clone());
     drop(v);
     save();
@@ -375,14 +385,14 @@ pub fn add_text(from: &str, text: &str) -> Entry {
 }
 
 pub fn find(id: &str) -> Option<Entry> {
-    catalog().lock().unwrap().iter().find(|e| e.id == id).cloned()
+    cat_lock().iter().find(|e| e.id == id).cloned()
 }
 
 /// Remove an entry from the index by id (does not touch the physical file).
 /// Returns the removed entry; the caller decides whether to delete the file on
 /// disk.
 pub fn remove(id: &str) -> Option<Entry> {
-    let mut v = catalog().lock().unwrap();
+    let mut v = cat_lock();
     if let Some(pos) = v.iter().position(|e| e.id == id) {
         let e = v.remove(pos);
         drop(v);
@@ -395,7 +405,7 @@ pub fn remove(id: &str) -> Option<Entry> {
 
 /// Message list sorted by ts ascending (timeline order).
 pub fn all_items() -> Vec<MsgItem> {
-    let mut v = catalog().lock().unwrap();
+    let mut v = cat_lock();
     v.sort_by(|a, b| a.ts.cmp(&b.ts));
     v.iter().map(|e| e.to_item()).collect()
 }

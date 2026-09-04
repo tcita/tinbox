@@ -21,7 +21,12 @@ fn write_line(line: &str) {
         chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
         line
     );
-    let _g = F.lock().unwrap();
+    // Poison-safe: the mutex guards only the write sequence (no data, no
+    // invariants), and logf runs inside the request-logging middleware — a
+    // poisoned F would panic on every future logf call and kill every HTTP
+    // request. See the stderr note below for the same hazard, avoided at the
+    // source.
+    let _g = F.lock().unwrap_or_else(|e| e.into_inner());
     rotate_if_large();
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(log_path()) {
         let _ = f.write_all(line.as_bytes());
