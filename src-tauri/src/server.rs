@@ -43,14 +43,23 @@ pub(crate) enum PushEvent {
     List(Vec<catalog::MsgItem>),
     /// Upload progress for one pending row (throttled to ~1/s server-side; the
     /// final `sent >= total` tick fires immediately). Receiver-side only: the
-    /// PC is the receiver of pushes and draws the ring from these; download
-    /// progress is never pushed — the puller's browser owns that UI, and the
-    /// server's only download output is the terminal Delivered event.
+    /// PC is the receiver of pushes and draws its ring from these; per-byte
+    /// download progress is still never pushed — the puller's browser owns
+    /// that UI. Download ACTIVITY is a coarser, separate event (DlState).
     Progress { id: String, total: u64, sent: u64 },
     /// A download just completed (every requested byte left the socket). The
-    /// PC stamps its '已下载到手机' delivery marker from this; the phone
-    /// ignores it (its browser owns the download UI).
+    /// PC stamps its 'downloaded to phone' delivery marker from this; the
+    /// phone ignores it (its browser owns the download UI).
     Delivered { id: String },
+    /// Sender-side download activity, aggregated per message id (the union of
+    /// its live per-request "msg#n" transfers): true while any pull of the
+    /// file is being served, false once none is. The PC pulses its card from
+    /// this — the symmetric counterpart of the sending phone's "Uploading…"
+    /// pulse — and deliberately paints no cancel affordance: a pull's cancel
+    /// belongs to the puller's browser, so this end gets no ✕, no percent and
+    /// no tap action. Hard-dead pulls are covered by the monitor's prune,
+    /// which broadcasts Resync for the reconcile path.
+    DlState { id: String, active: bool },
     /// Firewall repair flag changed.
     Fw(bool),
     /// A LAN device connected/disconnected, or the server address changed.
@@ -82,9 +91,11 @@ pub(crate) enum PushEvent {
 ///     the PC — the receiver of the push — draws its ring from these),
 ///   - downloads are keyed by a unique per-request transfer id ("msg#n"), so
 ///     two concurrent pulls of the same file are two independent counters and
-///     dropping one can never disturb the other. No UI consumes download
-///     entries: they feed the outcome log and presence only, and are pruned
-///     by the monitor's time windows.
+///     dropping one can never disturb the other. Download entries feed the
+///     outcome log, presence, and the sender-side DlState mirror (the PC's
+///     "being pulled" card pulse aggregates the incomplete entries of one
+///     message id — see msg_has_active_download), and are pruned by the
+///     monitor's time windows.
 #[derive(Clone, Default)]
 struct DlProg {
     total: u64,
@@ -168,6 +179,26 @@ fn push_progress(
             sent: e.sent,
         });
     }
+}
+
+/// True while any download transfer of `msg_id` (entries keyed "msg#n") is
+/// still incomplete — the sender-side card pulse is the UNION of these: it
+/// stays lit until every concurrent pull of the file is done or reaped, so
+/// cancelling one of two parallel pulls never darkens the card while the
+/// other still runs. The caller already holds the dl_progress lock.
+fn msg_has_active_download(map: &std::collections::HashMap<String, DlProg>, msg_id: &str) -> bool {
+    let prefix = format!("{msg_id}#");
+    map.iter()
+        .any(|(k, e)| k.starts_with(&prefix) && e.total > 0 && e.sent < e.total)
+}
+
+/// Re-evaluate and push the DlState mirror for `msg_id`. Pushed on every
+/// transition point (pull registered, one pull completed/cut); a redundant
+/// same-state push is one tiny SSE event the frontend applies idempotently.
+/// The caller already holds the dl_progress lock.
+fn push_dl_state(map: &std::collections::HashMap<String, DlProg>, msg_id: &str) {
+    let active = msg_has_active_download(map, msg_id);
+    let _ = notifier().send(PushEvent::DlState { id: msg_id.to_string(), active });
 }
 
 /// Preferred port; when taken, fall forward within the same range, and as a
@@ -992,10 +1023,12 @@ fn mime_for(name: &str) -> String {
 /// surfaces a disconnect as the body being dropped, not as an error inside
 /// the stream, so a per-chunk error arm never sees it. The guard reaps THIS
 /// transfer's counter — its own per-request id, so a sibling pull of the same
-/// file is never touched — and writes the outcome into the log, which is the
-/// sender side's only record of a pull. No broadcast: no UI mirrors a pull.
+/// file is never touched — writes the outcome into the log, and re-evaluates
+/// the message's DlState mirror (the card pulse ends only when the LAST pull
+/// of the file ends).
 struct StreamCutGuard {
     tid: String,
+    msg_id: String,
     name: String,
 }
 impl Drop for StreamCutGuard {
@@ -1009,6 +1042,7 @@ impl Drop for StreamCutGuard {
             let sent = map.get(&self.tid).map(|e| e.sent).unwrap_or(0);
             let total = map.get(&self.tid).map(|e| e.total).unwrap_or(0);
             map.remove(&self.tid);
+            push_dl_state(&map, &self.msg_id);
             drop(map);
             logf(&format!(
                 "download closed by receiver {} ({}): {}/{} bytes",
@@ -1088,9 +1122,10 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
     // Progress tracking: real downloads (not inline previews) register a
     // per-request transfer counter — a fresh unique id per /dl, so two
     // concurrent pulls of the same file are two independent entries and
-    // dropping one can never disturb the other. No progress is pushed: the
-    // puller's browser owns that UI, and the server's only UI output for a
-    // pull is the terminal Delivered event on completion.
+    // dropping one can never disturb the other. Per-byte progress is not
+    // pushed (the puller's browser owns that UI); what IS pushed is the
+    // aggregated DlState mirror, so the sending PC's card pulses while any
+    // pull of the file is being served.
     let prog_id = if inline {
         None
     } else {
@@ -1111,6 +1146,9 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
             e.total = len;
             touch_entry(e);
         }
+        // The new pull makes the file "being served" (a fresh counter is
+        // incomplete by construction, so this is always a false->true flip).
+        push_dl_state(&map, &p.id);
         logf(&format!("download start {id}: {name} [{start}-{end}]/{len}"));
     }
     // Take() caps the read at the range end so a partial response carries
@@ -1128,7 +1166,7 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
             let name = name.to_string();
             // Held for the stream's whole life: on drop (peer gone mid-transfer)
             // it reaps this transfer's counter and logs the outcome.
-            let cut = StreamCutGuard { tid: tid.clone(), name: name.clone() };
+            let cut = StreamCutGuard { tid: tid.clone(), msg_id: msg_id.clone(), name: name.clone() };
             Box::pin(base.map(move |chunk| {
                 // Referencing `cut` keeps it captured, so it is dropped only when
                 // the whole stream (and thus this closure) is dropped by hyper.
@@ -1142,9 +1180,14 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
                             if e.sent >= e.total && e.total > 0 {
                                 logf(&format!("download done {tid}: {} bytes", e.sent));
                                 // The receiver just got the whole file: stamp the
-                                // PC's delivery marker. No progress is pushed —
-                                // the puller's browser owns that UI.
+                                // PC's delivery marker. Per-byte progress stays
+                                // unpushed — the puller's browser owns that UI.
                                 let _ = notifier().send(PushEvent::Delivered { id: msg_id.clone() });
+                                // This pull no longer counts as active; if it was
+                                // the LAST active pull of the file, end the
+                                // sender's card pulse. (A sibling pull still
+                                // mid-flight keeps the union lit.)
+                                push_dl_state(&map, &msg_id);
                             }
                         }
                     }
@@ -1472,8 +1515,16 @@ async fn open_file(Query(p): Query<IdParam>) -> impl IntoResponse {
 
 /// Reveal a file's location on the PC side by id: Remote rows select the inbox
 /// copy (phone upload or PC add), legacy Local rows the original PC file. Only
-/// File messages.
-async fn reveal(Query(p): Query<IdParam>) -> impl IntoResponse {
+/// File messages. PC-only: a phone request must not pop Explorer windows on
+/// the PC (same guard posture as /cancel and /add-local).
+async fn reveal(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(p): Query<IdParam>,
+) -> impl IntoResponse {
+    if from_by_peer(peer) != "pc" {
+        logw("reveal: rejected from phone (would open Explorer on the PC)");
+        return (StatusCode::FORBIDDEN, "phone cannot open PC folders").into_response();
+    }
     let Some(entry) = catalog::find(&p.id) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
@@ -1493,7 +1544,13 @@ async fn reveal(Query(p): Query<IdParam>) -> impl IntoResponse {
 }
 
 /// Open the PC-side inbox directory (the phone frontend hides this button).
-async fn open_dir() -> impl IntoResponse {
+/// Frontend "Inbox" click: open the inbox folder on the PC. PC-only for the
+/// same reason as /reveal — a phone request must not pop windows on the PC.
+async fn open_dir(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> impl IntoResponse {
+    if from_by_peer(peer) != "pc" {
+        logw("open-dir: rejected from phone (would open Explorer on the PC)");
+        return (StatusCode::FORBIDDEN, "phone cannot open PC folders").into_response();
+    }
     match open::that(catalog::inbox_dir()) {
         Ok(_) => (StatusCode::OK, "opened").into_response(),
         Err(e) => {
@@ -1628,6 +1685,10 @@ fn push_event_to_sse(ev: PushEvent) -> Event {
         PushEvent::Delivered { id } => Event::default()
             .event("delivered")
             .json_data(serde_json::json!({ "id": id }))
+            .unwrap(),
+        PushEvent::DlState { id, active } => Event::default()
+            .event("dlstate")
+            .json_data(serde_json::json!({ "id": id, "active": active }))
             .unwrap(),
         PushEvent::Fw(need) => Event::default()
             .event("fw")

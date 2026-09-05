@@ -141,12 +141,22 @@
   }
   #qrLightbox.show { display: flex; }
   .ql-card {
+    position: relative;
     background: var(--card); border-radius: 24px; padding: 24px;
     text-align: center; max-width: 92vw;
     border: 1px solid var(--line);
     box-shadow: 0 20px 60px rgba(0,0,0,0.3);
     animation: zoomIn 0.25s var(--ease-spring);
   }
+  .ql-close {
+    position: absolute; top: 10px; right: 10px;
+    width: 28px; height: 28px; border-radius: 50%; border: none; cursor: pointer;
+    background: var(--card-subtle); color: var(--sub);
+    display: flex; align-items: center; justify-content: center;
+    transition: background 0.15s, color 0.15s, transform 0.15s;
+  }
+  .ql-close:hover { background: var(--line); color: var(--text); }
+  .ql-close:active { transform: scale(0.92); }
   .ql-title { font-size: 15px; font-weight: 600; margin: 0 0 14px; letter-spacing: -0.3px; }
   .ql-qr {
     width: 260px; height: 260px; max-width: 68vw; max-height: 68vw;
@@ -159,7 +169,6 @@
     padding: 8px 14px; max-width: 100%;
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   }
-  .ql-hint { font-size: 11.5px; color: var(--sub); margin-top: 10px; }
 
   /* Chat Area */
   #chat {
@@ -236,8 +245,11 @@
     border-radius: 12px; transition: transform 0.15s ease;
   }
   .file-card:active { transform: scale(0.98); }
-  /* Corner transfer button: the phone's permanent Download button — it never
-     yields to a transfer ring (downloads are the browser's business). */
+  /* Corner action button: a persistent 30px disc in the card's top-right on
+     BOTH ends, each pointing at what that end can do with the file — the
+     phone re-downloads through its browser, the PC reveals the file's folder.
+     It yields to the corner ring while a transfer this end mirrors is live
+     (receiver-side only; the phone draws no rings at all). */
   .dlcardbtn {
     position: absolute; top: 8px; right: 8px; z-index: 3;
     width: 30px; height: 30px; border-radius: 50%; border: none; cursor: pointer;
@@ -246,12 +258,12 @@
     backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
     transition: background 0.15s, transform 0.15s;
   }
-  /* Press feedback only (this button only ever shows on the touch phone side).
-     No `:hover` darkening: on a touch screen Chromium keeps `:hover` on the
-     last-tapped element until another tap, and since the button is hidden while
-     a download runs and re-shown at that same tap point, the stuck darker
-     background read as a black button until the next tap or a reload. `:active`
-     ends on release, so it can't stick. */
+  /* Hover darkening only where a mouse exists: on a touch screen Chromium
+     keeps `:hover` on the last-tapped element until another tap, and since
+     the button is hidden while a download runs and re-shown at that same tap
+     point, the stuck darker background read as a black button until the next
+     tap or a reload. `:active` ends on release, so it can't stick. */
+  @media (pointer: fine) { .dlcardbtn:hover { background: rgba(0,0,0,0.75); } }
   .dlcardbtn:active {
     transform: scale(0.9);
     background: rgba(255,255,255,0.3);
@@ -322,6 +334,12 @@
   /* A file that is still uploading pulses gently (no numeric progress). */
   .file-card.pending { animation: pendingPulse 1.6s ease-in-out infinite; }
   @keyframes pendingPulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
+
+  /* A file being pulled away (PC sender side) pulses the same way: the
+     symmetric counterpart of the phone's own "uploading" pulse. It is not a
+     ring on purpose — the pull's cancel lives in the puller's browser, so
+     this end paints no ✕, no percent and no tap target. */
+  .file-card.downloading { animation: pendingPulse 1.6s ease-in-out infinite; }
 
   /* Fullscreen media preview (phone "open" for image/video) */
   .media-ov {
@@ -617,11 +635,11 @@
     <div class="fw-icon">
       <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
     </div>
-    <div class="fw-title">Allow Network Access</div>
-    <div class="fw-desc">Mobile devices cannot reach this PC yet. Click "Allow" and grant permissions in the system prompt.</div>
+    <div class="fw-title">Firewall prompt was cancelled</div>
+    <div class="fw-desc">Cancelling the Windows firewall prompt creates a block rule — phones cannot reach this PC until it is removed. Click Allow and confirm the UAC prompt to fix it.</div>
     <div class="fw-btns">
-      <button class="fw-btn quit" id="fwQuit">Quit</button>
       <button class="fw-btn repair" id="fwRepair">Allow</button>
+      <button class="fw-btn quit" id="fwQuit">Quit</button>
     </div>
     <div class="fw-hint" id="fwHint"></div>
   </div>
@@ -644,10 +662,12 @@
 <!-- QR Lightbox (PC): enlarge the header QR for scanning -->
 <div id="qrLightbox">
   <div class="ql-card">
+    <button class="ql-close" id="qlClose" title="Close">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
     <div class="ql-title">Scan to connect a device</div>
     <img class="ql-qr" src="/qr" alt="QR code">
     <div><div class="ql-url" id="qlUrl">…</div></div>
-    <div class="ql-hint">Click anywhere to close</div>
   </div>
 </div>
 
@@ -666,10 +686,11 @@ const $ = id => document.getElementById(id);
 
 const isPC = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
 const me = isPC ? 'pc' : 'phone';
-// The phone's in-flight upload, if any (downloads are native and out of reach).
-// Uploads are the one transfer the page actually drives, so holding the XHR lets
-// the sending phone cancel its own upload from the corner ring's ✕.
-let currentUpload = null;
+// The phone's in-flight uploads (downloads are native and out of reach). One
+// entry per file XHR: parallel uploads each keep their own peer-refusal
+// detection, so refusing the older of two concurrent pushes still aborts the
+// right stream and reports "Stopped" instead of a late generic failure.
+const inFlightUploads = [];
 
 function toast(msg){
   const t = $('toast'); t.textContent = msg; t.classList.add('show');
@@ -814,9 +835,10 @@ function applyList(items){
   checkUploadGone(items);
   pruneTransfers(items);
   autoReceive(items);
-  // render() rebuilt the DOM and wiped every corner; repaint the ones that are
-  // still mid-transfer so their ring comes straight back.
+  // render() rebuilt the DOM and wiped every corner and pulse; repaint the
+  // ones that are still live so they come straight back.
   repaintTransfers();
+  repaintDownloads();
 }
 function reapply(){ lastList = ''; if(lastServer) applyList(lastServer); }
 let lastServer = [];
@@ -837,7 +859,15 @@ function pruneTransfers(items){
   for(const key of Object.keys(progCache)) if(!ids.has(key)) delete progCache[key];
   for(const key of Object.keys(doneIds))   if(!ids.has(key)) delete doneIds[key];
   for(const key of Object.keys(hideTimers)) if(!ids.has(key)){ clearTimeout(hideTimers[key]); delete hideTimers[key]; }
+  // No paint needed: the row is gone, so there is no card left to pulse.
+  for(const key of Object.keys(dlActive)) if(!ids.has(key)) delete dlActive[key];
 }
+
+// Watch the server list for uploads the PC refused: each in-flight entry
+// watches its own name+size pair, so once its pending row is seen and then
+// vanishes, that push was refused — abort locally so we stop streaming into
+// the socket the server already tore down. Entries are independent: refusing
+// one of two parallel uploads never touches the other's detection.
 
 // Auto-receive on the phone: the moment a List event carries a file the PC just
 // added, fire the browser's download for it — the user should meet only the
@@ -940,16 +970,18 @@ function render(items){
       info.querySelector('.fc-size').textContent = fmtSize(it.size);
       if(it.pending){
         // Direction caption only — the percent lives in the corner ring.
+        // Pending rows only ever originate from the phone, so the caption is
+        // "Uploading…" on the sending phone and "Receiving…" on the PC.
         info.querySelector('.fc-size').textContent +=
-          ' · ' + (!isPC && it.from === 'phone' ? '上传中…' : '接收中…');
+          ' · ' + (!isPC ? 'Uploading…' : 'Receiving…');
       }
       card.appendChild(info);
 
-      // Phone file cards get a permanent Download button (tap hands the file to
-      // the browser's own downloader, which owns progress and cancel — the page
-      // keeps no download state, see the corner block). The PC has no per-file
-      // button. The same corner hosts the transfer ring where this end mirrors
-      // a transfer (PC: everything it hosts; phone: its own uploads).
+      // Every file card gets a persistent corner button — Download on the
+      // phone (handed to the browser's own downloader, which owns progress
+      // and cancel), Reveal in Explorer on the PC. Which one is decided by
+      // paintCorner on each idle repaint. The same corner hosts the transfer
+      // ring where this end mirrors a receiving transfer (PC only).
       const btn = document.createElement('button');
       btn.className = 'dlcardbtn hidden';
       btn.type = 'button';
@@ -980,7 +1012,7 @@ function render(items){
     meta.textContent = fmtTime(it.ts);
     // Delivery marker (PC view): this file was pulled to a phone at some point.
     if(isPC && it.kind === 'file' && delivered[it.id]){
-      meta.textContent += ' · 已下载到手机 ' + fmtTime(String(delivered[it.id]));
+      meta.textContent += ' · downloaded to phone ' + fmtTime(String(delivered[it.id]));
     }
 
     bWrap.appendChild(bubble);
@@ -1012,7 +1044,8 @@ async function openDefault(it){
 // the corner block). There is no JS chunk/OPFS downloader anymore — that
 // engine was removed.
 // Delivery record: file id -> unix seconds when a phone last pulled it (PC
-// side only, survives reloads). Rendered as "已下载到手机 HH:MM" on the card.
+// side only, survives reloads). Rendered as "downloaded to phone HH:MM" on
+// the card.
 const delivered = loadDelivered();
 function loadDelivered(){
   try { return JSON.parse(localStorage.getItem('tinbox.delivered') || '{}'); } catch { return {}; }
@@ -1025,7 +1058,7 @@ function markDelivered(id){
   saveDelivered();
   const m = document.querySelector('.msg[data-id="'+id+'"] .meta-line');
   const it = itemById(id);
-  if(m && it) m.textContent = fmtTime(it.ts) + ' · 已下载到手机 ' + fmtTime(String(now));
+  if(m && it) m.textContent = fmtTime(it.ts) + ' · downloaded to phone ' + fmtTime(String(now));
 }
 // Optimistic upload cards: when the phone picks a file it appears immediately on
 // its own timeline as "Uploading…" before the server's pending row lands.
@@ -1033,17 +1066,24 @@ const optUploads = [];
 let optSeq = 0;
 function withOptimistic(serverItems){
   if(isPC || !optUploads.length) return serverItems;
-  const seen = {};
-  for(const it of serverItems) if(it.from === 'phone') seen[it.name + '|' + it.size] = true;
+  // Count real rows per name|size instead of a boolean: the same file can be
+  // picked twice in parallel, and each real pending row covers exactly one
+  // optimistic card — a boolean map would drop the twin's card the moment the
+  // first row lands.
+  const counts = {};
+  for(const it of serverItems) if(it.from === 'phone'){
+    const k = it.name + '|' + it.size;
+    counts[k] = (counts[k] || 0) + 1;
+  }
   const out = serverItems.slice();
   for(const o of optUploads){
-    if(seen[o.name + '|' + o.size]) continue;   // a real row already covers it
+    const k = o.name + '|' + o.size;
+    if(counts[k] > 0){ counts[k]--; continue; }   // a real row already covers it
     out.push({ id: o.id, ts: String((o.at / 1000) | 0), from: 'phone', kind: 'file',
       name: o.name, size: o.size, source_kind: 'remote', pending: true, text: '' });
   }
   return out;
 }
-function clearOptUploads(){ optUploads.length = 0; reapply(); }
 
 // ---- Corner transfer ring ----------------------------------------------
 // Rings are drawn by the RECEIVER of a transfer, and only it can cancel:
@@ -1055,12 +1095,17 @@ function clearOptUploads(){ optUploads.length = 0; reapply(); }
 //               state at all — no rings, no mirrors, nothing to sync. Its own
 //               uploads are sender-side: the optimistic "Uploading…" card is
 //               the feedback, and completion arrives as the row turning real.
-// Everything else (pull outcomes) is the server's event log, not UI.
+// Sender-side feedback on the PC (a file being pulled away) is the coarser
+// DlState card pulse further down — deliberately not a ring, since this end
+// can neither see the pull's percent nor cancel it.
 const progCache = {};   // id -> {sent,total,t} latest server snapshot (uploads)
 const doneIds = {};     // transfers already flashed complete -> corner stays idle
 const hideTimers = {};  // per-id "hide the finished ring" timers
 function itemById(id){ for(const it of curItems) if(it.id === id) return it; return null; }
 const BTN_DL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
+// The PC corner's idle occupant: reveal the file's folder — it is the file's
+// source, so its useful idle action is jumping to the location.
+const BTN_FOLDER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>';
 // The ring's only glyph is the completion check (Chrome's download-chip
 // pattern); cancel is the center ✕ text.
 const GLYPH_DONE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
@@ -1085,10 +1130,11 @@ function cornerState(id){
            done: !!(prog && total > 0 && prog.sent >= total) };
 }
 
-// Paint one card's corner: the ring while a transfer this end mirrors is live,
-// the Download button otherwise. Called after every render (cards were rebuilt)
-// and on every `progress` tick; idle cards early-return so cost scales with
-// activity.
+// Paint one card's corner: the ring while a transfer this end mirrors is
+// live, the end's persistent action button otherwise (Download on the phone,
+// Reveal in Explorer on the PC). Called after every render (cards were
+// rebuilt) and on every `progress` tick; idle cards early-return so cost
+// scales with activity.
 function paintCorner(id){
   const card = document.querySelector('.msg[data-id="'+id+'"] .file-card');
   if(!card) return;
@@ -1102,12 +1148,20 @@ function paintCorner(id){
   if(!st){
     ring.classList.remove('show', 'done', 'p0');
     card.classList.remove('transferring');
-    if(!card.dataset.pending && !isPC){
-      // The phone's Download button is permanent — it never yields the corner,
-      // because the page draws no rings at all (rings are the receiver's).
+    if(!card.dataset.pending){
+      // The corner's idle occupant is a persistent action button on both
+      // ends, each pointing at what that end can do with the file: the phone
+      // re-downloads through its browser; the PC (the file's source) reveals
+      // its folder. Both yield the corner only to a receiver-side ring, so
+      // each never gets hidden by the transfers the other end runs.
       btn.classList.remove('hidden');
-      btn.innerHTML = BTN_DL;
-      btn.title = 'Download';
+      if(isPC){
+        btn.innerHTML = BTN_FOLDER;
+        btn.title = 'Reveal in Explorer';
+      } else {
+        btn.innerHTML = BTN_DL;
+        btn.title = 'Download';
+      }
       return;
     }
     btn.classList.add('hidden');
@@ -1154,12 +1208,14 @@ function repaintTransfers(){
   }
 }
 
-// Corner-button action (phone): hand the file to the browser's native
-// downloader, every time. No guards and no mirror — an in-flight pull is the
+// Corner-button action: the phone hands the file to the browser's native
+// downloader, every time — no guards and no mirror, an in-flight pull is the
 // browser's business (its own UI shows progress and cancel), and a second tap
-// simply starts another download; where Chrome cares it asks "download again?".
+// simply starts another download. The PC's counterpart is revealing the
+// file's folder.
 function transferClick(it){
   if(it.pending) return;                 // still uploading, nothing to act on
+  if(isPC){ revealItem(it); return; }
   downloadFile(it);
 }
 
@@ -1183,21 +1239,20 @@ function clearMirror(id){
 function ringTap(it){
   if(isPC){ stopTransfer(it.id); }
 }
-// The PC can refuse this phone's push (see /cancel). Watch the server list:
-// once our pending row has been seen, its disappearance means the other end
-// revoked the transfer — abort locally so we stop streaming into nothing and
-// say so.
 function checkUploadGone(items){
-  if(!currentUpload) return;
-  const mine = items.filter(i => i.from === 'phone'
-    && i.name === currentUpload.name && i.size === currentUpload.size);
-  if(mine.some(i => i.pending)){ currentUpload.seen = true; return; }
-  if(!mine.length && currentUpload.seen){
-    currentUpload.stoppedByPeer = true;
-    currentUpload.seen = false;
-    try { currentUpload.xhr.abort(); } catch {}
-  } else {
-    currentUpload.seen = mine.length > 0; // completed (row kept) or not seen yet
+  for(const up of inFlightUploads){
+    const mine = items.filter(i => i.from === 'phone'
+      && i.name === up.name && i.size === up.size);
+    if(mine.some(i => i.pending)){ up.seen = true; continue; }
+    if(!mine.length && up.seen){
+      // Refused by the receiver: abort locally so we stop streaming into the
+      // socket the server is already tearing down. The failure toast is the
+      // same "Transfer failed" whichever path wins the race.
+      up.seen = false;
+      try { up.xhr.abort(); } catch {}
+    } else {
+      up.seen = mine.length > 0; // completed (row kept) or not seen yet
+    }
   }
 }
 
@@ -1229,22 +1284,26 @@ function downloadFile(it){
 
 // Native download: hand the file to the browser's own downloader — it owns
 // progress, cancel and error UI, so the page keeps no state at all. Every tap
-// is a fresh full GET; the server's transmitted-byte counter (which still
-// feeds the PC's ring) resets itself via the fresh branch in serve().
+// is a fresh full GET, and the server keys each pull to its own per-request
+// counter ("msg#n" in serve()), so parallel pulls — same file or not — are
+// independent and cancelling one never disturbs the others.
 function nativeDownload(it){
   const f = document.createElement('iframe');
   f.className = 'dlframe';
   f.style.display = 'none';
   f.src = '/dl?id='+encodeURIComponent(it.id)+'&r='+Date.now();
   document.body.appendChild(f);
+  // One hidden trigger iframe per tap; once the response has started the pull
+  // belongs to the browser's download manager, so reclaim the node after a
+  // generous grace period instead of piling one up per download forever.
+  setTimeout(() => f.remove(), 300000);
 }
 
 // Transfer snapshots arrive as `progress` SSE events (~1/s per upload) and a
 // one-shot /dl-status resync on connect. Rings are receiver-side: the PC
 // applies pushes for the pending rows it is receiving; download progress is
-// never pushed (the puller's browser owns that UI), and the sending phone
-// draws nothing — its send feedback is the optimistic card + the row turning
-// real.
+// never pushed (the puller's browser owns that UI) — the sending side's pull
+// feedback is the coarser DlState card pulse below.
 function syncProgress(list){
   if(!isPC) return;
   const now = Date.now();
@@ -1255,19 +1314,80 @@ function syncProgress(list){
     paintCorner(d.id);
   }
 }
+
+// ---- Sender-side download pulse (PC) --------------------------------------
+// While any pull of a file is being served, the sending PC pulses its card —
+// the symmetric counterpart of the sending phone's "Uploading…" pulse. The
+// mirror is deliberately NOT a ring: a pull's cancel belongs to the puller's
+// browser, so this end paints no ✕, no percent and no tap action — just
+// "bytes are moving to someone".
+//
+// Union rule: the card stays lit until EVERY per-request transfer ("msg#n")
+// of that file is complete or reaped, so cancelling one of two parallel pulls
+// never darkens it while the other still runs. Live state arrives as `dlstate`
+// SSE events (pushed at each transition: pull registered, one pull done or
+// cut); a /dl-status snapshot rebuilds the whole set on (re)connect and on
+// every `resync` — which is also the convergence path for a hard-dead pull
+// (socket hung, no FIN): its entry lingers until the monitor's 30s silence
+// prune, whose resync turns the pulse off then.
+const dlActive = {};   // msg id -> some download of it is being served
+function syncDlState(id, active){
+  if(!isPC) return;
+  if(active) dlActive[id] = true; else delete dlActive[id];
+  paintDl(id);
+}
+// Rebuild the mirror from a /dl-status snapshot. Entries keyed "msg#n" are
+// download transfers (uploads are keyed by their plain message id); an entry
+// is active while incomplete — completed entries linger 15s in the snapshot
+// and must not count.
+function rebuildDlMirror(snap){
+  if(!isPC) return;
+  const active = {};
+  for(const d of snap){
+    const h = d.id.indexOf('#');
+    if(h < 0) continue;                          // an upload counter, not a pull
+    if(d.total > 0 && d.sent < d.total) active[d.id.slice(0, h)] = true;
+  }
+  for(const id of Object.keys(dlActive)) if(!active[id]){ delete dlActive[id]; paintDl(id); }
+  for(const id of Object.keys(active)) if(!dlActive[id]){ dlActive[id] = true; paintDl(id); }
+}
+function paintDl(id){
+  const card = document.querySelector('.msg[data-id="'+id+'"] .file-card');
+  if(!card) return;
+  const on = !!dlActive[id];
+  card.classList.toggle('downloading', on);
+  // Caption parity with the pending cards: "Uploading…"/"Receiving…" get one,
+  // so "Sending…" rides the same fc-size line. The base text is cached on the
+  // node; render() writes it fresh on every rebuild, so the cache never goes
+  // stale.
+  const size = card.querySelector('.fc-size');
+  if(size){
+    if(size.dataset.base === undefined) size.dataset.base = size.textContent;
+    size.textContent = on ? size.dataset.base + ' · Sending…' : size.dataset.base;
+  }
+}
+// render() rebuilt the DOM and wiped the pulse classes; re-apply from the
+// mirror. Runs right after repaintTransfers in applyList.
+function repaintDownloads(){
+  for(const it of curItems) if(it.kind === 'file') paintDl(it.id);
+}
+
 // Fetch the server's live-transfer snapshot, apply it, then reconcile the
-// local mirror with it: refresh counters for rows the server is still
-// receiving, and drop mirror state for ids it no longer tracks. The server
-// pushes nothing on a refused push or a dead-transfer prune — it broadcasts
-// `resync` instead — so this reconcile is what lets a corner return to idle
-// instead of freezing on its last value forever.
+// local mirrors with it: refresh counters for rows the server is still
+// receiving, drop mirror state for ids it no longer tracks, and rebuild the
+// download-pulse set. The server pushes nothing on a refused push or a
+// dead-transfer prune — it broadcasts `resync` instead — so this reconcile is
+// what lets a corner (and a pulse) return to idle instead of freezing on its
+// last value forever.
 async function resyncProgress(){
   let snap;
   try { snap = await (await fetch('/dl-status')).json(); } catch { return; }
   snap = snap || [];
   syncProgress(snap);
   reconcileMirrors(snap);
+  rebuildDlMirror(snap);
   repaintTransfers();
+  repaintDownloads();
 }
 function reconcileMirrors(snap){
   const known = new Set(snap.map(d => d.id));
@@ -1284,7 +1404,7 @@ function sendText(){
   }).then(r => {
     if(r.ok){ t.value = ''; autoSize(); updateSendBtn(); }
     else toast('Send failed');
-  }).catch(() => toast('Network error'));
+  }).catch(() => toast('Send failed'));
 }
 
 function autoSize(){
@@ -1298,29 +1418,42 @@ function updateSendBtn(){
 
 function uploadFiles(files){
   if(!files.length) return;
-  const f0 = files[0];
+  // One XHR per file: each gets its own ?size= (the per-request total the
+  // server declares on the pending row, so the PC ring's percent is right),
+  // its own optimistic card, and its own in-flight entry — parallel uploads
+  // are independent end to end instead of sharing one request and one slot.
+  for(const f of files) startUpload(f);
+  reapply();
+}
+function startUpload(f){
+  const opt = { id: 'opt-' + (++optSeq), name: f.name, size: f.size || 0, at: Date.now() };
   // Draw the sending side's card immediately ("Uploading…") before the server
   // round-trips; withOptimistic() replaces it with the server's pending row as
   // soon as that arrives.
-  optUploads.length = 0;
-  optUploads.push({ id: 'opt-' + (++optSeq), name: f0.name, size: f0.size || 0, at: Date.now() });
+  optUploads.push(opt);
   const fd = new FormData();
-  for(const f of files) fd.append('file', f);
-  const size = f0 && f0.size ? f0.size : 0;
+  fd.append('file', f);
   const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/upload?size='+size);
+  xhr.open('POST', '/upload?size=' + (f.size || 0));
   // Remember this upload so checkUploadGone can notice a receiver-side refusal:
   // once our pending row is seen and then vanishes, the push was refused.
-  currentUpload = { xhr, name: f0.name, size: f0.size || 0, seen: false, stoppedByPeer: false };
-  reapply();
+  const up = { xhr, name: f.name, size: f.size || 0, seen: false };
+  inFlightUploads.push(up);
   const finish = (msg) => {
-    if(currentUpload && currentUpload.xhr === xhr) currentUpload = null;
-    clearOptUploads();
+    const i = inFlightUploads.indexOf(up);
+    if(i >= 0) inFlightUploads.splice(i, 1);
+    const j = optUploads.indexOf(opt);
+    if(j >= 0) optUploads.splice(j, 1);
+    reapply();
     if(msg) toast(msg);
   };
-  xhr.onload = () => finish(xhr.status === 200 ? 'Sent successfully' : 'Upload failed');
-  xhr.onerror = () => finish('Network error');
-  xhr.onabort = () => finish(currentUpload && currentUpload.stoppedByPeer ? 'Stopped' : 'Upload cancelled');
+  // One failure message for every cause: a receiver-side refusal tears the
+  // socket down before the row-vanish list event can arrive, so the client
+  // genuinely cannot tell a refused push from a WiFi drop — over-precise
+  // toasts only mislead (a refusal used to read "Network error").
+  xhr.onload = () => finish(xhr.status === 200 ? 'Sent successfully' : 'Transfer failed');
+  xhr.onerror = () => finish('Transfer failed');
+  xhr.onabort = () => finish('Transfer failed');
   xhr.send(fd);
 }
 
@@ -1493,6 +1626,13 @@ function connect(){
   es.addEventListener('progress', e => { lastSeen = Date.now(); syncProgress([JSON.parse(e.data)]); });
   // A pull just completed on some receiver: the PC stamps its delivery marker.
   es.addEventListener('delivered', e => { lastSeen = Date.now(); markDelivered(JSON.parse(e.data).id); });
+  // Sender-side pull activity (PC only): the card pulse tracks the union of
+  // the file's live per-request transfers.
+  es.addEventListener('dlstate', e => {
+    lastSeen = Date.now();
+    const d = JSON.parse(e.data);
+    syncDlState(d.id, d.active);
+  });
   // A `resync` means this client fell behind and may have dropped pushes (see
   // PushEvent::Resync for the full trigger list). Re-fetch BOTH the file list
   // and the transfer mirrors so nothing stays stale.
@@ -1533,7 +1673,11 @@ document.addEventListener('visibilitychange', () => {
 
 let fwWasShown = false;
 // Firewall repair flag arrives as an SSE `fw` event (the server pushes only on
-// change); no /fw-status polling.
+// change); no /fw-status polling. There is deliberately NO dismiss affordance:
+// a shown overlay means an applicable Block rule exists — the phone cannot
+// connect and the gate behind it is dead anyway. A false alarm self-heals
+// (a device connecting clears the flag within a second); anything else is
+// resolved by Allow (auto-fix) or Quit.
 function applyFw(needRepair){
   const show = !!needRepair;
   $('fwOverlay').classList.toggle('show', show);
@@ -1581,13 +1725,17 @@ if(takeover){
   takeover.postMessage('hello');
 }
 
-// QR lightbox: the small header QR opens a large scan-ready version on click;
-// clicking anywhere (card included) closes it. The URL is shown as plain text
-// for manual entry when scanning fails.
+// QR lightbox: the small header QR opens a large scan-ready version on click.
+// Closing is explicit — the card's ✕ button or the Escape key; the backdrop
+// does not swallow clicks (no accidental dismissal when a stray click lands
+// beside the card).
 function openQrLightbox(){ $('qrLightbox').classList.add('show'); }
 function closeQrLightbox(){ $('qrLightbox').classList.remove('show'); }
 $('qrBox').onclick = openQrLightbox;
-$('qrLightbox').onclick = closeQrLightbox;
+$('qlClose').onclick = closeQrLightbox;
+document.addEventListener('keydown', e => {
+  if(e.key === 'Escape') closeQrLightbox();
+});
 
 if(isPC){
   // The gate hides either when the user browses without a device
