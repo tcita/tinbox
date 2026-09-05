@@ -687,9 +687,9 @@ const $ = id => document.getElementById(id);
 const isPC = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
 const me = isPC ? 'pc' : 'phone';
 // The phone's in-flight uploads (downloads are native and out of reach). One
-// entry per file XHR: parallel uploads each keep their own peer-refusal
-// detection, so refusing the older of two concurrent pushes still aborts the
-// right stream and reports "Stopped" instead of a late generic failure.
+// entry per in-flight request: parallel uploads each keep their own
+// peer-refusal detection, so refusing the older of two concurrent pushes still
+// aborts the right stream instead of reporting a late generic failure.
 const inFlightUploads = [];
 
 function toast(msg){
@@ -722,6 +722,23 @@ function iconFor(name){
   if(['txt','md','log','json'].includes(ext)) return '📝';
   if(['js','ts','rs','go','py','java','c','cpp','html','css'].includes(ext)) return '⚙️';
   return '📦';
+}
+
+// ---- Server API -----------------------------------------------------------
+// Every HTTP call to the local server goes through api(): the method, query
+// and body conventions live in exactly one place instead of a bespoke fetch
+// per handler. Returns the raw Response, so each caller keeps its own .ok /
+// .json() / .text() semantics and its own error policy (toast, swallow or
+// reconcile). FormData bodies pass through untouched — the browser must set
+// the multipart boundary itself; anything else is JSON-encoded.
+function qs(query){ return '?' + new URLSearchParams(query); }
+async function api(path, { method = 'GET', query, body, signal } = {}){
+  const init = { method, signal };
+  if(body !== undefined){
+    init.body = body instanceof FormData ? body : JSON.stringify(body);
+    if(!(body instanceof FormData)) init.headers = { 'Content-Type': 'application/json' };
+  }
+  return fetch(query ? path + qs(query) : path, init);
 }
 
 // Context Menu
@@ -799,13 +816,13 @@ async function copyText(it){
 // the old guard never blocked anything anyway). Delete is a deliberate
 // context-menu action; the toast reports the outcome.
 async function delItem(it){
-  const res = await fetch('/rm?id='+encodeURIComponent(it.id), {method:'POST'});
+  const res = await api('/rm', { method:'POST', query:{ id: it.id } });
   if(res.ok) toast(it.kind === 'text' ? 'Deleted' : 'Deleted from Inbox');
   else toast('Delete failed');
   refresh();
 }
 async function revealItem(it){
-  const res = await fetch('/reveal?id='+encodeURIComponent(it.id), {method:'POST'});
+  const res = await api('/reveal', { method:'POST', query:{ id: it.id } });
   if(!res.ok) toast('File no longer exists');
 }
 function hideCtxMenu(){ $('ctxMenu').classList.remove('show'); }
@@ -846,7 +863,7 @@ let lastServer = [];
 // driven by EventSource (onopen/onerror), not by fetch failures.
 async function refresh(){
   try {
-    applyList(await (await fetch('/list')).json());
+    applyList(await (await api('/list')).json());
   } catch {}
 }
 
@@ -1034,7 +1051,7 @@ function render(items){
 }
 
 async function openDefault(it){
-  const res = await fetch('/open?id='+encodeURIComponent(it.id), {method:'POST'});
+  const res = await api('/open', { method:'POST', query:{ id: it.id } });
   if(!res.ok) toast('File no longer exists');
 }
 
@@ -1224,7 +1241,7 @@ function transferClick(it){
 // and the partial file) and we clear the local mirror so the ring vanishes
 // right away.
 async function stopTransfer(id){
-  try { await fetch('/cancel?id='+encodeURIComponent(id), {method:'POST'}); } catch {}
+  try { await api('/cancel', { method:'POST', query:{ id } }); } catch {}
   clearMirror(id);
 }
 // Drop this end's mirror of one transfer (counter, flash timers).
@@ -1249,7 +1266,7 @@ function checkUploadGone(items){
       // socket the server is already tearing down. The failure toast is the
       // same "Transfer failed" whichever path wins the race.
       up.seen = false;
-      try { up.xhr.abort(); } catch {}
+      up.ac.abort();
     } else {
       up.seen = mine.length > 0; // completed (row kept) or not seen yet
     }
@@ -1381,7 +1398,7 @@ function repaintDownloads(){
 // last value forever.
 async function resyncProgress(){
   let snap;
-  try { snap = await (await fetch('/dl-status')).json(); } catch { return; }
+  try { snap = await (await api('/dl-status')).json(); } catch { return; }
   snap = snap || [];
   syncProgress(snap);
   reconcileMirrors(snap);
@@ -1398,10 +1415,7 @@ function sendText(){
   const t = $('txt');
   const text = t.value.trim();
   if(!text) return;
-  fetch('/send-text', {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ text })
-  }).then(r => {
+  api('/send-text', { method:'POST', body:{ text } }).then(r => {
     if(r.ok){ t.value = ''; autoSize(); updateSendBtn(); }
     else toast('Send failed');
   }).catch(() => toast('Send failed'));
@@ -1418,14 +1432,14 @@ function updateSendBtn(){
 
 function uploadFiles(files){
   if(!files.length) return;
-  // One XHR per file: each gets its own ?size= (the per-request total the
+  // One request per file: each gets its own ?size= (the per-request total the
   // server declares on the pending row, so the PC ring's percent is right),
   // its own optimistic card, and its own in-flight entry — parallel uploads
   // are independent end to end instead of sharing one request and one slot.
   for(const f of files) startUpload(f);
   reapply();
 }
-function startUpload(f){
+async function startUpload(f){
   const opt = { id: 'opt-' + (++optSeq), name: f.name, size: f.size || 0, at: Date.now() };
   // Draw the sending side's card immediately ("Uploading…") before the server
   // round-trips; withOptimistic() replaces it with the server's pending row as
@@ -1433,11 +1447,11 @@ function startUpload(f){
   optUploads.push(opt);
   const fd = new FormData();
   fd.append('file', f);
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/upload?size=' + (f.size || 0));
-  // Remember this upload so checkUploadGone can notice a receiver-side refusal:
-  // once our pending row is seen and then vanishes, the push was refused.
-  const up = { xhr, name: f.name, size: f.size || 0, seen: false };
+  // The abort handle is what checkUploadGone pulls when the receiver refuses
+  // the push: aborting cancels the request mid-stream, so the phone stops
+  // writing bytes into a socket the server is already tearing down.
+  const ac = new AbortController();
+  const up = { ac, name: f.name, size: f.size || 0, seen: false };
   inFlightUploads.push(up);
   const finish = (msg) => {
     const i = inFlightUploads.indexOf(up);
@@ -1450,11 +1464,15 @@ function startUpload(f){
   // One failure message for every cause: a receiver-side refusal tears the
   // socket down before the row-vanish list event can arrive, so the client
   // genuinely cannot tell a refused push from a WiFi drop — over-precise
-  // toasts only mislead (a refusal used to read "Network error").
-  xhr.onload = () => finish(xhr.status === 200 ? 'Sent successfully' : 'Transfer failed');
-  xhr.onerror = () => finish('Transfer failed');
-  xhr.onabort = () => finish('Transfer failed');
-  xhr.send(fd);
+  // toasts only mislead (a refusal used to read "Network error"). The abort
+  // rejection and a hard network error both land in the same catch, so the
+  // old load/error/abort trio collapses into just success vs failure.
+  try {
+    const r = await api('/upload', { method:'POST', body: fd, query:{ size: f.size || 0 } });
+    finish(r.ok ? 'Sent successfully' : 'Transfer failed');
+  } catch {
+    finish('Transfer failed');
+  }
 }
 
 $('txt').addEventListener('input', () => { autoSize(); updateSendBtn(); });
@@ -1464,7 +1482,7 @@ $('txt').addEventListener('keydown', e => {
 $('send').onclick = sendText;
 
 $('inboxBtn').onclick = () => {
-  fetch('/open-dir', {method:'POST'}).catch(()=>toast('Could not open inbox'));
+  api('/open-dir', {method:'POST'}).catch(()=>toast('Could not open inbox'));
 };
 
 // iOS quirk (observed on both Safari and Chrome via log traces): the OS picker
@@ -1498,10 +1516,7 @@ async function addLocalPaths(paths){
     return !t || now - t > 5000;
   });
   if(!fresh.length) return;
-  const r = await fetch('/add-local', {
-    method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ paths: fresh })
-  });
+  const r = await api('/add-local', { method:'POST', body:{ paths: fresh } });
   if(!r.ok) toast('Could not add file(s)');
 }
 // Tauri fires tauri://drag-drop with the real paths in parallel with the HTML5
@@ -1688,7 +1703,7 @@ function applyFw(needRepair){
     // landed. The success toast lives HERE, not in the repair click: the
     // repair return only means "UAC granted", the confirmation is this
     // transition.
-    fetch('/untop', {method:'POST'}).catch(()=>{});
+    api('/untop', {method:'POST'}).catch(()=>{});
     toast('Network access granted');
   }
   fwWasShown = show;
@@ -1698,7 +1713,7 @@ $('fwRepair').onclick = async () => {
   $('fwQuit').disabled = true;
   $('fwHint').textContent = 'Please confirm the administrator prompt (UAC)…';
   try {
-    const r = await fetch('/repair', {method:'POST'});
+    const r = await api('/repair', {method:'POST'});
     const txt = await r.text();
     if(txt.trim() === 'ok'){
       // The launcher is spawned — the UAC prompt (if any) is on screen now.
@@ -1715,7 +1730,7 @@ $('fwRepair').onclick = async () => {
   $('fwRepair').disabled = false;
   $('fwQuit').disabled = false;
 };
-$('fwQuit').onclick = () => { fetch('/quit', {method:'POST'}).catch(()=>{}); };
+$('fwQuit').onclick = () => { api('/quit', {method:'POST'}).catch(()=>{}); };
 
 function supersede(){
   if(superseded) return;
@@ -1759,8 +1774,7 @@ if(isPC){
 // (where tinbox.log is not directly readable) still lands in tinbox.log with a
 // "client:" prefix. Fire-and-forget; a dead server must not loop on errors.
 function reportClientError(msg){
-  fetch('/log', { method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({ msg }) }).catch(()=>{});
+  api('/log', { method:'POST', body:{ msg } }).catch(()=>{});
 }
 window.addEventListener('error', e => {
   reportClientError((e.message || 'unknown error') + ' @' + (e.filename || '') + ':' + (e.lineno || ''));
