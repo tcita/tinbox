@@ -27,7 +27,7 @@ pub fn run() {
             // Start axum first and wait for the port to bind before creating the
             // window that loads that page; otherwise the window shows a blank
             // page / connection error because it loads before the server is up.
-            // The channel carries back the actual port (falls forward when 8765
+            // The channel carries back the actual port (falls forward when 7765
             // is taken), and the window uses it to build the URL.
             let ready = server::spawn(app.handle().clone());
             let port = ready.blocking_recv().ok().flatten().unwrap_or_else(|| {

@@ -4,43 +4,60 @@
 // through Windows Firewall' screen" problem.
 //
 // Mechanism (normal privileges can only read rules; New/Remove need admin):
-//   1. ensure(): read-only detection before startup - is there an ENABLED
-//      Block rule targeting our own exe whose profile covers the ACTIVE
-//      network (an applicable block = the phone is certainly blocked)? A
-//      live self-test connection cannot do this job: loopback traffic (any
-//      connection to a local IP, own LAN IP included) is exempt from Windows
-//      firewall filtering by design, so only another machine could test the
-//      inbound path. Rule inspection with the applicability filter is the
-//      strongest local equivalent, and when it confirms a block the overlay
-//      is raised immediately - no grace window needed, the state is certain.
+//   1. the fw worker: ONE long-lived powershell process owns the ENTIRE rule
+//      judgment — there is no separate startup pre-check (the worker's first
+//      pass ~1s after launch IS the startup check; two judges would either
+//      duplicate the logic or disagree with it). The script loops in-process
+//      (~100ms per pass, 500ms cadence) and emits a line only when the state
+//      changes, judged against an EXACT invariant: the app maintains exactly
+//      one rule (tinbox_Allow_Inbound — enabled, Allow, Any profile) and
+//      accepts NOTHING else pointing at the exe. Anything else — the Windows
+//      dialog's Query rules, hand-made blocks, duplicates, disabled strays —
+//      is 'dirty' and gets flagged; the repair wipes every rule pointing at
+//      the exe and recreates the canonical one, so the rule table stays
+//      readable and the judgment is a simple equality, not coverage math.
+//      The invariant being met clears the flag and retires the worker
+//      (rules cannot change by themselves — nothing left to watch). The
+//      script self-exits when its parent dies (an app quit never leaks the
+//      child), and an unexpected child death respawns after 5s. The one
+//      long-lived case is the fresh-install window where the Windows dialog
+//      is still unanswered — the OS gets the first chance (its answer is
+//      never canonical, so the overlay then demands the one-time repair).
 //   2. The flag is pushed over the SSE channel as an `fw` event; the
 //      frontend shows the HTML repair overlay (Allow / Quit, no dismiss —
-//      a shown overlay means the phone is certainly blocked, and a false
-//      alarm self-heals via connection evidence) and the window is pinned
-//      on top so the overlay cannot be missed. "Allow" writes a temp .ps1
-//      and triggers an elevated run (ShellExecute runas + SW_HIDE, so the
-//      elevated console never flashes): delete all Block rules for our exe
-//      and add one Allow rule. Rule changes take effect immediately, so the
-//      phone connects within the same session.
+//      the flag means the phone would be blocked on some network) and the
+//      window is pinned on top so the overlay cannot be missed. "Allow"
+//      writes a temp .ps1 and launches it elevated via ShellExecute runas +
+//      SW_HIDE (the elevated console is born hidden — no terminal flash):
+//      delete all Block rules for our exe and add one all-profile Allow
+//      rule. The repair return only means "UAC granted" — the worker
+//      confirms the invariant within ~1s and the overlay closes through the
+//      same flag path as everything else. Rule changes take effect
+//      immediately, so the phone connects within the same session.
 //   3. the fw worker: ONE long-lived powershell process owns every rule
 //      transition after startup (a per-tick "powershell spawn" costs ~1.1s
 //      of CPU, so the old spawn-per-tick pollers are gone). The script
 //      loops in-process (~100ms per pass, 500ms cadence) and emits a line
-//      only when the state changes: a block appearing sets the flag
-//      (overlay up, caught within ~1s of the dialog's Cancel); the block
-//      vanishing clears it (overlay down, ~0.6s after the rule leaves —
-//      this used to be a 4s-throttled re-check); an Allow appearing means
-//      the dialog was answered and the worker retires. The script self-
-//      exits when its parent dies (an app quit never leaks the child), and
-//      an unexpected child death respawns after 5s. A LAN device proving
-//      inbound open with no flag retires the worker too — its only
-//      long-lived case is a dialog hanging unanswered, which is exactly
-//      what it must keep watching.
+//      only when the state changes, judged against a ROAMING-PROOF
+//      invariant: the app's enabled inbound Allow rules must collectively
+//      cover every profile ({Public, Private, Domain}) — the Windows
+//      dialog's Allow is scoped to the category active at answer time, so
+//      "current network works" does not survive a network switch, and
+//      retiring on it would reopen the silent-failure hole. A block
+//      appearing sets the flag; missing coverage sets it too (preventive:
+//      the phone may still work right now, the NEXT network would not);
+//      the invariant being met clears it and retires the worker (rules
+//      cannot change by themselves — nothing left to watch). The script
+//      self-exits when its parent dies (an app quit never leaks the
+//      child), and an unexpected child death respawns after 5s. The one
+//      long-lived case is the fresh-install window where the Windows
+//      dialog is still unanswered — the OS gets the first chance to
+//      satisfy the invariant before the overlay demands the repair.
 //
 // A temp .ps1 file is used instead of passing the script via -ArgumentList to
 // avoid quotes/braces being mangled while being passed on the command line.
 // Only takes effect on Windows; a no-op on other platforms.
-use crate::logger::{loge, logf, logw};
+use crate::logger::{loge, logf};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -101,96 +118,6 @@ pub(crate) fn run_ps(script: &str) -> Option<(bool, String)> {
     }
 }
 
-/// Outcome of looking for a Block rule that targets our own exe. "Absent" and
-/// "Unknown" must not be conflated: hiding the repair overlay because a check
-/// failed (powershell unavailable, script error) would leave the phone blocked
-/// with the UI claiming everything is fine.
-#[cfg(windows)]
-enum BlockCheck {
-    /// Confirmed: no such Block rule exists.
-    Absent,
-    /// Confirmed: a Block rule exists, with its display name.
-    Present(String),
-    /// The check itself failed; no conclusion either way.
-    Unknown,
-}
-
-/// Look for an ENABLED Block inbound rule for our own exe that APPLIES to the
-/// currently active network(s). Filters by program first (one indexed query)
-/// instead of walking every inbound Block rule and fetching its filter one by
-/// one — the latter takes seconds, which directly adds to the detection
-/// latency.
-///
-/// Two applicability guards keep this from crying wolf (the overlay locks the
-/// app behind Quit/Allow, so the check must be strict):
-///   - Enabled only: an inactive rule blocks nothing (disabling the Block in
-///     wf.msc is a common manual fix).
-///   - Profile coverage: a rule scoped to Public does not block on a Private
-///     network. The rule's profile set is intersected with the active
-///     NetworkCategory values ('DomainAuthenticated' folds to 'Domain'); an
-///     uncovered-but-present rule is reported as "dormant:" in the output so
-///     the log keeps the diagnosis without flagging a repair.
-#[cfg(windows)]
-fn find_block_rule(exe: &str) -> BlockCheck {
-    let ps = format!(
-        r#"$exe = '{exe}'
-$active = @((Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object {{ $_.NetworkCategory }}) | ForEach-Object {{ if ($_ -eq 'DomainAuthenticated') {{ 'Domain' }} else {{ $_ }} }} | Sort-Object -Unique)
-$applicable = ''
-$dormant = ''
-Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue | ForEach-Object {{
-  $r = $_ | Get-NetFirewallRule -ErrorAction SilentlyContinue
-  if ($r -and $r.Enabled -eq 'True' -and $r.Direction -eq 'Inbound' -and $r.Action -eq 'Block') {{
-    $applies = $false
-    if ($r.Profile -eq 'Any') {{ $applies = $true }}
-    else {{ foreach ($p in (($r.Profile -split ',') | ForEach-Object {{ $_.Trim() }})) {{ if ($active -contains $p) {{ $applies = $true }} }} }}
-    if ($applies) {{ if (-not $applicable) {{ $applicable = $r.DisplayName }} }}
-    else {{ if (-not $dormant) {{ $dormant = $r.DisplayName }} }}
-  }}
-}}
-if ($applicable) {{ $applicable }} elseif ($dormant) {{ 'dormant:' + $dormant }} else {{ '' }}"#
-    );
-    match run_ps(&ps) {
-        Some((true, out)) => {
-            let s = out.trim();
-            if s.is_empty() {
-                BlockCheck::Absent
-            } else if let Some(dormant) = s.strip_prefix("dormant:") {
-                logf(&format!(
-                    "firewall: Block rule '{dormant}' exists but its profile does not cover the active network — not blocking"
-                ));
-                BlockCheck::Absent
-            } else {
-                BlockCheck::Present(s.to_string())
-            }
-        }
-        _ => BlockCheck::Unknown,
-    }
-}
-
-/// The Program path our Allow inbound rule points at, if the rule exists.
-/// Comparing this against the current exe path catches the "exe was moved or
-/// renamed after the rule was created" case: the rule still shows up in the
-/// firewall UI but no longer matches this binary, so the phone stays blocked
-/// with no visible reason.
-#[cfg(windows)]
-fn allow_rule_program() -> Option<String> {
-    let ps = format!(
-        r#"$r = Get-NetFirewallRule -DisplayName '{RULE_ALLOW}' -ErrorAction SilentlyContinue
-if ($r) {{ ($r | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue).Program }}"#
-    );
-    match run_ps(&ps) {
-        Some((true, out)) => {
-            let s = out.trim().to_string();
-            if s.is_empty() {
-                None
-            } else {
-                Some(s)
-            }
-        }
-        _ => None,
-    }
-}
-
 /// Log the active network profile(s) (Private/Public/Domain). A Public profile
 /// combined with stricter inbound handling is one of the most common reasons a
 /// phone cannot connect while the PC's own browser (loopback) works fine.
@@ -224,59 +151,12 @@ pub fn ensure_background(app: AppHandle) {
                 return;
             };
             log_network_profile();
-            // First check whether an applicable Block already exists before
-            // startup (left over from last time). The result only sets the
-            // initial flag and the diagnostic logs — ALL subsequent rule
-            // watching belongs to the fw worker, which is spawned below in
-            // every branch.
-            match find_block_rule(&exe) {
-                BlockCheck::Present(name) => {
-                    let allow = allow_rule_program();
-                    logf(&format!(
-                        "firewall needs repair: found applicable Block inbound rule name={name} (allow rule present={}{})",
-                        allow.is_some(),
-                        allow.map(|p| format!(", program={p}")).unwrap_or_default()
-                    ));
-                    // Applicable = enabled AND profile covers the active
-                    // network: the phone is certainly blocked right now, so
-                    // flag immediately — no grace window, the state itself is
-                    // the evidence. The worker's transition logic no-ops on
-                    // its first read (flag already set) and keeps watching
-                    // for the rule to vanish.
-                    mark_need_repair(&app);
-                }
-                BlockCheck::Unknown => {
-                    // Cannot inspect rules right now; do not guess. The
-                    // worker's respawn loop keeps retrying the query, and a
-                    // phone actually connecting remains the other signal.
-                    logw("firewall: could not inspect rules (powershell failed), relying on connection evidence");
-                }
-                BlockCheck::Absent => {
-                    match allow_rule_program() {
-                        Some(prog) => {
-                            if prog.eq_ignore_ascii_case(&exe) {
-                                logf("firewall OK: Allow rule covers this exe, no Block");
-                            } else {
-                                // The rule exists but was created for another
-                                // copy of tinbox (exe moved/renamed). Windows
-                                // re-prompts for the new path at bind time;
-                                // the worker watches for whatever the user
-                                // answers.
-                                logf(&format!(
-                                    "firewall: Allow rule points at a different exe (rule={prog}, current={exe}); watching for a Block rule"
-                                ));
-                            }
-                        }
-                        None => {
-                            logf("firewall: no Allow rule yet — the Windows dialog may be up; worker watching for the answer");
-                        }
-                    }
-                }
-            }
-            // One long-lived worker owns every rule transition from here on:
-            // the dialog answer (block appears → flag; allow appears → stand
-            // down) and the flagged block's disappearance (flag cleared →
-            // overlay down). See spawn_fw_worker for the lifetime policy.
+            // No startup rule pre-check: the worker's FIRST pass (~1s after
+            // launch) IS the startup check. One judge, one verdict — a
+            // separate pre-check would either duplicate the worker's logic
+            // or disagree with it. Unhealthy → flag + overlay + the worker
+            // stays watching; healthy → the worker retires immediately
+            // (nothing can change the rules by itself).
             spawn_fw_worker(app, exe);
         });
     }
@@ -291,27 +171,28 @@ pub fn ensure_background(app: AppHandle) {
 /// need_repair confirm check). Each spawn of powershell costs ~1.1s of CPU
 /// (engine init dominates; the WMI query itself is ~60ms), so the script
 /// loops IN-PROCESS and emits one line only when the state changes:
-///   'block:<DisplayName>' — an applicable enabled Block rule appeared
-///   'allow'               — an Allow rule for this exe appeared
-///   'none'                — neither (also the initial state at start)
+///   'ok'                 — CANONICAL state: exactly one inbound rule for
+///                          the exe, and it is our enabled all-profile Allow
+///   'dirty:<detail>'     — anything else (dialog Query rules, hand-made
+///                          blocks, duplicates, disabled strays); detail is
+///                          'block' when an applicable block is the reason,
+///                          'shape' otherwise
+///   'none'               — no inbound rules at all: the Windows dialog is
+///                          pending, so hold fire and let the OS have its
+///                          chance first
 ///
-/// The Rust side translates transitions into flag moves:
-///   → Blocked: flag set (overlay up) — the worker STAYS ALIVE so the
-///     overlay closes the moment the rule vanishes;
-///   → away from Blocked: flag cleared (overlay down) — the confirm path
-///     need_repair() used to throttle at 4s; this closes it within one
-///     worker pass (~0.6s);
-///   → Allowed with no flag: the dialog will never re-appear for this path,
-///     nothing left to watch — worker retires.
-/// A 1s Rust tick additionally retires the worker when a LAN device has
-/// proven inbound open with no flag (the old watcher's stand-down), so the
-/// lifetime is bounded in every case except a dialog hanging unanswered —
-/// which is exactly what it must keep watching.
+/// The invariant is deliberately EXACT: the app maintains exactly one rule
+/// (tinbox_Allow_Inbound, Any profile, enabled) and accepts nothing else.
+/// Every deviation — including a "harmless" extra allow the OS dialog left
+/// behind — gets flagged and cleaned by the repair, so the rule table stays
+/// readable and the judgment is a simple equality, not coverage math.
+/// Retirement happens only when the invariant holds — rules cannot change
+/// by themselves, so nothing is left to watch.
 ///
-/// Robustness: the script self-exits when its parent process dies (an app
-/// quit must not leak the child), and an unexpected child death (powershell
-/// crashed, AV killed it) respawns after 5s — cost-equivalent to the old
-/// confirm throttle and self-healing.
+/// The Rust side translates transitions into flag moves: dirty → flag
+/// (overlay up); ok → clear (overlay down) and retire. The script self-
+/// exits when its parent process dies (an app quit never leaks the child),
+/// and an unexpected child death respawns after 5s.
 #[cfg(windows)]
 fn spawn_fw_worker(app: AppHandle, exe: String) {
     std::thread::spawn(move || {
@@ -323,26 +204,25 @@ $ppid = {ppid}
 $prev = ''
 while ($true) {{
   if (-not (Get-Process -Id $ppid -ErrorAction SilentlyContinue)) {{ break }}
-  $active = $null
-  $block = ''
-  $allow = $false
-  Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue | ForEach-Object {{
-    $r = $_ | Get-NetFirewallRule -ErrorAction SilentlyContinue
-    if ($r -and $r.Enabled -eq 'True' -and $r.Direction -eq 'Inbound') {{
-      if ($r.Action -eq 'Block') {{
-        if ($null -eq $active) {{
-          $active = @((Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object {{ $_.NetworkCategory }}) | ForEach-Object {{ if ($_ -eq 'DomainAuthenticated') {{ 'Domain' }} else {{ $_ }} }} | Sort-Object -Unique)
-        }}
+  $rules = @(Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue | Get-NetFirewallRule | Where-Object {{ $_.Direction -eq 'Inbound' }})
+  $s = ''
+  if ($rules.Count -eq 0) {{
+    $s = 'none'
+  }} elseif ($rules.Count -eq 1 -and $rules[0].Enabled -eq 'True' -and $rules[0].Action -eq 'Allow' -and $rules[0].Profile -eq 'Any' -and $rules[0].DisplayName -eq 'tinbox_Allow_Inbound') {{
+    $s = 'ok'
+  }} else {{
+    $detail = 'shape'
+    $active = @((Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object {{ $_.NetworkCategory }}) | ForEach-Object {{ if ($_ -eq 'DomainAuthenticated') {{ 'Domain' }} else {{ $_ }} }} | Sort-Object -Unique)
+    foreach ($r in $rules) {{
+      if ($r.Enabled -eq 'True' -and $r.Action -eq 'Block') {{
         $applies = $false
         if ($r.Profile -eq 'Any') {{ $applies = $true }}
         else {{ foreach ($p in (($r.Profile -split ',') | ForEach-Object {{ $_.Trim() }})) {{ if ($active -contains $p) {{ $applies = $true }} }} }}
-        if ($applies -and -not $block) {{ $block = $r.DisplayName }}
-      }} elseif ($r.Action -eq 'Allow') {{
-        $allow = $true
+        if ($applies) {{ $detail = 'block'; break }}
       }}
     }}
+    $s = 'dirty:' + $detail
   }}
-  $s = if ($block) {{ 'block:' + $block }} elseif ($allow) {{ 'allow' }} else {{ 'none' }}
   if ($s -ne $prev) {{ $prev = $s; [Console]::WriteLine($s) }}
   Start-Sleep -Milliseconds 500
 }}"#
@@ -391,26 +271,28 @@ while ($true) {{
             loop {
                 match rx.recv_timeout(Duration::from_secs(1)) {
                     Ok(line) => match line.trim() {
-                        s if s.starts_with("block:") => {
-                            let name = s.strip_prefix("block:").unwrap_or(s);
+                        s if s.starts_with("dirty:") => {
+                            let detail = &s["dirty:".len()..];
                             if !PENDING_REPAIR.load(Ordering::SeqCst) {
                                 logf(&format!(
-                                    "fw worker: applicable Block rule '{name}' appeared, flagging repair"
+                                    "fw worker: rule set is not canonical ({detail}) — flagging repair to restore it"
                                 ));
                                 mark_need_repair(&app);
                             }
-                            // Stay alive: this side now watches for the rule
-                            // to vanish (overlay must close when it does).
+                            // Stay alive: the repair wipes everything pointing
+                            // at the exe and recreates the canonical rule,
+                            // flipping this to 'ok'.
                         }
-                        "allow" => {
+                        "ok" => {
                             if PENDING_REPAIR.load(Ordering::SeqCst) {
-                                logf("fw worker: Block rule gone (Allow present), clearing repair flag");
+                                logf("fw worker: coverage restored, clearing repair flag");
                                 clear_need_repair();
                             } else {
-                                logf("fw worker: Allow rule covers this exe — dialog answered with Allow");
+                                logf("fw worker: all-profile Allow coverage in place — invariant met");
                             }
-                            // The dialog will never re-appear for this path;
-                            // there is nothing left to watch.
+                            // The invariant is roaming-proof: rules cannot
+                            // change by themselves, so there is nothing left
+                            // to watch this session.
                             policy_dead = true;
                         }
                         "none" => {
@@ -418,7 +300,10 @@ while ($true) {{
                                 logf("fw worker: applicable Block rule gone, clearing repair flag");
                                 clear_need_repair();
                             }
-                            // Keep watching: the dialog may still be pending.
+                            // No rules at all: the Windows dialog is pending.
+                            // Hold fire — the OS gets the first chance to
+                            // satisfy the invariant, the worker re-judges on
+                            // the next pass.
                         }
                         _ => {}
                     },
@@ -426,19 +311,6 @@ while ($true) {{
                     Err(mpsc::RecvTimeoutError::Disconnected) => break, // child died
                 }
                 if policy_dead {
-                    break;
-                }
-                // Stand-down with no flag: a connected device proved inbound
-                // open, so the dialog question is moot. (With the flag set
-                // the worker must live on: the overlay waits for the rule to
-                // vanish. Evidence clearing the flag is need_repair()'s own
-                // branch; the next tick retires the worker then.)
-                if !PENDING_REPAIR.load(Ordering::SeqCst)
-                    && (crate::server::lan_seen_recently(30)
-                        || crate::server::transfer_active_recently(30))
-                {
-                    logf("fw worker: device connected, inbound proven open — standing down");
-                    policy_dead = true;
                     break;
                 }
             }
@@ -516,6 +388,11 @@ pub fn need_repair() -> bool {
 pub fn repair() -> bool {
     #[cfg(windows)]
     {
+        // No click dedup on purpose: every click is a genuine request and
+        // spawns its own UAC — a cancelled prompt must be retry-able
+        // instantly, never gated by a cooldown. Stacked grants are safe: the
+        // script deletes the previous tinbox_Allow_Inbound before creating
+        // the new one, so N grants still converge to exactly one rule.
         let Some(exe) = exe_path() else { return false; };
         repair_as_admin(&exe)
     }
@@ -546,10 +423,12 @@ pub fn quit(app: &AppHandle) {
 /// hidden; the UAC consent prompt itself is unaffected.
 ///
 /// ShellExecute is fire-and-forget (no -Wait), so the launcher — itself a
-/// hidden powershell — waits for the script's self-delete instead. A
-/// cancelled UAC throws inside the launcher → it exits at once, so a refused
-/// prompt fails fast instead of stalling through the wait cap. The caller
-/// re-checks the rule afterwards either way, so the verdict stays honest.
+/// hidden powershell — is spawned and never waited on: the /repair handler
+/// must return instantly (the UAC dialog may sit unanswered for minutes, and
+/// blocking on it once froze the overlay's buttons for 11 minutes). A
+/// cancelled UAC simply changes nothing; the user retries. The verdict
+/// belongs to the fw worker: it re-judges the invariant within ~1s and
+/// closes the overlay via the SSE flag.
 ///
 /// Blocks the calling thread: but the frontend modal already covers the UI
 /// while the user waits for the repair, so blocking is fine.
@@ -558,27 +437,29 @@ fn repair_as_admin(exe: &str) -> bool {
     let dir = data_dir();
     let ps1 = dir.join("tinbox_fw_fix.ps1");
 
-    // Self-contained script: delete Block + add Allow, then self-delete the ps1.
+    // Self-contained script: restore the CANONICAL rule set — create the one
+    // all-profile Allow, then wipe EVERY other inbound rule pointing at the
+    // exe (dialog Query rules, hand-made blocks, duplicates, disabled
+    // strays). New-first ordering: at least one valid Allow exists at every
+    // instant. The canonical check on the worker side requires exactly this
+    // rule set, so a successful run always flips the worker to 'ok'.
     // Note: Get-NetFirewallRule's -DisplayName cannot be combined with
     // -Direction/-Action (different parameter sets).
     let script = format!(
         r#"$exe = '{exe}'
 try {{
-  Get-NetFirewallRule -Direction Inbound -Action Block -ErrorAction SilentlyContinue | ForEach-Object {{
+  $new = New-NetFirewallRule -DisplayName '{RULE_ALLOW}' -Direction Inbound -Action Allow -Program $exe -Profile Any -ErrorAction Stop
+  Get-NetFirewallRule -Direction Inbound -ErrorAction SilentlyContinue | ForEach-Object {{
     $f = $_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
-    if ($f -and $f.Program -ieq $exe) {{
+    if ($f -and $f.Program -ieq $exe -and $_.Name -ne $new.Name) {{
       Remove-NetFirewallRule -Name $_.Name -ErrorAction SilentlyContinue
     }}
   }}
-  Get-NetFirewallRule -DisplayName '{RULE_ALLOW}' -ErrorAction SilentlyContinue | ForEach-Object {{
-    Remove-NetFirewallRule -Name $_.Name -ErrorAction SilentlyContinue
-  }}
-  # One-time migration: clean up the old (filedrop-era) allow rule to avoid
-  # orphaned rules lingering.
+  # One-time migration: clean up the old (filedrop-era) allow rule — its
+  # program points at the old exe path, so the program scan above misses it.
   Get-NetFirewallRule -DisplayName 'FileDrop_Allow_Inbound' -ErrorAction SilentlyContinue | ForEach-Object {{
     Remove-NetFirewallRule -Name $_.Name -ErrorAction SilentlyContinue
   }}
-  New-NetFirewallRule -DisplayName '{RULE_ALLOW}' -Direction Inbound -Action Allow -Program $exe -Profile Any -ErrorAction Stop | Out-Null
 }} catch {{
   Write-Host ('FAIL:' + $_.Exception.Message)
 }}
@@ -590,47 +471,37 @@ Remove-Item $MyInvocation.MyCommand.Path -ErrorAction SilentlyContinue"#
     }
 
     use std::os::windows::process::CommandExt;
-    use std::process::Command;
-    // ShellExecute with the runas verb + SW_HIDE (the trailing 0): the hidden
-    // show-command travels with process creation, so the elevated console is
-    // born hidden — no flash. The launcher then waits for the script's
-    // self-delete (ShellExecute cannot wait); a cancelled UAC throws and
-    // exits the launcher at once (exit 1 → launched=no).
+    use std::process::{Command, Stdio};
+    // Fire-and-forget: the launcher's ONLY job is to carry the runas verb
+    // (the UAC consent + the elevated run happen inside it). It is spawned
+    // and never waited on — waiting here would block the /repair handler for
+    // as long as the UAC dialog sits unanswered, with both buttons disabled
+    // (the regression: an 11-minute hang). Confirmation belongs to the fw
+    // worker, which re-judges the invariant within ~1s of the rules landing
+    // and closes the overlay through the flag; a cancelled UAC simply means
+    // nothing changes and the user can retry.
     let launcher = format!(
         "$sh = New-Object -ComObject Shell.Application; \
          try {{ $sh.ShellExecute('powershell.exe', \
          '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File \"{ps1}\"', \
-         '', 'runas', 0) }} catch {{ exit 1 }}; \
-         $deadline = (Get-Date).AddSeconds(30); \
-         while ((Test-Path -LiteralPath '{ps1}') -and ((Get-Date) -lt $deadline)) {{ \
-           Start-Sleep -Milliseconds 300 \
-         }}",
+         '', 'runas', 0) }} catch {{ exit 1 }}",
         ps1 = ps1.to_string_lossy()
     );
-    let launched = match Command::new("powershell.exe")
+    match Command::new("powershell.exe")
         .args(["-NoProfile", "-NonInteractive", "-Command", &launcher])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
-        .output()
+        .spawn()
     {
-        Ok(o) => o.status.success(),
-        Err(_) => false,
-    };
-    // The real success criterion: whether the Block is really gone (the
-    // launcher can only report that the launch itself succeeded). An
-    // unverifiable outcome is reported as not fixed — the repair may still
-    // have worked, and the overlay will close by itself once a device
-    // actually connects.
-    let fixed = match find_block_rule(exe) {
-        BlockCheck::Absent => "yes (success)",
-        BlockCheck::Present(_) => "no (still blocked)",
-        BlockCheck::Unknown => "unverifiable (check failed)",
-    };
-    logf(&format!(
-        "repair: launched={}, Block removed={}",
-        if launched { "yes" } else { "no" },
-        fixed
-    ));
-    fixed == "yes (success)"
+        // The launcher outlives this call by design; dropping the Child does
+        // not kill it, and it exits on its own once ShellExecute returns.
+        Ok(_) => true,
+        Err(e) => {
+            loge(&format!("repair: could not launch powershell: {e}"));
+            false
+        }
+    }
 }
 
 // Suppress unused warnings on non-Windows.

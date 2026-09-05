@@ -635,8 +635,8 @@
     <div class="fw-icon">
       <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
     </div>
-    <div class="fw-title">Firewall prompt was cancelled</div>
-    <div class="fw-desc">Cancelling the Windows firewall prompt creates a block rule — phones cannot reach this PC until it is removed. Click Allow and confirm the UAC prompt to fix it.</div>
+    <div class="fw-title">Restore tinbox firewall rules</div>
+    <div class="fw-desc">The firewall rules for tinbox are not the expected ones — phones may fail to connect on some networks. Click Allow and confirm the UAC prompt to restore the correct rules.</div>
     <div class="fw-btns">
       <button class="fw-btn repair" id="fwRepair">Allow</button>
       <button class="fw-btn quit" id="fwQuit">Quit</button>
@@ -1673,15 +1673,24 @@ document.addEventListener('visibilitychange', () => {
 
 let fwWasShown = false;
 // Firewall repair flag arrives as an SSE `fw` event (the server pushes only on
-// change); no /fw-status polling. There is deliberately NO dismiss affordance:
-// a shown overlay means an applicable Block rule exists — the phone cannot
-// connect and the gate behind it is dead anyway. A false alarm self-heals
-// (a device connecting clears the flag within a second); anything else is
-// resolved by Allow (auto-fix) or Quit.
+// change); no /fw-status polling. The flag means the firewall would block the
+// phone on some network — either an applicable Block rule exists, or the Allow
+// rules do not cover every network type (the dialog's Allow is scoped to the
+// category active at answer time). The overlay is PREVENTIVE: it may appear
+// while the current network still works, because the next network change
+// would break connectivity. There is no dismiss: the fix is one UAC prompt,
+// and after it the all-profile Allow makes the issue permanent-impossible.
 function applyFw(needRepair){
   const show = !!needRepair;
   $('fwOverlay').classList.toggle('show', show);
-  if(fwWasShown && !show){ fetch('/untop', {method:'POST'}).catch(()=>{}); }
+  if(fwWasShown && !show){
+    // The worker (or connection evidence) just cleared the flag — the fix
+    // landed. The success toast lives HERE, not in the repair click: the
+    // repair return only means "UAC granted", the confirmation is this
+    // transition.
+    fetch('/untop', {method:'POST'}).catch(()=>{});
+    toast('Network access granted');
+  }
   fwWasShown = show;
 }
 $('fwRepair').onclick = async () => {
@@ -1692,10 +1701,11 @@ $('fwRepair').onclick = async () => {
     const r = await fetch('/repair', {method:'POST'});
     const txt = await r.text();
     if(txt.trim() === 'ok'){
-      $('fwOverlay').classList.remove('show');
-      fetch('/untop', {method:'POST'}).catch(()=>{});
-      fwWasShown = false;
-      toast('Network access granted');
+      // The launcher is spawned — the UAC prompt (if any) is on screen now.
+      // The fix is confirmed by the fw worker within ~1s of the rules
+      // landing: applyFw(false) closes this overlay. If the UAC prompt is
+      // cancelled, nothing changes and clicking Allow retries.
+      $('fwHint').textContent = 'Confirm the UAC prompt — the overlay closes once the fix takes effect.';
     } else {
       $('fwHint').textContent = 'Permission not granted. Click Allow to retry.';
     }

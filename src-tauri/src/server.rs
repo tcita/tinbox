@@ -203,7 +203,7 @@ fn push_dl_state(map: &std::collections::HashMap<String, DlProg>, msg_id: &str) 
 
 /// Preferred port; when taken, fall forward within the same range, and as a
 /// last resort fall back to a kernel-assigned free port.
-const PORT: u16 = 8765;
+const PORT: u16 = 7765;
 
 /// The port actually bound (written after a successful bind; used by handlers
 /// like /qr to build URLs consistent with the window).
@@ -469,7 +469,7 @@ fn note_foreign_subnet(peer: &SocketAddr) {
     ));
 }
 
-/// Find an available port starting from the preferred one: try 8765..8780 one
+/// Find an available port starting from the preferred one: try 7765..7780 one
 /// by one; if all are taken, bind port 0 (kernel assigns a free port).
 async fn bind_any() -> std::io::Result<(tokio::net::TcpListener, u16)> {
     for port in PORT..PORT + 16 {
@@ -563,7 +563,7 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024))
                 .with_state(app_handle);
 
-            // Find an available port: preferred 8765, fall forward when taken,
+            // Find an available port: preferred 7765, fall forward when taken,
             // and let the kernel pick a free port when the range is exhausted.
             let (listener, actual) = match bind_any().await {
                 Ok(v) => v,
