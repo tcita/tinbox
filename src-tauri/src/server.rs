@@ -538,7 +538,17 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
             let app = Router::new()
                 .route("/", get(index))
                 .route("/list", get(list))
-                .route("/upload", post(upload))
+                // /upload is exempt from the body cap: it streams the body
+            // straight to disk (see upload()), so RSS stays flat however big
+            // the push is, and a full disk fails the write cleanly (row +
+            // partial file are dropped on the error path). Every other POST
+            // buffers through the Json extractor, which reads the WHOLE body
+            // into memory before deserializing — those keep axum's default
+            // 2MB limit so an unbounded body cannot spike RSS.
+            .route(
+                "/upload",
+                post(upload).layer(DefaultBodyLimit::disable()),
+            )
                 .route("/add-local", post(add_local))
                 .route("/send-text", post(send_text))
                 .route("/log", post(client_log))
@@ -560,7 +570,6 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 .route("/quit", post(quit))
                 .route("/untop", post(untop))
                 .layer(from_fn(log_requests))
-                .layer(DefaultBodyLimit::max(2 * 1024 * 1024 * 1024))
                 .with_state(app_handle);
 
             // Find an available port: preferred 7765, fall forward when taken,
