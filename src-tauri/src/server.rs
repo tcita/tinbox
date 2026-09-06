@@ -1187,28 +1187,53 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
             // Held for the stream's whole life: on drop (peer gone mid-transfer)
             // it reaps this transfer's counter and logs the outcome.
             let cut = StreamCutGuard { tid: tid.clone(), msg_id: msg_id.clone(), name: name.clone() };
+            // Stream-local byte count: this pull's authoritative sent figure,
+            // independent of the shared counter's lifetime. The monitor reaps a
+            // counter after 30s of silence (a paused puller); the stream
+            // outlives the reap, so the rebuild below needs the stream's own
+            // numbers, not whatever a dead entry remembers.
+            let mut sent: u64 = start;
             Box::pin(base.map(move |chunk| {
                 // Referencing `cut` keeps it captured, so it is dropped only when
                 // the whole stream (and thus this closure) is dropped by hyper.
                 let _alive = &cut;
                 match &chunk {
                     Ok(b) => {
+                        sent += b.len() as u64;
                         let mut map = dl_lock();
-                        if let Some(e) = map.get_mut(&tid) {
-                            e.sent += b.len() as u64;
-                            touch_entry(e);
-                            if e.sent >= e.total && e.total > 0 {
-                                logf(&format!("download done {tid}: {} bytes", e.sent));
-                                // The receiver just got the whole file: stamp the
-                                // PC's delivery marker. Per-byte progress stays
-                                // unpushed — the puller's browser owns that UI.
-                                let _ = notifier().send(PushEvent::Delivered { id: msg_id.clone() });
-                                // This pull no longer counts as active; if it was
-                                // the LAST active pull of the file, end the
-                                // sender's card pulse. (A sibling pull still
-                                // mid-flight keeps the union lit.)
-                                push_dl_state(&map, &msg_id);
+                        let e = match map.get_mut(&tid) {
+                            Some(e) => e,
+                            None => {
+                                // Re-seed a pruned counter from the stream's own
+                                // count: the pull was paused past the monitor's
+                                // 30s window, the entry went away, and without
+                                // this rebuild the resumed stream would finish
+                                // uncounted — no done log, no Delivered push,
+                                // and a wrong active-set for sibling pulls.
+                                logf(&format!(
+                                    "download counter rebuilt {tid}: {sent}/{} bytes (was pruned while paused)",
+                                    len
+                                ));
+                                let e = map.entry(tid.clone()).or_default();
+                                e.total = len;
+                                e.sent = sent;
+                                touch_entry(e);
+                                map.get_mut(&tid).unwrap()
                             }
+                        };
+                        e.sent = sent;
+                        touch_entry(e);
+                        if e.sent >= e.total && e.total > 0 {
+                            logf(&format!("download done {tid}: {} bytes", e.sent));
+                            // The receiver just got the whole file: stamp the
+                            // PC's delivery marker. Per-byte progress stays
+                            // unpushed — the puller's browser owns that UI.
+                            let _ = notifier().send(PushEvent::Delivered { id: msg_id.clone() });
+                            // This pull no longer counts as active; if it was
+                            // the LAST active pull of the file, end the
+                            // sender's card pulse. (A sibling pull still
+                            // mid-flight keeps the union lit.)
+                            push_dl_state(&map, &msg_id);
                         }
                     }
                     Err(err) => {
@@ -1785,22 +1810,30 @@ async fn monitor_loop() {
         // (a lingering completion would keep reappearing in /dl-status), and
         // in-flight ones after 30s of silence — a dead pull's socket write can
         // hang past any timeout, so its entry dies here rather than through
-        // the stream (a living stream that resumes simply re-touches its entry
-        // and never goes stale). Upload entries whose writer already failed
-        // were removed by the writer itself. Broadcast `resync` when anything
-        // drops so clients reconcile their upload rings back to idle (a silent
-        // prune would otherwise leave a ring stuck).
+        // the stream. A pruned-but-alive stream rebuilds its counter on its
+        // next chunk (see the chunk loop in serve), so a paused-then-resumed
+        // pull goes: pruned here with this log line, rebuilt below with that
+        // one. Upload entries whose writer already failed were removed by the
+        // writer itself. Broadcast `resync` when anything drops so clients
+        // reconcile their upload rings back to idle (a silent prune would
+        // otherwise leave a ring stuck).
         let now = now_mono();
         {
             let mut map = dl_lock();
             let before = map.len();
-            map.retain(|_, e| {
+            map.retain(|id, e| {
                 let stale = now.saturating_sub(e.last_ts);
-                if e.sent >= e.total {
-                    stale <= 15
-                } else {
-                    stale <= 30
+                let keep = if e.sent >= e.total { stale <= 15 } else { stale <= 30 };
+                if !keep && e.sent < e.total {
+                    // Only the incomplete reap gets a line: the finished one is
+                    // lifecycle noise. Say "stalled pull" so it reads next to
+                    // started/done/cut in the same vocabulary.
+                    logw(&format!(
+                        "prune stalled pull {id}: {}/{} bytes (30s silent)",
+                        e.sent, e.total
+                    ));
                 }
+                keep
             });
             if map.len() < before {
                 let _ = notifier().send(PushEvent::Resync);
