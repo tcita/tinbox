@@ -1092,19 +1092,30 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
     // download progress bar and speed.
     let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
 
-    // Range support: the phone resumes interrupted downloads by asking for
-    // bytes=N- instead of re-fetching the whole file, and media previews get
-    // seekable playback for free. Malformed / multi-range headers fall through
+    // Range support: media previews get seekable playback, and a download
+    // manager may resume an interrupted pull with bytes=N-. Whether any given
+    // client resumes, and when, is that client's business and changes between
+    // versions; what HTTP asks of the server is a strong validator so a
+    // resume can be proven safe — without one, clients that would otherwise
+    // resume restart from zero. Content behind an id is immutable, so the id
+    // doubles as the ETag; a stale client's mismatched If-Range falls through
+    // to a full 200 body. Malformed / multi-range headers also fall through
     // to a full 200 body.
+    let etag = format!("\"{}\"", p.id);
+    let if_range_ok = headers
+        .get(header::IF_RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map_or(true, |ir| ir == etag);
     logf(&format!(
-        "serve {} q={:?} range={:?} ua={:?}",
+        "serve {} q={:?} range={:?} if_range_ok={} ua={:?}",
         p.id,
         uri.query(),
         headers.get(header::RANGE).and_then(|v| v.to_str().ok()),
-        headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok())
+        if_range_ok,
+        headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()),
     ));
-    let (start, end, partial) = match headers
-        .get(header::RANGE)
+    let range_hdr = if if_range_ok { headers.get(header::RANGE) } else { None };
+    let (start, end, partial) = match range_hdr
         .and_then(|v| v.to_str().ok())
         .and_then(|r| parse_range(r, len))
     {
@@ -1253,6 +1264,7 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
             (header::CONTENT_DISPOSITION, cd),
             (header::CONTENT_LENGTH, len.to_string()),
             (header::CONTENT_TYPE, ct),
+            (header::ETAG, etag),
             (header::CACHE_CONTROL, cc.to_string()),
         ],
         body,
