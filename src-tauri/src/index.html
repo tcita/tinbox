@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="tinbox">
@@ -128,6 +128,7 @@
   #qrUrl {
     font-size: 11px; font-weight: 500; color: var(--sub);
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    cursor: text; user-select: text; -webkit-user-select: text;
   }
   @media (pointer: coarse) { #qrBox { display: none; } .addrbar { display: none; } }
 
@@ -168,6 +169,10 @@
     background: var(--accent-bg); border: none; border-radius: 10px;
     padding: 8px 14px; max-width: 100%;
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    cursor: text; user-select: text; -webkit-user-select: text;
+  }
+  .ql-hint {
+    margin-top: 10px; font-size: 11px; color: var(--sub); line-height: 1.4;
   }
 
   /* Chat Area */
@@ -227,6 +232,10 @@
 
   .bubble.text {
     white-space: pre-wrap; cursor: default;
+    /* Selectable text on every device, like an ordinary webpage: long-press
+       on the phone gives the browser's own selection loupe + system copy
+       menu (the app paints no competing menu anymore), right-click on the PC
+       gives the app menu. */
     user-select: text; -webkit-user-select: text;
   }
   .bubble.text:active { transform: scale(0.995); }
@@ -331,6 +340,21 @@
   .file-card.has-preview .fc-info { width: 100%; }
   .file-card.has-preview .fc-name { max-width: none; }
 
+  /* Only the card's TEXT is selection-suppressed on touch — the img/video
+     themselves stay at user-select:auto, exactly like any ordinary website's
+     <img>: Safari's long-press 拷贝 has a long-standing quirk of putting the
+     image AND its URL on the pasteboard (text-ish paste targets then take
+     the URL), and the media element's own selectability is the one page-side
+     lever we have for behaving like a vanilla site. The explicit -webkit-
+     prefix matters: body's unprefixed user-select:none does not cascade to
+     descendants on iOS (user-select is non-inherited), which is what used to
+     paint a stray selection rect over the image during a long-press. No
+     -webkit-touch-callout anywhere in the card — that would block the native
+     menu. */
+  @media (pointer: coarse) {
+    .file-card, .fc-name, .fc-size, .meta-line { -webkit-user-select: none; user-select: none; }
+  }
+
   /* A file that is still uploading pulses gently (no numeric progress). */
   .file-card.pending { animation: pendingPulse 1.6s ease-in-out infinite; }
   @keyframes pendingPulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
@@ -351,6 +375,14 @@
     max-width: 100%; max-height: 100%; border-radius: 8px;
     box-shadow: 0 8px 40px rgba(0,0,0,0.5);
   }
+  .mo-close {
+    position: absolute; top: calc(10px + env(safe-area-inset-top, 0px));
+    right: calc(10px + env(safe-area-inset-right, 0px));
+    width: 32px; height: 32px; border-radius: 50%; border: none; cursor: pointer;
+    background: rgba(255,255,255,0.14); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .mo-close:active { transform: scale(0.92); }
   @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
   /* Empty state */
@@ -400,9 +432,12 @@
     box-shadow: 0 0 0 3px var(--accent-bg);
   }
   #txt {
-    flex: 1; resize: none; max-height: 100px; min-height: 34px; height: 34px;
+    flex: 1; resize: none; max-height: 100px; min-height: 38px; height: 38px;
     border: none; outline: none; padding: 7px 0;
-    font-size: 14.5px; font-family: inherit; background: transparent; color: var(--text);
+    /* 16px, not a taste choice: iOS Safari force-zooms the viewport on focus
+       for any form field set below 16px (it ignores user-scalable=no since
+       iOS 10), which shears the whole chat layout when the keyboard opens. */
+    font-size: 16px; font-family: inherit; background: transparent; color: var(--text);
     line-height: 1.4; user-select: text;
   }
 
@@ -485,7 +520,9 @@
     padding: 8px 16px; max-width: 100%;
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     display: inline-flex; align-items: center;
+    cursor: text; user-select: text; -webkit-user-select: text;
   }
+  #gateUrl span { cursor: text; user-select: text; -webkit-user-select: text; }
   /* Dismiss the gate and jump straight to the message list without waiting */
   .g-actions {
     margin-top: 18px; display: flex; justify-content: center;
@@ -536,7 +573,15 @@
   .fw-btn:disabled { opacity: 0.5; pointer-events: none; }
   .fw-hint { font-size: 11.5px; color: var(--sub); margin-top: 12px; line-height: 1.4; }
 
-  /* Context Menu */
+  /* Pairing-expired overlay (phone): the PC process restarted, the pairing
+   cookie no longer matches — only a fresh scan restores access. */
+#pairGate {
+  position: fixed; inset: 0; z-index: 90; background: var(--bg);
+  display: none; align-items: center; justify-content: center; padding: 20px;
+}
+#pairGate.show { display: flex; }
+
+/* Context Menu */
   .ctx-menu {
     position: fixed; display: none; z-index: 400;
     background: var(--glass-bg);
@@ -613,7 +658,7 @@
       <img src="/logo" alt="tinbox">
     </div>
     <div class="g-title" id="gateTitle">Scan to connect</div>
-    <div class="g-desc" id="gateDesc">Make sure your phone is on the same Wi-Fi.</div>
+    <div class="g-desc" id="gateDesc">Make sure your phone is on the same Wi-Fi.<br>Pairing expires when you close tinbox — scan again after restarting the app.</div>
     <div class="qr-frame">
       <img id="gateQr" src="/qr" alt="QR code">
     </div>
@@ -621,9 +666,9 @@
       <div id="gateUrl"><span>…</span></div>
     </div>
     <div class="g-actions">
-      <button class="g-inbox" id="gateInbox">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
-        Inbox
+      <button class="g-inbox" id="gateInbox" title="Open the inbox folder on disk">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        Open inbox
       </button>
     </div>
   </div>
@@ -659,6 +704,20 @@
   </div>
 </div>
 
+<!-- Pairing-expired overlay: the PC closed and reopened tinbox; old pairing
+     dies with the process. A new scan (fresh tab) reconnects. -->
+<div id="pairGate">
+  <div class="g-card">
+    <div class="g-radar">
+      <!-- No /logo here: in the expired state every fetch 403s, so imagery
+           must be inline-only (a glyph, no network asset). -->
+      <span style="font-size:44px;line-height:1">📦</span>
+    </div>
+    <div class="g-title">Pairing expired</div>
+    <div class="g-desc">Pairing does not survive a restart. Scan the QR code shown on the tinbox window on the PC to connect.</div>
+  </div>
+</div>
+
 <!-- QR Lightbox (PC): enlarge the header QR for scanning -->
 <div id="qrLightbox">
   <div class="ql-card">
@@ -668,6 +727,7 @@
     <div class="ql-title">Scan to connect a device</div>
     <img class="ql-qr" src="/qr" alt="QR code">
     <div><div class="ql-url" id="qlUrl">…</div></div>
+    <div class="ql-hint">Pairing expires on restart — this URL changes each time you open tinbox.</div>
   </div>
 </div>
 
@@ -725,6 +785,15 @@ function iconFor(name){
 }
 
 // ---- Server API -----------------------------------------------------------
+
+// Media-class helpers, single source of truth: the renderer, the phone
+// "open" action and the long-press convergence all ask the same two questions
+// about a file name. Kept ahead of their users (function declarations, so
+// hoisting would also work, but one table reads better than three literals).
+const IMG_EXTS = ['jpg','jpeg','png','gif','webp','heic','bmp','svg'];
+const VID_EXTS = ['mp4','mov','avi','mkv','webm'];
+const isImgName = n => IMG_EXTS.includes((n.split('.').pop()||'').toLowerCase());
+const isVidName = n => VID_EXTS.includes((n.split('.').pop()||'').toLowerCase());
 // Every HTTP call to the local server goes through api(): the method, query
 // and body conventions live in exactly one place instead of a bespoke fetch
 // per handler. Returns the raw Response, so each caller keeps its own .ok /
@@ -732,13 +801,25 @@ function iconFor(name){
 // reconcile). FormData bodies pass through untouched — the browser must set
 // the multipart boundary itself; anything else is JSON-encoded.
 function qs(query){ return '?' + new URLSearchParams(query); }
+// 403 from any server call = the pairing cookie failed the server's check:
+// the process restarted and its token rotated. Once seen, the pairing-expired
+// gate is latched — only a fresh scan fixes it; the SSE stream is stopped so
+// a dead connection can't keep the page pretending to be live.
+let pairExpired = false;
+function pairExpiredNow(){
+  if(pairExpired) return;
+  pairExpired = true;
+  try { es.close(); } catch {}
+  $('pairGate').classList.add('show');
+}
 async function api(path, { method = 'GET', query, body, signal } = {}){
   const init = { method, signal };
   if(body !== undefined){
     init.body = body instanceof FormData ? body : JSON.stringify(body);
     if(!(body instanceof FormData)) init.headers = { 'Content-Type': 'application/json' };
   }
-  return fetch(query ? path + qs(query) : path, init);
+  const url = query ? path + qs(query) : path;
+  return fetch(url, init).then(r => { if(r.status === 403) pairExpiredNow(); return r; });
 }
 
 // Context Menu
@@ -766,14 +847,11 @@ function attachMenu(el, it, bubble){
 
 function showCtxMenu(x, y, it, bubble){
   if(it.pending) return;               // mid-upload: no reveal/delete/download yet
-  // Phone file cards have their action on the Download button; long-press only
-  // still offers Copy for text messages (PC keeps its file menu).
-  if(!isPC && it.kind === 'file') return;
   ctxTarget = it;
   ctxBubble = bubble;
   const m = $('ctxMenu');
   m.innerHTML = '';
-  
+
   const add = (label, iconSvg, cls, fn) => {
     const b = document.createElement('button');
     if(cls) b.className = cls;
@@ -784,20 +862,24 @@ function showCtxMenu(x, y, it, bubble){
 
   const copyIco = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>`;
   const delIco = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>`;
-  const openIco = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>`;
-  const dlIco = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`;
 
-  if(it.kind === 'text'){
-    add('Copy', copyIco, '', () => copyText(ctxTarget));
-    if(isPC) add('Delete', delIco, 'danger', () => delItem(ctxTarget));
-  } else {
-    if(isPC){
-      add('Reveal in Explorer', openIco, '', () => revealItem(ctxTarget));
-      add('Delete', delIco, 'danger', () => delItem(ctxTarget));
+  // The context menu is a PC affordance only (right-click), unified to
+  // Copy + Delete for every card. The corner folder button owns "open the
+  // folder", so Reveal has no menu seat. The phone's long-press belongs to
+  // the browser everywhere — media gets the native image menu, text gets
+  // native selection + the system copy callout — so the app paints no menu
+  // of its own there.
+  let any = false;
+  if(isPC){
+    if(it.kind === 'text'){
+      add('Copy', copyIco, '', () => copyText(it));
     } else {
-      add('Download', dlIco, '', () => downloadFile(ctxTarget));
+      add(isImgName(it.name) ? 'Copy image' : 'Copy file', copyIco, '', () => copyItem(it));
     }
+    add('Delete', delIco, 'danger', () => delItem(it));
+    any = true;
   }
+  if(!any) return;
 
   const w = 160, h = 90;
   const left = Math.min(x, window.innerWidth - w - 12);
@@ -808,8 +890,48 @@ function showCtxMenu(x, y, it, bubble){
 }
 
 async function copyText(it){
-  try { await navigator.clipboard.writeText(it.text); toast('Copied to clipboard'); }
-  catch { toast('Copy failed'); }
+  try { await navigator.clipboard.writeText(it.text); toast('Copied to clipboard'); return; }
+  catch {}
+  // The phone reaches this page over plain LAN http, which is NOT a secure
+  // context — the async Clipboard API does not exist there at all (the try
+  // above is really an existence probe). The legacy execCommand path with a
+  // synthetic selection is the only copy that works on iOS/Android over http.
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = it.text;
+    ta.style.cssText = 'position:fixed;left:-9999px;opacity:0';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    toast(ok ? 'Copied to clipboard' : 'Copy failed');
+  } catch { toast('Copy failed'); }
+}
+// File-card Copy, unified with the text bubbles': images copy their bytes
+// (fetch -> decode -> canvas -> PNG, the one image format every paste target
+// accepts), every other file copies ITSELF as a clipboard file (CF_HDROP via
+// /copy-file — the web Clipboard API cannot carry files), so an Explorer
+// paste or Ctrl+V into WeChat hands over the real file. A decode failure
+// (HEIC in the desktop webview) degrades to the same file copy, not a dead
+// toast.
+async function copyItem(it){
+  const fileCopy = async () => {
+    const r = await api('/copy-file', { method:'POST', query:{ id: it.id } });
+    toast(r.ok ? 'File copied' : 'Copy failed');
+  };
+  if(it.kind !== 'file' || !isImgName(it.name)) return fileCopy();
+  try {
+    const bmp = await createImageBitmap(await (await api('/view', { query: { id: it.id } })).blob());
+    const cnv = document.createElement('canvas');
+    cnv.width = bmp.width; cnv.height = bmp.height;
+    cnv.getContext('2d').drawImage(bmp, 0, 0);
+    const png = await new Promise(b => cnv.toBlob(b, 'image/png'));
+    bmp.close();
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
+    toast('Image copied');
+  } catch {
+    return fileCopy();
+  }
 }
 // No confirmation dialog: window.confirm is broken inside the Tauri WebView
 // (no dialog plugin -> it resolves to a rejected Promise, which is truthy, so
@@ -826,6 +948,36 @@ async function revealItem(it){
   if(!res.ok) toast('File no longer exists');
 }
 function hideCtxMenu(){ $('ctxMenu').classList.remove('show'); }
+
+// Phone text bubbles: long-press = select the WHOLE message. The platform's
+// own long-press selects a word (its callout needs a second tap on 全选);
+// upgrading the selection to the full bubble right at release turns
+// "long-press → copy" into one gesture, with the native copy button — the
+// app paints no menu of its own (ordinary-webpage rule). If the browser
+// does not auto-show its callout over a programmatic selection, tapping the
+// selection brings it up; either way the copy action is the system's.
+function attachSelectAll(el){
+  let t0 = 0, x = 0, y = 0, moved = false;
+  el.addEventListener('touchstart', e => {
+    if(e.touches.length !== 1){ t0 = 0; return; }
+    t0 = Date.now();
+    x = e.touches[0].clientX; y = e.touches[0].clientY; moved = false;
+  }, {passive: true});
+  el.addEventListener('touchmove', e => {
+    const t = e.touches[0];
+    if(Math.abs(t.clientX - x) > 10 || Math.abs(t.clientY - y) > 10) moved = true;
+  }, {passive: true});
+  el.addEventListener('touchend', () => {
+    if(!t0 || moved || Date.now() - t0 < 450) return;
+    t0 = 0;
+    const sel = window.getSelection();
+    const r = document.createRange();
+    r.selectNodeContents(el);
+    sel.removeAllRanges();
+    sel.addRange(r);
+  });
+  el.addEventListener('touchcancel', () => { t0 = 0; });
+}
 
 document.addEventListener('click', () => {
   if(suppressClick){ suppressClick = false; return; }
@@ -950,25 +1102,34 @@ function render(items){
     if(it.kind === 'text'){
       bubble.classList.add('text');
       bubble.textContent = it.text;
-      attachMenu(bubble, it, null);
+      // PC: right-click menu. Phone: long-press selects the whole message
+      // and the system copy callout does the rest.
+      if(isPC) attachMenu(bubble, it, null);
+      else attachSelectAll(bubble);
     } else {
       const card = document.createElement('div');
       card.className = 'file-card';
       if(it.pending){ card.dataset.pending = '1'; card.classList.add('pending'); }
-      const ext = (it.name.split('.').pop()||'').toLowerCase();
-      const isImg = ['jpg','jpeg','png','gif','webp','heic','bmp','svg'].includes(ext);
-      const isVid = ['mp4','mov','avi','mkv','webm'].includes(ext);
+      const isImg = !it.pending && isImgName(it.name);
+      const isVid = !it.pending && isVidName(it.name);
 
-      // A pending upload has nothing on disk yet: no /view preview, no open.
-      if(!it.pending && isImg){
+      // Preview bytes follow the long-press contract: the native media menu
+      // (Safari loupe + 存储图像) saves img.src, so cards pull the ORIGINAL
+      // (/view) on both ends — the phone so "Save Image" stores real bytes,
+      // the PC because it holds the file on disk and the pull is loopback.
+      // /view is no-store, so a re-render refetches what is on screen: cheap
+      // on the PC (loopback), LAN-local and lazy-loaded on the phone.
+      // Undecodable formats (HEIC on old iOS) fail as before: onerror drops
+      // the preview, the card falls back to its icon.
+      if(isImg){
         card.classList.add('has-preview');
         const img = document.createElement('img');
-        img.src = '/view?id='+encodeURIComponent(it.id);
+        img.src = '/view?id=' + encodeURIComponent(it.id);
         img.alt = it.name;
         img.loading = 'lazy';
         img.onerror = () => { img.remove(); card.classList.remove('has-preview'); };
         card.appendChild(img);
-      } else if(!it.pending && isVid){
+      } else if(isVid){
         card.classList.add('has-preview');
         const v = document.createElement('video');
         v.src = '/view?id='+encodeURIComponent(it.id);
@@ -986,11 +1147,11 @@ function render(items){
       info.querySelector('.fc-name').textContent = it.name;
       info.querySelector('.fc-size').textContent = fmtSize(it.size);
       if(it.pending){
-        // Direction caption only — the percent lives in the corner ring.
-        // Pending rows only ever originate from the phone, so the caption is
-        // "Uploading…" on the sending phone and "Receiving…" on the PC.
+        // Direction caption by sender, not by device: a pending row can be the
+        // phone's push or the PC's own paste-to-send. The percent lives in the
+        // corner ring on the receiving end only.
         info.querySelector('.fc-size').textContent +=
-          ' · ' + (!isPC ? 'Uploading…' : 'Receiving…');
+          ' · ' + (mine ? 'Uploading…' : 'Receiving…');
       }
       card.appendChild(info);
 
@@ -1018,9 +1179,19 @@ function render(items){
       card.onclick = () => {
         if(it.pending) return;                            // still uploading
         if(isPC) openDefault(it);
-        else openOnPhone(it);                             // previews media only
+        // Phone tap = "show it", exactly like tapping a file link on an
+        // ordinary webpage: the browser decides — its inline viewer for
+        // PDF/text, its own download flow (with its own progress UI) for
+        // anything else. The corner button stays the explicit download.
+        else if(isImg || isVid) openOnPhone(it);
+        else location.href = '/view?id=' + encodeURIComponent(it.id);
       };
-      attachMenu(card, it, bubble);
+      // The app's long-press menu is a PC affordance only (right-click). On
+      // the phone the long-press gesture is handed to the browser's native
+      // media menu on cards, and is simply dead on non-media files (their one
+      // action, Download, lives on the corner button) — no 450ms timer, no
+      // custom items, no suppression fighting the platform.
+      if(isPC) attachMenu(card, it, bubble);
       bubble.appendChild(card);
     }
 
@@ -1274,19 +1445,27 @@ function checkUploadGone(items){
 }
 
 // Phone "open": fullscreen preview for media, a hint otherwise (the phone has
-// no generic file viewer).
+// no generic file viewer). The fullscreen layer deliberately keeps the
+// BROWSER's native long-press callout: it shows the ORIGINAL bytes, so the
+// platform's "Save Image" / "Download" / share sheet operates on the real
+// photo — the one place where native menus are both natural and byte-correct.
 function openOnPhone(it){
-  const ext = (it.name.split('.').pop()||'').toLowerCase();
-  const isImg = ['jpg','jpeg','png','gif','webp','heic','bmp','svg'].includes(ext);
-  const isVid = ['mp4','mov','avi','mkv','webm'].includes(ext);
-  if(!isImg && !isVid) return;   // only images/videos can be previewed; no "open"
+  if(!isImgName(it.name) && !isVidName(it.name)) return;   // only media previews
+  const isVid = isVidName(it.name);
   const ov = document.createElement('div');
   ov.className = 'media-ov';
   const src = '/view?id='+encodeURIComponent(it.id);
   ov.innerHTML = isVid
     ? '<video src="'+src+'" controls autoplay playsInline></video>'
-    : '<img src="'+src+'">';
-  ov.onclick = () => ov.remove();
+    : '<img src="'+src+'">'
+    + '<button class="mo-close" aria-label="Close">'
+    + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
+    + '</button>';
+  // Image: any tap dismisses (the whole layer IS the photo). Video: only the
+  // backdrop or the ✕ dismisses — taps on the video itself must reach the
+  // native controls (play/pause/seek), not close the layer under the finger.
+  ov.onclick = (e) => { if(!isVid || e.target === ov) ov.remove(); };
+  ov.querySelector('.mo-close').onclick = (e) => { e.stopPropagation(); ov.remove(); };
   document.body.appendChild(ov);
 }
 
@@ -1476,6 +1655,17 @@ async function startUpload(f){
 }
 
 $('txt').addEventListener('input', () => { autoSize(); updateSendBtn(); });
+// Paste-to-send on the composer: a screenshot on the PC, or an image just
+// copied from a card on the phone, sends immediately — the same flow as the
+// plus button, no staging UI. Text-only pastes are untouched, and a
+// <textarea> cannot render an image anyway, so intercepting the file
+// representation is the only way it reaches the app. Some mobile keyboards
+// never offer 粘贴 for an image-only clipboard; there the plus button stays
+// the path (failure mode = today's behavior, nothing lost).
+$('txt').addEventListener('paste', e => {
+  const files = [...(e.clipboardData ? e.clipboardData.files : [])];
+  if(files.length){ e.preventDefault(); uploadFiles(files); }
+});
 $('txt').addEventListener('keydown', e => {
   if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendText(); }
 });
@@ -1596,13 +1786,15 @@ window.addEventListener('drop', e => {
 // the moment. The SSE channel below still reconnects + replays state
 // invisibly; it just never paints.
 let everConnected = false;
-let gateDismissed = false;
 function applyInfo(d){
   if(!isPC || !d) return;
   const online = !!d.mobileConnected;
-  if(online && !everConnected) toast('Device connected');
+  if(online && !everConnected) toast('Paired — ready to transfer');
   if(online) everConnected = true;
-  $('gate').classList.toggle('show', !everConnected && !gateDismissed);
+  // The gate is a pairing screen, not a splash: it never goes away by click.
+  // The first LAN device arriving is the only thing that lifts it — which is
+  // exactly the reported question "已连接了吗？" answered in one gesture.
+  $('gate').classList.toggle('show', !everConnected);
   if(d.url){
     $('qrUrl').textContent = d.url;
     $('gateUrl').querySelector('span').textContent = d.url;
@@ -1631,9 +1823,10 @@ let lastSeen = 0;
 // probing, so closing/reopening would only double the churn.
 let esDown = false;
 function connect(){
+  if(pairExpired) return;
   es = new EventSource('/events');
   es.onopen = () => { esDown = false; lastSeen = Date.now(); reconcile(); };
-  es.onerror = () => { esDown = true; };
+  es.onerror = () => { esDown = true; probePairing(); };
   // The server heartbeats as unnamed `message` events (see /events keep_alive);
   // this is the only hook that sees them.
   es.onmessage = () => { lastSeen = Date.now(); };
@@ -1657,10 +1850,31 @@ function connect(){
 }
 connect();
 
+// Pairing-expiry probe: EventSource never surfaces HTTP statuses, so a token
+// rotated by a server restart looks identical to a dead server. Every SSE
+// failure and every down-channel poll cycle checks /list once: a 403 answers
+// at once and trips pairExpiredNow (the overlay replaces the stale snapshot
+// within ~a retry delay, so an old tab never lingers as a "usable" main UI);
+// a network failure (server still closed) is swallowed — the probe is also
+// half of "watch for the PC coming back". The in-flight guard dedupes, since
+// EventSource can fire `error` on a ~1s retry cadence.
+let pairProbeInFlight = false;
+function probePairing(){
+  if(superseded || pairExpired || pairProbeInFlight) return;
+  pairProbeInFlight = true;
+  fetch('/list')
+    .then(r => { if(r.status === 403) pairExpiredNow(); })
+    .catch(() => {})
+    .finally(() => { pairProbeInFlight = false; });
+}
+
 // One reconcile pass: everything that can fall behind re-pulls both mirrors.
 // Driven by the `resync` event, a (re)connect and a return to the foreground —
 // never by per-state timers.
 function reconcile(){
+  probePairing();       // 403 is asked before anything else refreshes: the
+                        // overdue overlay must not wait for the probe interval.
+  if(pairExpired) return;
   refresh();
   resyncProgress();
 }
@@ -1671,7 +1885,7 @@ function reconcile(){
 // EventSource will never notice on its own. Force a fresh connection; its
 // `open` replays state.
 setInterval(() => {
-  if(superseded) return;
+  if(superseded || pairExpired) return;
   if(!esDown && lastSeen && Date.now() - lastSeen > 3000){
     lastSeen = Date.now();
     try { es.close(); } catch {}
@@ -1763,11 +1977,15 @@ document.addEventListener('keydown', e => {
 });
 
 if(isPC){
-  // The gate hides either when the user browses without a device
-  // (gateDismissed) or once the first device connects (everConnected latches
-  // inside applyInfo); it never comes back after that.
+  // The gate hides only once the first device connects (everConnected latches
+  // inside applyInfo); it never comes back after that. There is NO manual
+  // escape: the gate is the pairing screen, and pairing is the only way to the
+  // in-app timeline. The Inbox button is a real folder — the transfer landing
+  // zone on disk — and nothing else.
   $('gate').classList.add('show');
-  $('gateInbox').onclick = () => { gateDismissed = true; $('gate').classList.remove('show'); };
+  $('gateInbox').onclick = async () => {
+    try { await api('/open-dir', { method: 'POST' }); } catch {}
+  };
 }
 
 // Report client-side exceptions into the server log, so a failure on the phone

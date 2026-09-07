@@ -6,7 +6,7 @@
 use axum::{
     body::Body,
     extract::{connect_info::ConnectInfo, Multipart, Query, Request, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode, Uri},
     middleware::{from_fn, Next},
     response::{Html, IntoResponse, Json, Response, sse::{Event, Sse, KeepAlive}},
     routing::{get, post},
@@ -251,6 +251,23 @@ fn from_by_peer(peer: SocketAddr) -> &'static str {
 /// the PC never counts itself.
 static LAST_PHONE_ACT: AtomicU64 = AtomicU64::new(0);
 
+/// Monotonic seconds since start of the most recent request from a **paired**
+/// LAN device — same traffic stream as LAST_PHONE_ACT, minus what the pairing
+/// gate refused. Presence (the QR gate latch, the device transitions the
+/// monitor announces) must mean "a paired device is alive", so an expired or
+/// never-paired web page — which gets 403s for everything — cannot lift the
+/// PC's gate into "connected" by merely refetching. Transit evidence reaches
+/// this stamp only through log_requests and the presence guard after the
+/// pairing middleware has let the request through.
+static LAST_PAIRED_ACT: AtomicU64 = AtomicU64::new(0);
+
+/// A LAN device is online while it holds an open /events stream or was active
+/// recently. Evidence writers (the only three): events()/PresenceGuard ->
+/// LAN_EVENTS_OPEN (paired only: /events itself is behind the gate), transfer
+/// chunk writers -> DlProg::last_ts (uploads need a paired cookie). Requests
+/// arrive via log_requests, which stamps LAST_PAIRED_ACT for every response
+/// the pairing middleware did not refuse.
+
 /// Peers already warned about coming from a different subnet than the QR IP.
 static SUBNET_WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
 
@@ -278,9 +295,14 @@ fn now_mono() -> u64 {
 ///                 client's watchdog measures server death by its silence.
 ///   presence      PRESENCE_ACT_SECS — a LAN device is online while it holds
 ///                 an open /events stream or was active recently. Evidence
-///                 writers (the only three): `log_requests` -> LAST_PHONE_ACT,
-///                 `events`/PresenceGuard -> LAN_EVENTS_OPEN, transfer chunk
-///                 writers -> DlProg::last_ts (via touch_entry). The monitor
+///                 writers (the only three): `log_requests` ->
+///                 LAST_PAIRED_ACT (paired requests only — the pairing gate
+///                 marks its refusals, and unpaired 403 traffic must never
+///                 count as "device present", or an expired tab could lift the
+///                 PC scan gate), `events`/PresenceGuard -> LAN_EVENTS_OPEN
+///                 (itself behind the pairing gate), transfer chunk writers ->
+///                 DlProg::last_ts (via touch_entry; uploads need a paired
+///                 cookie, so this is paired by construction). The monitor
 ///                 is the single announcer of transitions.
 ///                 Consumers are the PC scan gate's first-connect latch, the
 ///                 firewall's inbound-proof, and the logs — no UI light.
@@ -359,8 +381,16 @@ static LAN_EVENTS_OPEN: AtomicU64 = AtomicU64::new(0);
 /// block: optimistic under no-FIN death, and global rather than per-device.
 fn lan_peer_connected() -> bool {
     LAN_EVENTS_OPEN.load(Ordering::Relaxed) > 0
-        || lan_seen_recently(PRESENCE_ACT_SECS)
+        || lan_paired_recently(PRESENCE_ACT_SECS)
         || transfer_active_recently(PRESENCE_ACT_SECS)
+}
+
+/// Recent activity from a PAIRED LAN device: identical shape to
+/// lan_seen_recently, but reading LAST_PAIRED_ACT. This is the stamp presence
+/// and the PC gate latch run on; unpaired 403 traffic must not lift the gate.
+fn lan_paired_recently(secs: u64) -> bool {
+    let last = LAST_PAIRED_ACT.load(Ordering::Relaxed);
+    last != 0 && now_mono().saturating_sub(last) < secs
 }
 
 /// Any in-flight download whose streams pushed bytes within the last `secs`
@@ -387,7 +417,7 @@ pub(crate) fn transfer_active_recently(secs: u64) -> bool {
 fn presence_evidence() -> String {
     let now = now_mono();
     let streams = LAN_EVENTS_OPEN.load(Ordering::Relaxed);
-    let req = match LAST_PHONE_ACT.load(Ordering::Relaxed) {
+    let req = match LAST_PAIRED_ACT.load(Ordering::Relaxed) {
         0 => "never".to_string(),
         t => format!("{}s ago", now.saturating_sub(t)),
     };
@@ -425,6 +455,20 @@ async fn log_requests(
         logf(&format!("{} {} <- {}", method, path, peer));
     }
     let resp = next.run(req).await;
+    if is_lan {
+        // Two stamps, two consumers, out of the same request stream:
+        //   LAST_PHONE_ACT proves packets can arrive — firewall evidence — and
+        //   a pairing refusal is still an arrival, so it was already stamped
+        //   above.
+        //   LAST_PAIRED_ACT proves a PAIRED device is present, and only gets
+        //   this request when the pairing gate let it through. Previously ONE
+        //   stamp fed presence: an expired tab (403 for everything) visibly
+        //   lifted the PC's QR gate into "Paired" by merely refetching — the
+        //   report that produced this split.
+        if resp.headers().get(UNPAIRED_MARKER).is_none() {
+            LAST_PAIRED_ACT.store(now_mono(), Ordering::Relaxed);
+        }
+    }
     if resp.status().as_u16() >= 400 {
         logf(&format!(
             "{} {} <- {} -> error response {}",
@@ -434,6 +478,145 @@ async fn log_requests(
             resp.status().as_u16()
         ));
     }
+    resp
+}
+
+// ── Pairing token ─────────────────────────────────────────────────────────
+// The QR code encodes http://IP:PORT/?t=<token>; a phone's first visit with the
+// correct ?t= is handed a cookie and needs no further interaction. The PC's own
+// window rides loopback and never needs the token. Token lifetime = process
+// lifetime (no persistence): the app runs desk-range sessions of minutes to a
+// few hours, so every restart is also a natural "expire all pairings" event,
+// and knowing the bare IP:PORT on this LAN is not enough after a restart.
+static REQ_TOKEN: OnceLock<String> = OnceLock::new();
+
+/// The per-process pairing token, lazily generated on first use. Desktop-sized
+/// secrets are plenty against a LAN attacker who might see but mistype the
+/// QR once; 8 characters are also hand-typable for manual phone entry, which
+/// is why the alphabet avoids look-alike glyphs.
+fn request_token() -> &'static String {
+    REQ_TOKEN.get_or_init(|| {
+        // No crypto dependency here: RandomState's SipHash keys come from the
+        // OS CSPRNG, so folding a process id through two fresh hashers yields
+        // two independent words of OS-grade randomness per run.
+        use std::hash::{BuildHasher, Hasher};
+        const RAND_CHARS: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+        let mut buf = String::with_capacity(8);
+        let pid = std::process::id() as u64;
+        for salt in [0u8, 1] {
+            let mut h = std::collections::hash_map::RandomState::new()
+                .build_hasher();
+            h.write_u64(pid ^ 0x5a1fe93b2346_0000 | (salt as u64) << 24);
+            let mut v = h.finish();
+            for _ in 0..4 {
+                buf.push(RAND_CHARS[(v % 31) as usize] as char);
+                v /= 31;
+            }
+        }
+        buf
+    })
+}
+
+const COOKIE_NAME: &str = "tb_auth";
+
+/// Deterministic axum query split: token is alnum-only, so a plain byte check
+/// needs no percent-decoding.
+fn query_has_token(q: Option<&str>, tok: &str) -> bool {
+    let Some(q) = q else { return false };
+    q.split('&').any(|kv| match kv.split_once('=') {
+        Some((k, v)) => k == "t" && v == tok,
+        None => false,
+    })
+}
+
+fn cookie_carries_token(headers: &HeaderMap, tok: &str) -> bool {
+    headers.get(header::COOKIE).and_then(|v| v.to_str().ok())
+        .map_or(false, |c| {
+            c.split(';').any(|p| {
+                let p = p.trim();
+                match p.split_once('=') {
+                    Some((k, v)) => k == COOKIE_NAME && v == tok,
+                    None => false,
+                }
+            })
+        })
+}
+
+/// What an unpaired, non-loopback visitor sees: a card visually identical to
+/// the in-app "Pairing expired" overlay (same glyph, card geometry, type,
+/// theme-following palette and the SAME wording — one message for every
+/// unpaired arrival: expired session, first-time visitor, stale link; the
+/// instruction is the same "rescan", so the wording is one). All CSS and the
+/// emoji are inline; the page makes ZERO further requests (every asset it
+/// could want is behind the very gate that served it). The PC's loopback
+/// window never reaches this branch, so the text below is visitor-only.
+const UNPAIRED_PAGE: &str = concat!(
+    "<!doctype html><html><head><meta charset=\"utf-8\">",
+    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
+    "<title>tinbox — pairing expired</title><style>",
+    "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;",
+    "box-sizing:border-box;background:#f2f2f7;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}",
+    "@media (prefers-color-scheme: dark){body{background:#000000}}",
+    ".card{max-width:380px;width:100%;box-sizing:border-box;text-align:center;padding:36px 32px 30px;",
+    "background:#ffffff;border-radius:28px;border:1px solid rgba(0,0,0,0.04);",
+    "box-shadow:0 16px 48px rgba(0,0,0,0.08)}",
+    "@media (prefers-color-scheme: dark){.card{background:#1c1c1e;border-color:rgba(255,255,255,0.08)}}",
+    ".glyph{font-size:44px;line-height:1;margin-bottom:12px}",
+    "h1{font-size:20px;font-weight:700;letter-spacing:-0.4px;margin:0 0 6px;color:#1a1a1e}",
+    "@media (prefers-color-scheme: dark){h1{color:#ffffff}}",
+    "p{font-size:13px;line-height:1.55;margin:0;color:#86868b}",
+    "@media (prefers-color-scheme: dark){p{color:#8e8e93}}",
+    "</style></head><body><div class=\"card\">",
+    "<div class=\"glyph\">📦</div>",
+    "<h1>Pairing expired</h1>",
+    "<p>Pairing does not survive a restart. Scan the QR code shown on the tinbox window on the PC to connect.</p>",
+    "</div></body></html>"
+);
+
+/// Response marker the pairing gate attaches to every refusal: log_requests
+/// reads it after the fact to decide which of the two presence stamps this
+/// request may update (firewall proof: any inbound; device presence: paired
+/// only).
+const UNPAIRED_MARKER: HeaderName = HeaderName::from_static("x-tinbox-unpaired");
+
+/// Gate every non-loopback request: no valid pairing cookie, no access. A valid
+/// `?t=<token>` query (the QR payload / hand-typed URL) passes once and sets
+/// the long-lived cookie, so afterwards the pairing rides the browser jar with
+/// no URL decoration — the /view URLs the immutable cache keys on stay stable
+/// across restarts.
+async fn require_token(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if peer.ip().is_loopback() {
+        return next.run(req).await;
+    }
+    let tok = request_token().clone();
+    if cookie_carries_token(req.headers(), &tok) {
+        return next.run(req).await;
+    }
+    if query_has_token(req.uri().query(), &tok) {
+        let mut resp = next.run(req).await;
+        // 30-day browser-side life; server restart is the real expiry.
+        let cookie = format!(
+            "{COOKIE_NAME}={tok}; Path=/; Max-Age=2592000; HttpOnly"
+        );
+        if let Ok(v) = HeaderValue::from_str(&cookie) {
+            resp.headers_mut().append(header::SET_COOKIE, v);
+        }
+        return resp;
+    }
+    let mut resp = (
+        StatusCode::FORBIDDEN,
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
+            (header::CACHE_CONTROL, "no-cache".to_string()),
+        ],
+        UNPAIRED_PAGE,
+    )
+        .into_response();
+    resp.headers_mut().insert(UNPAIRED_MARKER, HeaderValue::from_static("1"));
     resp
 }
 
@@ -535,6 +718,11 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
             // drop them so no stale half-file surfaces in the timeline.
             catalog::purge_pending();
 
+            // One-time cleanup of the retired thumbnail layer: /thumb is gone
+            // (both ends pull /view originals), so inbox/.thumbs from older
+            // versions is dead weight on disk.
+            let _ = std::fs::remove_dir_all(catalog::inbox_dir().join(".thumbs"));
+
             let app = Router::new()
                 .route("/", get(index))
                 .route("/list", get(list))
@@ -565,10 +753,14 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 .route("/apple-touch-icon-precomposed.png", get(logo))
                 .route("/open-dir", post(open_dir))
                 .route("/reveal", post(reveal))
+                .route("/copy-file", post(copy_file))
                 .route("/events", get(events))
                 .route("/repair", post(repair))
                 .route("/quit", post(quit))
                 .route("/untop", post(untop))
+                // Inner-to-outer: token gate first, access log outermost (the
+                // log must also see refused requests).
+                .layer(from_fn(require_token))
                 .layer(from_fn(log_requests))
                 .with_state(app_handle);
 
@@ -592,6 +784,7 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 "listening on 0.0.0.0:{}; QR code points at http://{}:{}; candidate IPs={:?}",
                 actual, ip, actual, ips
             ));
+            logf(&format!("pairing token: {} (changes every app restart)", request_token()));
             logf(
                 "diagnostics - how to read this log: every phone request logs a '<phone-ip> GET ...' \
                  line. If the phone cannot open the page, those lines are absent, meaning requests \
@@ -688,7 +881,15 @@ async fn list() -> impl IntoResponse {
     Json(catalog::all_items())
 }
 
-async fn upload(Query(q): Query<UpQuery>, mut multipart: Multipart) -> impl IntoResponse {
+async fn upload(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(q): Query<UpQuery>,
+    mut multipart: Multipart,
+) -> impl IntoResponse {
+    // The sender follows the peer, exactly like /send-text: LAN pushes are
+    // "phone", the desktop's own paste-to-send (no real path to /add-local)
+    // is "pc" and must not be misattributed to the phone.
+    let from = from_by_peer(peer);
     loop {
         let mut field = match multipart.next_field().await {
             Ok(Some(f)) => f,
@@ -710,7 +911,7 @@ async fn upload(Query(q): Query<UpQuery>, mut multipart: Multipart) -> impl Into
         // shared byte counter, so BOTH ends render a progress ring immediately.
         // The sender reports its declared total via ?size=.
         let size = q.size.unwrap_or(0);
-        catalog::add_remote_pending(&id, &stored, &filename, size);
+        catalog::add_remote_pending(from, &id, &stored, &filename, size);
         let _ = notifier().send(PushEvent::List(catalog::all_items()));
         {
             let mut map = dl_lock();
@@ -1061,7 +1262,7 @@ impl Drop for StreamCutGuard {
     }
 }
 
-/// Shared file dispatch: inline=true previews in the browser (/view), false
+/// One shared-file dispatch: inline=true previews in the browser (/view), false
 /// forces a download (/dl). Looks up the message by id; only File messages can
 /// be dispatched, Text returns 400.
 async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: Uri) -> impl IntoResponse {
@@ -1270,18 +1471,12 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
     };
     let disp = if inline { "inline" } else { "attachment" };
     let cd = format!("{}; filename=\"{}\"", disp, name);
-    // Inline previews may be cached for good: a message id never changes
-    // content (the file behind it is written once; a re-upload gets a new id),
-    // so list re-renders stop re-pulling every visible image over the LAN.
-    // Pending files answer 404 (uncached), so the cache only ever holds final
-    // bytes. Attachment downloads are the opposite: their URLs carry a fresh
-    // &r= cache-buster, so caching would only pile multi-GB bodies into the
-    // browser cache with no reuse — forbid it.
-    let cc = if inline {
-        "public, max-age=31536000, immutable"
-    } else {
-        "no-store"
-    };
+    // Inline previews are zero-cache: card previews and fullscreen views both
+    // ride /view, refetched on re-render. Nothing here intends to live in a
+    // browser cache after the session — a deleted message should leave
+    // nothing retrievable on the phone. The id never changes content, but
+    // retention is the phone's, not the app's, problem.
+    let cc = "no-store";
     let mut resp = (
         StatusCode::OK,
         [
@@ -1291,10 +1486,16 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
             (header::CONTENT_TYPE, ct),
             (header::ETAG, etag),
             (header::CACHE_CONTROL, cc.to_string()),
+            // Inline responses get navigated to directly now (a tapped card
+            // hands the file to the browser). A sandboxed document can never
+            // execute scripts on this app's origin: an inbox .svg opened by
+            // navigation stays inert, while <img>/<video> subresource loads
+            // are unaffected — CSP applies to documents, not images.
+            (header::CONTENT_SECURITY_POLICY, "sandbox".to_string()),
         ],
         body,
     )
-        .into_response();
+    .into_response();
     if partial {
         *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
         let cr = format!("bytes {start}-{end}/{len}");
@@ -1589,6 +1790,56 @@ async fn reveal(
     (StatusCode::OK, "opened").into_response()
 }
 
+/// Copy an inbox file to the system clipboard as a file (CF_HDROP), so an
+/// Explorer paste — or Ctrl+V into any app's file target — receives the file
+/// itself. The web Clipboard API cannot carry files, so this rides the
+/// same-process server exactly like /open and /reveal. PC-only: the phone
+/// must not reach the desktop clipboard (same guard posture as /reveal).
+async fn copy_file(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(p): Query<IdParam>,
+) -> impl IntoResponse {
+    use clipboard_win::{formats, Clipboard, Setter};
+    if from_by_peer(peer) != "pc" {
+        logw("copy-file: rejected from phone (would write the PC clipboard)");
+        return (StatusCode::FORBIDDEN, "phone cannot use the PC clipboard").into_response();
+    }
+    let Some(entry) = catalog::find(&p.id) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    if entry.pending {
+        return (StatusCode::NOT_FOUND, "still uploading").into_response();
+    }
+    let path = match &entry.body {
+        catalog::MsgBody::File { source, .. } => source.path().to_string(),
+        catalog::MsgBody::Text { .. } => {
+            return (StatusCode::BAD_REQUEST, "not a file").into_response();
+        }
+    };
+    if !Path::new(&path).exists() {
+        return (StatusCode::NOT_FOUND, "file missing").into_response();
+    }
+    // The clipboard is a global, contended resource: open with retries, then
+    // clear stale formats so the paste target sees only the file list.
+    // FileList.write_clipboard builds the DROPFILES header + double-NUL
+    // wide path list CF_HDROP requires.
+    let _clip = match Clipboard::new_attempts(10) {
+        Ok(c) => c,
+        Err(e) => {
+            logw(&format!("copy-file: clipboard busy: {e:?}"));
+            return (StatusCode::INTERNAL_SERVER_ERROR, "clipboard busy").into_response();
+        }
+    };
+    let _ = clipboard_win::empty();
+    match formats::FileList.write_clipboard(&[path.as_str()]) {
+        Ok(()) => (StatusCode::OK, "copied").into_response(),
+        Err(e) => {
+            logw(&format!("copy-file: write failed: {e:?}"));
+            (StatusCode::INTERNAL_SERVER_ERROR, "copy failed").into_response()
+        }
+    }
+}
+
 /// Open the PC-side inbox directory (the phone frontend hides this button).
 /// Frontend "Inbox" click: open the inbox folder on the PC. PC-only for the
 /// same reason as /reveal — a phone request must not pop windows on the PC.
@@ -1751,13 +2002,15 @@ fn push_event_to_sse(ev: PushEvent) -> Event {
 }
 
 /// Best LAN IP + bound port + full URL, shared by the /qr code and `info` events.
+/// The URL carries the pairing token, so scanning the QR and copy-pasting the
+/// address elsewhere are one and the same gesture.
 fn current_url() -> (String, u16, String) {
     let ip = collect_ips()
         .first()
         .cloned()
         .unwrap_or_else(|| "127.0.0.1".to_string());
     let port = BOUND_PORT.get().copied().unwrap_or(PORT);
-    let url = format!("http://{}:{}", ip, port);
+    let url = format!("http://{}:{}/?t={}", ip, port, request_token());
     (ip, port, url)
 }
 
@@ -1850,7 +2103,7 @@ async fn qr() -> impl IntoResponse {
     let ips = collect_ips();
     let ip = ips.first().cloned().unwrap_or_else(|| "127.0.0.1".to_string());
     let port = BOUND_PORT.get().copied().unwrap_or(PORT);
-    let url = format!("http://{}:{}", ip, port);
+    let url = format!("http://{}:{}/?t={}", ip, port, request_token());
     let qr = match qrcode::QrCode::new(url.as_bytes()) {
         Ok(q) => q,
         Err(e) => {

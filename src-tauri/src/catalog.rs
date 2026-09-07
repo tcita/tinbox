@@ -292,15 +292,17 @@ pub fn add_remote(from: &str, id: &str, inbox_path: &Path, display_name: &str) -
     entry
 }
 
-/// Register a phone upload the moment its request arrives, marked `pending` so
-/// both devices can render the row and a progress ring while bytes stream in.
-/// `size` is the declared total (the phone sends it in the query string); it is
-/// corrected to the on-disk length when the upload finishes.
-pub fn add_remote_pending(id: &str, inbox_path: &Path, display_name: &str, size: u64) -> Entry {
+/// Register an upload the moment its request arrives, marked `pending` so both
+/// devices can render the row and a progress ring while bytes stream in. The
+/// sender is the peer-determined `from` ("phone" for LAN pushes, "pc" for the
+/// desktop's own paste-to-send, which has no real path and rides /upload).
+/// `size` is the declared total (sent in the query string); it is corrected to
+/// the on-disk length when the upload finishes.
+pub fn add_remote_pending(from: &str, id: &str, inbox_path: &Path, display_name: &str, size: u64) -> Entry {
     let entry = Entry {
         id: id.to_string(),
         ts: now_ts(),
-        from: "phone".to_string(),
+        from: from.to_string(),
         body: MsgBody::File {
             source: Source::Remote {
                 path: inbox_path.to_string_lossy().to_string(),
@@ -325,7 +327,7 @@ pub fn mark_remote_ready(id: &str) -> bool {
     let Some(e) = v.iter_mut().find(|e| e.id == id) else {
         return false;
     };
-    let is_pending_remote_file = e.pending && e.from == "phone"
+    let is_pending_remote_file = e.pending
         && matches!(&e.body, MsgBody::File { source: Source::Remote { .. }, .. });
     if !is_pending_remote_file {
         return false;
