@@ -369,8 +369,8 @@ fn clear_need_repair() {
 pub fn need_repair() -> bool {
     #[cfg(windows)]
     {
-        if crate::server::lan_seen_recently(30)
-            || crate::server::transfer_active_recently(30)
+        if crate::presence::lan_seen_recently(30)
+            || crate::transfer::transfer_active_recently(30)
         {
             PENDING_REPAIR.store(false, Ordering::SeqCst);
             return false;

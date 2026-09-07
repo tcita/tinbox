@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="apple-mobile-web-app-title" content="tinbox">
@@ -874,7 +874,7 @@ function showCtxMenu(x, y, it, bubble){
     if(it.kind === 'text'){
       add('Copy', copyIco, '', () => copyText(it));
     } else {
-      add(isImgName(it.name) ? 'Copy image' : 'Copy file', copyIco, '', () => copyItem(it));
+      add('Copy', copyIco, '', () => copyFile(it));
     }
     add('Delete', delIco, 'danger', () => delItem(it));
     any = true;
@@ -907,31 +907,17 @@ async function copyText(it){
     toast(ok ? 'Copied to clipboard' : 'Copy failed');
   } catch { toast('Copy failed'); }
 }
-// File-card Copy, unified with the text bubbles': images copy their bytes
-// (fetch -> decode -> canvas -> PNG, the one image format every paste target
-// accepts), every other file copies ITSELF as a clipboard file (CF_HDROP via
-// /copy-file — the web Clipboard API cannot carry files), so an Explorer
-// paste or Ctrl+V into WeChat hands over the real file. A decode failure
-// (HEIC in the desktop webview) degrades to the same file copy, not a dead
-// toast.
-async function copyItem(it){
-  const fileCopy = async () => {
-    const r = await api('/copy-file', { method:'POST', query:{ id: it.id } });
-    toast(r.ok ? 'File copied' : 'Copy failed');
-  };
-  if(it.kind !== 'file' || !isImgName(it.name)) return fileCopy();
-  try {
-    const bmp = await createImageBitmap(await (await api('/view', { query: { id: it.id } })).blob());
-    const cnv = document.createElement('canvas');
-    cnv.width = bmp.width; cnv.height = bmp.height;
-    cnv.getContext('2d').drawImage(bmp, 0, 0);
-    const png = await new Promise(b => cnv.toBlob(b, 'image/png'));
-    bmp.close();
-    await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
-    toast('Image copied');
-  } catch {
-    return fileCopy();
-  }
+// File-card Copy = the FILE itself on the clipboard (CF_HDROP, written by
+// the same-process server via /copy-file — the web Clipboard API cannot
+// carry files). An Explorer paste, or Ctrl+V into any file target, hands
+// over the real bytes. The bitmap route (ClipboardItem 'image/png' after a
+// canvas roundtrip) was tried and is NOT trustworthy: the write resolves
+// and toasts success, yet Explorer's desktop paste reads nothing — the log
+// showed three copy fetches, zero failures reported, empty pastes. One
+// path, one writer, always a file.
+async function copyFile(it){
+  const r = await api('/copy-file', { method:'POST', query:{ id: it.id } });
+  toast(r.ok ? 'File copied' : 'Copy failed');
 }
 // No confirmation dialog: window.confirm is broken inside the Tauri WebView
 // (no dialog plugin -> it resolves to a rejected Promise, which is truthy, so
@@ -948,36 +934,6 @@ async function revealItem(it){
   if(!res.ok) toast('File no longer exists');
 }
 function hideCtxMenu(){ $('ctxMenu').classList.remove('show'); }
-
-// Phone text bubbles: long-press = select the WHOLE message. The platform's
-// own long-press selects a word (its callout needs a second tap on 全选);
-// upgrading the selection to the full bubble right at release turns
-// "long-press → copy" into one gesture, with the native copy button — the
-// app paints no menu of its own (ordinary-webpage rule). If the browser
-// does not auto-show its callout over a programmatic selection, tapping the
-// selection brings it up; either way the copy action is the system's.
-function attachSelectAll(el){
-  let t0 = 0, x = 0, y = 0, moved = false;
-  el.addEventListener('touchstart', e => {
-    if(e.touches.length !== 1){ t0 = 0; return; }
-    t0 = Date.now();
-    x = e.touches[0].clientX; y = e.touches[0].clientY; moved = false;
-  }, {passive: true});
-  el.addEventListener('touchmove', e => {
-    const t = e.touches[0];
-    if(Math.abs(t.clientX - x) > 10 || Math.abs(t.clientY - y) > 10) moved = true;
-  }, {passive: true});
-  el.addEventListener('touchend', () => {
-    if(!t0 || moved || Date.now() - t0 < 450) return;
-    t0 = 0;
-    const sel = window.getSelection();
-    const r = document.createRange();
-    r.selectNodeContents(el);
-    sel.removeAllRanges();
-    sel.addRange(r);
-  });
-  el.addEventListener('touchcancel', () => { t0 = 0; });
-}
 
 document.addEventListener('click', () => {
   if(suppressClick){ suppressClick = false; return; }
@@ -1060,35 +1016,43 @@ function autoReceive(items){
   }
   seenFileIds = new Set(items.map(i => i.id));
 }
-function render(items){
-  const chat = $('chat');
-  const prev = chat.scrollTop;
-  const wasAtBottom = prev + chat.clientHeight >= chat.scrollHeight - 32;
-  chat.innerHTML = '';
-  
-  if(!items.length){
-    const e = document.createElement('div');
-    e.className = 'empty'; e.id = 'empty';
-    e.innerHTML = `
-      <div class="e-icon">
-        <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m3 15 4-4 4 4"/><path d="m14 9 4-4 4 4"/><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/></svg>
-      </div>
-      <div class="e-title">Ready for transfer</div>
-      <div class="e-desc">Send text messages, photos or files seamlessly across devices.</div>`;
-    chat.appendChild(e);
-    return;
-  }
+// Payload signature of one rendered item: a card is REBUILT in place only when
+// this changes (pending→ready, size fix), APPENDED when genuinely new, and
+// otherwise left untouched. Timeline order is append-only (ids carry their
+// creation timestamp), so a diff-render never refetches the media of kept
+// cards and never replays the entrance animation across the whole history —
+// the per-new-message flash that used to come with the full innerHTML wipe.
+function itemSig(it){
+  return it.kind === 'text'
+    ? ['text', it.from, it.ts, it.text].join('|')
+    : ['file', it.from, it.ts, it.name, it.size, it.pending ? 1 : 0].join('|');
+}
 
-  for(const it of items){
-    try {
+function buildEmpty(){
+  const e = document.createElement('div');
+  e.className = 'empty'; e.id = 'empty';
+  e.innerHTML = `
+    <div class="e-icon">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m3 15 4-4 4 4"/><path d="m14 9 4-4 4 4"/><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/></svg>
+    </div>
+    <div class="e-title">Ready for transfer</div>
+    <div class="e-desc">Send text messages, photos or files seamlessly across devices.</div>`;
+  return e;
+}
+
+function buildMsg(it, animate){
+  try {
     const mine = it.from === me;
     const msg = document.createElement('div');
     msg.className = 'msg ' + (mine ? 'me' : 'them');
     msg.dataset.id = it.id;
+    // Only genuinely new cards replay the entrance animation; an in-place
+    // rebuild of an existing id (pending turning ready) must not blink.
+    if(!animate) msg.style.animation = 'none';
 
     const avatar = document.createElement('div');
     avatar.className = 'avatar';
-    avatar.innerHTML = it.from === 'pc' 
+    avatar.innerHTML = it.from === 'pc'
       ? '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>'
       : '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>';
     msg.appendChild(avatar);
@@ -1102,10 +1066,11 @@ function render(items){
     if(it.kind === 'text'){
       bubble.classList.add('text');
       bubble.textContent = it.text;
-      // PC: right-click menu. Phone: long-press selects the whole message
-      // and the system copy callout does the rest.
+      // PC: right-click menu. Phone: nothing at all — long-press is the
+      // browser's own word selection with the system 全选/拷贝 callout. A
+      // programmatic select-all could not summon that menu reliably on
+      // every iOS version, so the native gesture IS the feature.
       if(isPC) attachMenu(bubble, it, null);
-      else attachSelectAll(bubble);
     } else {
       const card = document.createElement('div');
       card.className = 'file-card';
@@ -1117,10 +1082,9 @@ function render(items){
       // (Safari loupe + 存储图像) saves img.src, so cards pull the ORIGINAL
       // (/view) on both ends — the phone so "Save Image" stores real bytes,
       // the PC because it holds the file on disk and the pull is loopback.
-      // /view is no-store, so a re-render refetches what is on screen: cheap
-      // on the PC (loopback), LAN-local and lazy-loaded on the phone.
-      // Undecodable formats (HEIC on old iOS) fail as before: onerror drops
-      // the preview, the card falls back to its icon.
+      // With the diff-render below a kept card never refetches; only a
+      // genuine rebuild does. Undecodable formats (HEIC on old iOS) fail as
+      // before: onerror drops the preview, the card falls back to its icon.
       if(isImg){
         card.classList.add('has-preview');
         const img = document.createElement('img');
@@ -1128,6 +1092,12 @@ function render(items){
         img.alt = it.name;
         img.loading = 'lazy';
         img.onerror = () => { img.remove(); card.classList.remove('has-preview'); };
+        // Phone: preview opens from the image ITSELF. The card surface stays
+        // dead, so a long-press that lands on the card's padding (not the
+        // image) cannot click-through into the preview on release — on an
+        // ordinary webpage the padding is dead too. Long-press ON the image
+        // is the browser's native menu.
+        if(!isPC) img.onclick = () => openOnPhone(it);
         card.appendChild(img);
       } else if(isVid){
         card.classList.add('has-preview');
@@ -1136,11 +1106,12 @@ function render(items){
         v.muted = true; v.playsInline = true; v.preload = 'metadata';
         v.onloadedmetadata = () => { try { v.currentTime = 0.01; } catch {} };
         v.onerror = () => { v.remove(); card.classList.remove('has-preview'); };
+        if(!isPC) v.onclick = () => openOnPhone(it);
         card.appendChild(v);
       } else {
         card.innerHTML = `<div class="fc-ico">${iconFor(it.name)}</div>`;
       }
-      
+
       const info = document.createElement('div');
       info.className = 'fc-info';
       info.innerHTML = '<div class="fc-name"></div><div class="fc-size"></div>';
@@ -1176,16 +1147,24 @@ function render(items){
       ring.onclick = (e) => { e.stopPropagation(); ringTap(it); };
       card.appendChild(ring);
 
-      card.onclick = () => {
-        if(it.pending) return;                            // still uploading
-        if(isPC) openDefault(it);
-        // Phone tap = "show it", exactly like tapping a file link on an
-        // ordinary webpage: the browser decides — its inline viewer for
-        // PDF/text, its own download flow (with its own progress UI) for
-        // anything else. The corner button stays the explicit download.
-        else if(isImg || isVid) openOnPhone(it);
-        else location.href = '/view?id=' + encodeURIComponent(it.id);
-      };
+      if(isPC){
+        card.onclick = () => {
+          if(it.pending) return;                          // still uploading
+          openDefault(it);
+        };
+      } else if(isImg || isVid){
+        // Preview lives on the media element (see above); the card surface
+        // is deliberately click-dead on the phone.
+      } else {
+        card.onclick = () => {
+          if(it.pending) return;                          // still uploading
+          // Phone tap = "show it", exactly like tapping a file link on an
+          // ordinary webpage: the browser decides — its inline viewer for
+          // PDF/text, its own download flow (with its own progress UI) for
+          // anything else. The corner button stays the explicit download.
+          location.href = '/view?id=' + encodeURIComponent(it.id);
+        };
+      }
       // The app's long-press menu is a PC affordance only (right-click). On
       // the phone the long-press gesture is handed to the browser's native
       // media menu on cards, and is simply dead on non-media files (their one
@@ -1206,19 +1185,54 @@ function render(items){
     bWrap.appendChild(bubble);
     bWrap.appendChild(meta);
     msg.appendChild(bWrap);
-    chat.appendChild(msg);
-    // Must run after the node is in the document - the selector query would
-    // miss it otherwise. This is what surfaces the Download button on the phone
-    // for historical files (idle state) or the transfer ring.
-    if(it.kind !== 'text') paintCorner(it.id);
-    } catch(err){
-      // One bad message must not blank the whole timeline: report it and move on.
-      reportClientError('render: skipped '+(it.name||it.text||'')+' ('+it.id+'): '+(err && err.message ? err.message : String(err)));
+    return msg;
+  } catch(err){
+    // One bad message must not blank the whole timeline: report it and move on.
+    reportClientError('render: skipped '+(it.name||it.text||'')+' ('+it.id+'): '+(err && err.message ? err.message : String(err)));
+    return null;
+  }
+}
+
+function render(items){
+  const chat = $('chat');
+  const wasAtBottom = chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 32;
+
+  if(!items.length){
+    chat.replaceChildren();
+    if(!document.getElementById('empty')) chat.appendChild(buildEmpty());
+    return;
+  }
+  const emptyEl = document.getElementById('empty');
+  if(emptyEl) emptyEl.remove();
+
+  // Diff against what is on screen: ids still rendered are kept (never
+  // touched), changed ids are rebuilt in place, new ids are appended, and
+  // survivors of the kept map at the end were deleted on the server.
+  const kept = new Map();
+  for(const el of chat.children) if(el.dataset.id) kept.set(el.dataset.id, el);
+
+  for(const it of items){
+    const sig = itemSig(it);
+    const old = kept.get(it.id);
+    if(old){
+      kept.delete(it.id);
+      if(old.dataset.sig === sig) continue;
+      const el = buildMsg(it, false);
+      if(!el) continue;
+      el.dataset.sig = sig;
+      old.replaceWith(el);
+      if(it.kind !== 'text') paintCorner(it.id);
+    } else {
+      const el = buildMsg(it, true);
+      if(!el) continue;
+      el.dataset.sig = sig;
+      chat.appendChild(el);
+      if(it.kind !== 'text') paintCorner(it.id);
     }
   }
+  for(const el of kept.values()) el.remove();
 
   if(wasAtBottom) chat.scrollTop = chat.scrollHeight;
-  else chat.scrollTop = prev;
 }
 
 async function openDefault(it){

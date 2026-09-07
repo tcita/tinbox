@@ -1,7 +1,12 @@
 mod catalog;
+mod desktop;
 mod firewall;
 mod logger;
+mod netinfo;
+mod pairing;
+mod presence;
 mod server;
+mod transfer;
 
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
