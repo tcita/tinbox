@@ -220,11 +220,23 @@ pub fn load() {
                     ));
                 }
             }
-            Err(e) => crate::logger::loge(&format!(
-                "catalog: corrupt index {}: {}",
+        Err(e) => {
+            // Corrupt index: quarantine the file so the empty in-memory
+            // catalog cannot overwrite it on the next save (the records
+            // would be lost for good). The startup reconcile pass then
+            // re-adopts every file from inbox, so nothing but text history
+            // is lost.
+            let bad = catalog_path().with_extension("json.bad");
+            let renamed = std::fs::rename(catalog_path(), &bad);
+            crate::logger::loge(&format!(
+                "catalog: corrupt index ({}); quarantined to {}: {e}",
                 catalog_path().display(),
-                e
-            )),
+                bad.display()
+            ));
+            if renamed.is_err() {
+                crate::logger::loge("catalog: quarantine rename failed — the corrupt file may be overwritten by the next save");
+            }
+        }
         },
         // A missing index on first run is normal, not an error.
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => crate::logger::loge(&format!(
@@ -250,6 +262,104 @@ pub fn save() {
         }
         Err(e) => crate::logger::loge(&format!("catalog: could not serialize index: {}", e)),
     }
+}
+
+/// Startup reconciliation: the inbox directory is the disk truth, the catalog
+/// is its index. Two divergences are repaired, both bounded to startup so the
+/// runtime keeps its single-writer simplicity:
+///   - orphan files (on disk, no record) are ADOPTED as from="pc" entries.
+///     This is also the self-heal path after a lost or quarantined index:
+///     every file becomes manageable again, only text history is lost.
+///   - dangling records (indexed, file gone — the user deleted or moved the
+///     file via Explorer) are DROPPED, matching that intent; keeping them
+///     would leave dead "file missing" bubbles.
+/// Disk files are NEVER deleted here: the index yields to the disk, never
+/// the reverse. Runs after purge_pending so interrupted-upload leftovers do
+/// not count as orphans.
+pub fn reconcile() {
+    let dir = inbox_dir();
+    let mut on_disk: Vec<(PathBuf, String)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Ok(meta) = e.metadata() else { continue };
+            // Inbox is a flat landing zone: no recursion, no dot-dirs.
+            if !meta.is_file() || name.starts_with('.') {
+                continue;
+            }
+            on_disk.push((e.path(), name));
+        }
+    }
+    let known: std::collections::HashSet<String> = cat_lock()
+        .iter()
+        .filter_map(|e| match &e.body {
+            MsgBody::File { source, .. } => Some(source.path().to_string()),
+            MsgBody::Text { .. } => None,
+        })
+        .collect();
+
+    let mut adopted = 0usize;
+    for (path, name) in &on_disk {
+        let ps = path.to_string_lossy().to_string();
+        if known.contains(&ps) {
+            continue;
+        }
+        let display = strip_stored_prefix(name);
+        // add_remote stamps now_ts(); the entry is then corrected to the
+        // file's mtime, which is the honest history moment.
+        let ts = file_mtime_secs(path);
+        let entry = add_remote("pc", &new_id(), path, &display);
+        {
+            let mut v = cat_lock();
+            if let Some(e) = v.iter_mut().find(|e| e.id == entry.id) {
+                if let Some(t) = ts {
+                    e.ts = t;
+                }
+            }
+        }
+        adopted += 1;
+        crate::logger::logf(&format!("catalog: adopted orphan file {name} (id {})", entry.id));
+    }
+
+    let dropped;
+    {
+        let mut v = cat_lock();
+        let before = v.len();
+        v.retain(|e| match &e.body {
+            MsgBody::File { source, .. } => Path::new(source.path()).exists(),
+            MsgBody::Text { .. } => true,
+        });
+        dropped = before - v.len();
+    }
+    if adopted > 0 || dropped > 0 {
+        crate::logger::logf(&format!(
+            "catalog: reconciled with inbox — {adopted} adopted, {dropped} dangling record(s) dropped"
+        ));
+        save();
+    }
+}
+
+/// Adopted files may still carry the stored `{nanos}-{seq}__` prefix; show
+/// the clean name instead. Anything that does not match the shape (a user
+/// file like "2024-report__draft.jpg") is kept verbatim.
+fn strip_stored_prefix(name: &str) -> String {
+    if let Some((head, rest)) = name.split_once("__") {
+        let looks_like_id = !head.is_empty()
+            && head.contains('-')
+            && head.split('-').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
+        if looks_like_id {
+            return rest.to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// Adoption timestamps come from the file's mtime, not the adoption moment:
+/// a file dropped into inbox three months ago should read as three months
+/// old in the timeline.
+fn file_mtime_secs(p: &Path) -> Option<String> {
+    let t = std::fs::metadata(p).ok()?.modified().ok()?;
+    Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs().to_string())
 }
 
 /// Recursively collect every file under a directory into `out`.

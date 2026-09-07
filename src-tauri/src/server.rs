@@ -57,10 +57,6 @@ pub(crate) enum PushEvent {
     /// download progress is still never pushed — the puller's browser owns
     /// that UI. Download ACTIVITY is a coarser, separate event (DlState).
     Progress { id: String, total: u64, sent: u64 },
-    /// A download just completed (every requested byte left the socket). The
-    /// PC stamps its 'downloaded to phone' delivery marker from this; the
-    /// phone ignores it (its browser owns the download UI).
-    Delivered { id: String },
     /// Sender-side download activity, aggregated per message id (the union of
     /// its live per-request "msg#n" transfers): true while any pull of the
     /// file is being served, false once none is. The PC pulses its card from
@@ -254,6 +250,11 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
             // (both ends pull /view originals), so inbox/.thumbs from older
             // versions is dead weight on disk.
             let _ = std::fs::remove_dir_all(catalog::inbox_dir().join(".thumbs"));
+
+            // Reconcile the index with the inbox directory (adopt orphans,
+            // drop dangling records) — after purge_pending, so interrupted
+            // upload leftovers are not mistaken for orphans.
+            catalog::reconcile();
 
             let app = Router::new()
                 .route("/", get(index))
@@ -705,10 +706,6 @@ fn push_event_to_sse(ev: PushEvent) -> Event {
         PushEvent::Progress { id, total, sent } => Event::default()
             .event("progress")
             .json_data(serde_json::json!({ "id": id, "total": total, "sent": sent }))
-            .unwrap(),
-        PushEvent::Delivered { id } => Event::default()
-            .event("delivered")
-            .json_data(serde_json::json!({ "id": id }))
             .unwrap(),
         PushEvent::DlState { id, active } => Event::default()
             .event("dlstate")

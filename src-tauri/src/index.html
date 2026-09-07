@@ -1,11 +1,13 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-<meta name="apple-mobile-web-app-title" content="tinbox">
+<!-- Home-screen standalone support is deliberately absent (no apple-mobile-web-app-*
+     metas): an iOS standalone web app has no download manager, so "downloads ride the
+     browser" would break silently there — and pairing never survives a restart, so the
+     gesture buys nothing anyway. A home-screen icon, if anyone makes one, just opens
+     Safari and downloads keep working. -->
 <link rel="icon" href="/logo" type="image/svg+xml">
 <title>tinbox</title>
 <style>
@@ -574,12 +576,14 @@
   .fw-hint { font-size: 11.5px; color: var(--sub); margin-top: 12px; line-height: 1.4; }
 
   /* Pairing-expired overlay (phone): the PC process restarted, the pairing
-   cookie no longer matches — only a fresh scan restores access. */
-#pairGate {
+   cookie no longer matches — only a fresh scan restores access. The
+   home-screen web app gate shares the geometry: same card, same one-message-
+   one-action language. */
+#pairGate, #webAppGate {
   position: fixed; inset: 0; z-index: 90; background: var(--bg);
   display: none; align-items: center; justify-content: center; padding: 20px;
 }
-#pairGate.show { display: flex; }
+#pairGate.show, #webAppGate.show { display: flex; }
 
 /* Context Menu */
   .ctx-menu {
@@ -715,6 +719,23 @@
     </div>
     <div class="g-title">Pairing expired</div>
     <div class="g-desc">Pairing does not survive a restart. Scan the QR code shown on the tinbox window on the PC to connect.</div>
+  </div>
+</div>
+
+<!-- Home-screen web app gate (phone): since iOS 26, adding a site to the Home
+     Screen opens it as a web app BY DEFAULT and no site-side meta can opt out
+     ("no matter how the site's code is configured", WebKit). That context has
+     no download manager — attachment navigations become an undismissable
+     QuickLook preview — and tinbox's whole download path rides the browser's
+     downloader, so the app refuses to run there. One card, one instruction:
+     use Safari. -->
+<div id="webAppGate">
+  <div class="g-card">
+    <div class="g-radar">
+      <span style="font-size:44px;line-height:1">📦</span>
+    </div>
+    <div class="g-title">Open in Safari</div>
+    <div class="g-desc">A home-screen app cannot hand files to the system downloader. Delete this icon and open tinbox in Safari — scan the QR code shown on the tinbox window on the PC.</div>
   </div>
 </div>
 
@@ -959,9 +980,8 @@ function applyList(items){
   render(view);
   checkUploadGone(items);
   pruneTransfers(items);
-  autoReceive(items);
-  // render() rebuilt the DOM and wiped every corner and pulse; repaint the
-  // ones that are still live so they come straight back.
+  // Repaint transfer state on every card: appended/rebuilt nodes lost their
+  // corner and pulse; kept nodes re-apply idempotently.
   repaintTransfers();
   repaintDownloads();
 }
@@ -994,28 +1014,6 @@ function pruneTransfers(items){
 // the socket the server already tore down. Entries are independent: refusing
 // one of two parallel uploads never touches the other's detection.
 
-// Auto-receive on the phone: the moment a List event carries a file the PC just
-// added, fire the browser's download for it — the user should meet only the
-// browser's own download confirm, with no in-page button to find first. Whether
-// the browser honors a script-initiated download with no user gesture is the
-// platform's call (drive-by-download protection): if it blocks, nothing fires
-// and the card's Download button stays as the manual path. The seen-set makes
-// this fire-once per file: the first snapshot after a page load is baseline
-// (no retroactive downloads), and every later List event fires only for ids
-// new since the previous one — resyncs, reconnects and re-renders are no-ops.
-let seenFileIds = null;
-function autoReceive(items){
-  if(isPC) return;
-  if(seenFileIds){
-    for(const it of items){
-      if(seenFileIds.has(it.id)) continue;
-      if(it.kind !== 'file' || it.from !== 'pc' || it.pending) continue;
-      reportClientError('auto-receive: firing download for ' + it.name);
-      nativeDownload(it);
-    }
-  }
-  seenFileIds = new Set(items.map(i => i.id));
-}
 // Payload signature of one rendered item: a card is REBUILT in place only when
 // this changes (pending→ready, size fix), APPENDED when genuinely new, and
 // otherwise left untouched. Timeline order is append-only (ids carry their
@@ -1177,10 +1175,6 @@ function buildMsg(it, animate){
     const meta = document.createElement('div');
     meta.className = 'meta-line';
     meta.textContent = fmtTime(it.ts);
-    // Delivery marker (PC view): this file was pulled to a phone at some point.
-    if(isPC && it.kind === 'file' && delivered[it.id]){
-      meta.textContent += ' · downloaded to phone ' + fmtTime(String(delivered[it.id]));
-    }
 
     bWrap.appendChild(bubble);
     bWrap.appendChild(meta);
@@ -1245,23 +1239,10 @@ async function openDefault(it){
 // ring below is the PC's receiver ring for pushes arriving from phones (see
 // the corner block). There is no JS chunk/OPFS downloader anymore — that
 // engine was removed.
-// Delivery record: file id -> unix seconds when a phone last pulled it (PC
-// side only, survives reloads). Rendered as "downloaded to phone HH:MM" on
-// the card.
-const delivered = loadDelivered();
-function loadDelivered(){
-  try { return JSON.parse(localStorage.getItem('tinbox.delivered') || '{}'); } catch { return {}; }
-}
-function saveDelivered(){ try { localStorage.setItem('tinbox.delivered', JSON.stringify(delivered)); } catch {} }
-function markDelivered(id){
-  if(!isPC) return;
-  const now = Math.floor(Date.now()/1000);
-  delivered[id] = now;
-  saveDelivered();
-  const m = document.querySelector('.msg[data-id="'+id+'"] .meta-line');
-  const it = itemById(id);
-  if(m && it) m.textContent = fmtTime(it.ts) + ' · downloaded to phone ' + fmtTime(String(now));
-}
+// No sender-side delivery marker on the card: cloud drives and transfer
+// tools do not badge the sender's file with "downloaded at HH:MM" either —
+// receipt is the receiver's own UI to confirm. The download-done fact lives
+// in the server log only.
 // Optimistic upload cards: when the phone picks a file it appears immediately on
 // its own timeline as "Uploading…" before the server's pending row lands.
 const optUploads = [];
@@ -1846,8 +1827,6 @@ function connect(){
   es.onmessage = () => { lastSeen = Date.now(); };
   es.addEventListener('list', e => { lastSeen = Date.now(); applyList(JSON.parse(e.data)); });
   es.addEventListener('progress', e => { lastSeen = Date.now(); syncProgress([JSON.parse(e.data)]); });
-  // A pull just completed on some receiver: the PC stamps its delivery marker.
-  es.addEventListener('delivered', e => { lastSeen = Date.now(); markDelivered(JSON.parse(e.data).id); });
   // Sender-side pull activity (PC only): the card pulse tracks the union of
   // the file's live per-request transfers.
   es.addEventListener('dlstate', e => {
@@ -1862,7 +1841,18 @@ function connect(){
   es.addEventListener('fw', e => { lastSeen = Date.now(); applyFw(JSON.parse(e.data).needRepair); });
   es.addEventListener('info', e => { lastSeen = Date.now(); applyInfo(JSON.parse(e.data)); });
 }
-connect();
+// Home-screen web app contexts refuse service: since iOS 26 the add-to-Home-
+// Screen flow installs every site as a web app by default (the "Open as Web
+// App" toggle, on by default, is the user's — no site-side meta can opt out),
+// and a standalone web app has no download manager to hand /dl to. tinbox's
+// download path rides the browser's downloader, so that context cannot work;
+// surfacing the webAppGate card beats silent download failures there. The
+// legacy apple-mobile-web-app-* metas stay retired: on older iOS they are
+// what FORCED this context, on iOS 26 they are dead code either way.
+const inWebApp = !isPC && (navigator.standalone === true
+  || matchMedia('(display-mode: standalone)').matches);
+if(inWebApp) $('webAppGate').classList.add('show');
+else connect();
 
 // Pairing-expiry probe: EventSource never surfaces HTTP statuses, so a token
 // rotated by a server restart looks identical to a dead server. Every SSE

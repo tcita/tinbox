@@ -525,7 +525,7 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
                                 // count: the pull was paused past the monitor's
                                 // 30s window, the entry went away, and without
                                 // this rebuild the resumed stream would finish
-                                // uncounted — no done log, no Delivered push,
+                                // uncounted — no done log, no dlstate flip,
                                 // and a wrong active-set for sibling pulls.
                                 logf(&format!(
                                     "download counter rebuilt {tid}: {sent}/{} bytes (was pruned while paused)",
@@ -542,10 +542,6 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
                         touch_entry(e);
                         if e.sent >= e.total && e.total > 0 {
                             logf(&format!("download done {tid}: {} bytes", e.sent));
-                            // The receiver just got the whole file: stamp the
-                            // PC's delivery marker. Per-byte progress stays
-                            // unpushed — the puller's browser owns that UI.
-                            let _ = notifier().send(PushEvent::Delivered { id: msg_id.clone() });
                             // This pull no longer counts as active; if it was
                             // the LAST active pull of the file, end the
                             // sender's card pulse. (A sibling pull still
