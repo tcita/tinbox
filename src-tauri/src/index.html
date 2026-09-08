@@ -1712,7 +1712,27 @@ async function addLocalPaths(paths){
     return !t || now - t > 5000;
   });
   if(!fresh.length) return;
-  const r = await api('/add-local', { method:'POST', body:{ paths: fresh } });
+  // The webview's fetch reuses pooled keep-alive sockets; after a long idle
+  // the first POST can land in a socket the OS already dropped — "Failed to
+  // fetch" with the request never reaching the server (the log proves it:
+  // no /add-local line, only the unhandledrejection report). One silent
+  // retry gets a fresh connection, which is exactly what a manual re-drop
+  // did. Still loud after: a real failure toasts twice as hard.
+  let r;
+  try {
+    r = await api('/add-local', { method:'POST', body:{ paths: fresh } });
+  } catch {
+    // The one observable trace of this bug class: count every silent retry
+    // in the server log, so the stale-socket phenomenon goes from folklore
+    // to a measurable frequency (the pool's own internals emit no events).
+    reportClientError('add-local: first attempt failed to fetch (likely stale pooled socket), retrying');
+    try {
+      r = await api('/add-local', { method:'POST', body:{ paths: fresh } });
+    } catch {
+      toast('添加失败');
+      return;
+    }
+  }
   if(!r.ok) toast('添加失败');
 }
 // Tauri fires tauri://drag-drop with the real paths in parallel with the HTML5
