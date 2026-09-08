@@ -265,7 +265,7 @@ pub fn save() {
 }
 
 /// Startup reconciliation: the inbox directory is the disk truth, the catalog
-/// is its index. Two divergences are repaired, both bounded to startup so the
+/// is its index. Three divergences are repaired, both bounded to startup so the
 /// runtime keeps its single-writer simplicity:
 ///   - orphan files (on disk, no record) are ADOPTED as from="pc" entries.
 ///     This is also the self-heal path after a lost or quarantined index:
@@ -273,9 +273,18 @@ pub fn save() {
 ///   - dangling records (indexed, file gone — the user deleted or moved the
 ///     file via Explorer) are DROPPED, matching that intent; keeping them
 ///     would leave dead "file missing" bubbles.
-/// Disk files are NEVER deleted here: the index yields to the disk, never
-/// the reverse. Runs after purge_pending so interrupted-upload leftovers do
-/// not count as orphans.
+///   - `pending__`-prefixed files are a dead upload's residue — the sentinel
+///     stamped at registration and stripped only by the success-path rename,
+///     so its presence proves the body never graduated. They are DELETED on
+///     sight. This is the one carve-out from "the index yields to the disk":
+///     a sentinel file is not disk truth, it is a transfer that never became
+///     a file. The prefix is namespaced with a server-generated nanosecond
+///     id, so no user filename can collide; deletion retries every startup
+///     until it wins (a locked file just waits), and a residue can never be
+///     adopted as a complete file after an index loss.
+/// Disk files are otherwise NEVER deleted here: the index yields to the disk,
+/// never the reverse. Runs after purge_pending so interrupted-upload
+/// leftovers do not count as orphans.
 pub fn reconcile() {
     let dir = inbox_dir();
     let mut on_disk: Vec<(PathBuf, String)> = Vec::new();
@@ -285,6 +294,18 @@ pub fn reconcile() {
             let Ok(meta) = e.metadata() else { continue };
             // Inbox is a flat landing zone: no recursion, no dot-dirs.
             if !meta.is_file() || name.starts_with('.') {
+                continue;
+            }
+            // Kill the sentinel-named residue before it can be mistaken for
+            // an orphan to adopt (see the doc block above).
+            if name.starts_with("pending__") {
+                let p = e.path();
+                match std::fs::remove_file(&p) {
+                    Ok(()) => crate::logger::logf(&format!("catalog: deleted partial upload {name}")),
+                    Err(err) => crate::logger::logw(&format!(
+                        "catalog: partial upload {name} still locked, retry next startup: {err}"
+                    )),
+                }
                 continue;
             }
             on_disk.push((e.path(), name));
@@ -429,10 +450,12 @@ pub fn add_remote_pending(from: &str, id: &str, inbox_path: &Path, display_name:
     entry
 }
 
-/// Flip a pending upload to a real entry once the whole body has been written:
-/// clears the flag and fixes `size` to the actual on-disk length. No-op (false)
-/// if the id is gone or not a pending remote file.
-pub fn mark_remote_ready(id: &str) -> bool {
+/// Flip a pending upload to a real entry once the whole body has been written
+/// and renamed off its `pending__` sentinel: clears the flag, repoints the
+/// stored path at the final (sentinel-free) name and fixes `size` to the
+/// actual on-disk length. No-op (false) if the id is gone or not a pending
+/// remote file.
+pub fn mark_remote_ready(id: &str, final_path: &Path) -> bool {
     let mut v = cat_lock();
     let Some(e) = v.iter_mut().find(|e| e.id == id) else {
         return false;
@@ -443,8 +466,9 @@ pub fn mark_remote_ready(id: &str) -> bool {
         return false;
     }
     e.pending = false;
-    if let MsgBody::File { source, size, .. } = &mut e.body {
-        *size = std::fs::metadata(source.path()).map(|m| m.len()).unwrap_or(*size);
+    if let MsgBody::File { source: Source::Remote { path }, size, .. } = &mut e.body {
+        *path = final_path.to_string_lossy().to_string();
+        *size = std::fs::metadata(final_path).map(|m| m.len()).unwrap_or(*size);
     }
     drop(v);
     save();
@@ -452,7 +476,9 @@ pub fn mark_remote_ready(id: &str) -> bool {
 }
 
 /// Drop catalog entries left pending by a crashed/interrupted upload and delete
-/// their partial files. Called once at startup.
+/// their partial files (the sentinel-named path recorded at registration).
+/// Called once at startup, before reconcile; a delete that loses to a file
+/// lock is retried by reconcile's sentinel sweep on the same startup.
 pub fn purge_pending() {
     let mut v = cat_lock();
     let before = v.len();

@@ -181,10 +181,18 @@ pub(crate) async fn upload(
         if filename.is_empty() {
             return (StatusCode::BAD_REQUEST, "bad filename").into_response();
         }
-        // Write to inbox, prefixing the filename with the id to prevent
-        // same-name overwrites; the catalog id matches this prefix.
+        // Write to inbox under a SENTINEL name, not the final one:
+        // `pending__{id}__{filename}` until the whole body is on disk, then a
+        // same-volume rename strips the prefix (atomic — same directory). The
+        // sentinel makes a partial file self-identifying, independent of the
+        // catalog index: after a crash + index loss, reconcile kills anything
+        // wearing `pending__` instead of adopting a truncated file as
+        // complete. The prefix cannot collide with a user's filename — `{id}`
+        // is a server-generated nanosecond stamp, unknowable in advance. The
+        // catalog id matches the inner `{id}__` prefix.
         let id = catalog::new_id();
-        let stored = catalog::inbox_dir().join(format!("{id}__{filename}"));
+        let stored = catalog::inbox_dir().join(format!("pending__{id}__{filename}"));
+        let final_path = catalog::inbox_dir().join(format!("{id}__{filename}"));
         // Register the row as `pending` the moment the request lands, and seed a
         // shared byte counter, so BOTH ends render a progress ring immediately.
         // The sender reports its declared total via ?size=.
@@ -264,9 +272,22 @@ pub(crate) async fn upload(
                 }
             }
         };
+        let write_result = match write_result {
+            Ok(()) => match tokio::fs::rename(&stored, &final_path).await {
+                Ok(()) => Ok(()),
+                // Graduation failed (file locked by AV/backup): the bytes may
+                // be complete, but the sentinel is still on — serving it as
+                // ready would survive this session only to be killed by the
+                // next reconcile. Fail the upload instead; the cleanup below
+                // deletes the file, and even a lost delete race leaves the
+                // sentinel on for the next reconcile to finish.
+                Err(e) => Err(format!("promote: {e}")),
+            },
+            other => other,
+        };
         match write_result {
             Ok(()) => {
-                catalog::mark_remote_ready(&id);
+                catalog::mark_remote_ready(&id, &final_path);
                 logf(&format!("upload done: {} ({} bytes) -> inbox", filename, total));
                 // Final tick (sent == total) closes the ring on both ends.
                 {
@@ -282,7 +303,11 @@ pub(crate) async fn upload(
             }
             Err(e) => {
                 // Aborted or failed mid-transfer: drop the pending row and the
-                // partial file; do NOT leave the entry in the catalog.
+                // partial file; do NOT leave the entry in the catalog. The
+                // unlink targets the sentinel-named file, so even if THIS
+                // delete fails (locked), the name still reads "partial" and
+                // the next startup's reconcile finishes the job — a residue
+                // can never be mistaken for a complete file.
                 drop(file);
                 catalog::remove(&id);
                 let _ = std::fs::remove_file(&stored);
