@@ -4,8 +4,6 @@
 
 use crate::logger::{loge, logf};
 use crate::presence::now_mono;
-use crate::pairing::request_token;
-use crate::server::{BOUND_PORT, PORT};
 use axum::{
     http::{header, StatusCode},
     response::IntoResponse,
@@ -47,10 +45,10 @@ pub(crate) fn note_foreign_subnet(peer: &SocketAddr) {
 /// stays correct even with TUN-mode VPNs or virtual adapters active. The page
 /// shows it via <img src="/qr">; the phone scans it to open this page.
 pub(crate) async fn qr() -> impl IntoResponse {
-    let ips = collect_ips();
-    let ip = ips.first().cloned().unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = BOUND_PORT.get().copied().unwrap_or(PORT);
-    let url = format!("http://{}:{}/?t={}", ip, port, request_token());
+    // One URL builder for the whole app: current_url() assembles the pairing
+    // URL (server.rs), so the QR payload and the displayed address can never
+    // drift apart on an IP/port change.
+    let url = crate::server::current_url();
     let qr = match qrcode::QrCode::new(url.as_bytes()) {
         Ok(q) => q,
         Err(e) => {

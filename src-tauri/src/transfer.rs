@@ -40,8 +40,8 @@ pub(crate) struct DlProg {
     pub(crate) total: u64,
     pub(crate) sent: u64,
     /// Monotonic seconds-since-start of the last byte written / registration
-    /// (see touch_entry). Compared against now_mono() by the monitor's prune,
-    /// and by presence (transfer_active_recently).
+    /// (see touch_entry). Compared against now_mono() by the monitor's prune —
+    /// its only reader.
     pub(crate) last_ts: u64,
     /// Last time a progress event was pushed for this transfer, to throttle SSE
     /// emissions to ~1/s per transfer (the frontend used to poll /dl-status).
@@ -59,8 +59,8 @@ fn dl_progress() -> &'static Mutex<std::collections::HashMap<String, DlProg>> {
 
 /// [LIVENESS/death] Mark a transfer as alive. The single writer of
 /// DlProg::last_ts: registration, every chunk (either direction) and the
-/// upload-silence timeout all go through here. Read by the monitor's prune,
-/// and by presence (transfer_active_recently).
+/// upload-silence timeout all go through here. Read by the monitor's prune —
+/// its only reader.
 fn touch_entry(e: &mut DlProg) {
     e.last_ts = now_mono();
 }
@@ -152,21 +152,12 @@ pub(crate) struct UpQuery {
 /// phone, a half-open TCP), and hyper has no body read timeout, so the
 /// actively-awaited read needs this wrapper. Without it the pending row would
 /// hang forever. Floor: the longest legitimate chunk gap of a healthy LAN
-/// push (milliseconds), with margin. The download side needs no mirror of
-/// this: a stalled pull's socket write simply stops draining, and the
-/// monitor's prune reaps its entry after the idle window.
-const UPLOAD_SILENCE_SECS: u64 = 3;
-
-pub(crate) fn transfer_active_recently(secs: u64) -> bool {
-    let now = now_mono();
-    let map = dl_lock();
-    map.iter()
-        .any(|(_, e)| {
-            e.sent < e.total
-                && e.last_ts != 0  // 0 = never touched (defensive; creators always touch)
-                && now.saturating_sub(e.last_ts) < secs
-        })
-}
+/// push (milliseconds), with margin. Same number as the monitor's prune
+/// window, different kind of timeout: this one aborts a TASK (uploads have
+/// no legitimate pause state, so prompt is safe), that one reaps a LEDGER
+/// entry (pulls do — a paused puller is reaped too, accepted as a false
+/// alarm; a live stream rebuilds its counter on the next chunk).
+const UPLOAD_SILENCE_SECS: u64 = 5;
 
 pub(crate) async fn upload(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -506,9 +497,9 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
             let cut = StreamCutGuard { tid: tid.clone(), msg_id: msg_id.clone(), name: name.clone() };
             // Stream-local byte count: this pull's authoritative sent figure,
             // independent of the shared counter's lifetime. The monitor reaps a
-            // counter after 30s of silence (a paused puller); the stream
-            // outlives the reap, so the rebuild below needs the stream's own
-            // numbers, not whatever a dead entry remembers.
+            // counter after 5s of silence (a paused puller reaped too); the
+            // stream outlives the reap, so the rebuild below needs the
+            // stream's own numbers, not whatever a dead entry remembers.
             let mut sent: u64 = start;
             Box::pin(base.map(move |chunk| {
                 // Referencing `cut` keeps it captured, so it is dropped only when
@@ -522,8 +513,8 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
                             Some(e) => e,
                             None => {
                                 // Re-seed a pruned counter from the stream's own
-                                // count: the pull was paused past the monitor's
-                                // 30s window, the entry went away, and without
+                                // count: the pull was silent past the monitor's
+                                // 5s window, the entry went away, and without
                                 // this rebuild the resumed stream would finish
                                 // uncounted — no done log, no dlstate flip,
                                 // and a wrong active-set for sibling pulls.

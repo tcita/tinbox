@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,interactive-widget=resizes-content">
@@ -268,6 +268,16 @@
     display: flex; align-items: center; justify-content: center;
     backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
     transition: background 0.15s, transform 0.15s;
+  }
+  /* Touch target: the 30px disc is below the 44pt/48dp platform minimums, and
+     a near-miss lands on the <img> beneath the corner — flipping "download"
+     into "open fullscreen preview" (and vice versa). This transparent halo
+     widens the hit zone to a 44px circle without painting anything: the disc,
+     its backdrop blur and the image gestures around it all stay untouched.
+     Taps in the halo belong to the button, so aiming at the disc always
+     downloads; everything outside the halo still reaches the image. */
+  .dlcardbtn::before {
+    content: ''; position: absolute; inset: -7px; border-radius: 50%;
   }
   /* Hover darkening only where a mouse exists: on a touch screen Chromium
      keeps `:hover` on the last-tapped element until another tap, and since
@@ -619,7 +629,7 @@
     <span>tinbox</span>
   </div>
   <div class="head-actions">
-    <button id="inboxBtn" title="Open inbox folder">
+    <button id="inboxBtn" title="打开收件箱">
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
     </button>
     <div id="qrBox">
@@ -637,18 +647,18 @@
     <div class="e-icon">
       <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m3 15 4-4 4 4"/><path d="m14 9 4-4 4 4"/><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/></svg>
     </div>
-    <div class="e-title">Ready for transfer</div>
-    <div class="e-desc">Send text messages, photos or files seamlessly across devices.</div>
+    <div class="e-title">准备就绪</div>
+    <div class="e-desc">跨设备互传文字、照片和文件</div>
   </div>
 </div>
 
 <div class="composer">
-  <button class="plus-btn" id="plus" title="Select files">
+  <button class="plus-btn" id="plus" title="选择文件">
     <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
   </button>
   <div class="input-wrap">
-    <textarea id="txt" rows="1" placeholder="Type a message…"></textarea>
-    <button class="send-btn" id="send" disabled title="Send">
+    <textarea id="txt" rows="1" placeholder="输入消息…"></textarea>
+    <button class="send-btn" id="send" disabled title="发送">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
     </button>
   </div>
@@ -661,8 +671,8 @@
     <div class="g-radar">
       <img src="/logo" alt="tinbox">
     </div>
-    <div class="g-title" id="gateTitle">Scan to connect</div>
-    <div class="g-desc" id="gateDesc">Make sure your phone is on the same Wi-Fi.<br>Pairing expires when you close tinbox — scan again after restarting the app.</div>
+    <div class="g-title" id="gateTitle">扫码连接</div>
+    <div class="g-desc" id="gateDesc">请保持手机与电脑在同一 Wi-Fi<br>tinbox 重启后需重新扫码</div>
     <div class="qr-frame">
       <img id="gateQr" src="/qr" alt="QR code">
     </div>
@@ -670,9 +680,9 @@
       <div id="gateUrl"><span>…</span></div>
     </div>
     <div class="g-actions">
-      <button class="g-inbox" id="gateInbox" title="Open the inbox folder on disk">
+      <button class="g-inbox" id="gateInbox" title="打开收件箱文件夹">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-        Open inbox
+        打开收件箱
       </button>
     </div>
   </div>
@@ -684,11 +694,11 @@
     <div class="fw-icon">
       <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
     </div>
-    <div class="fw-title">Restore tinbox firewall rules</div>
-    <div class="fw-desc">The firewall rules for tinbox are not the expected ones — phones may fail to connect on some networks. Click Allow and confirm the UAC prompt to restore the correct rules.</div>
+    <div class="fw-title">恢复防火墙规则</div>
+    <div class="fw-desc">防火墙规则异常,手机可能无法连接。点击“允许”并确认 UAC 弹窗即可修复。</div>
     <div class="fw-btns">
-      <button class="fw-btn repair" id="fwRepair">Allow</button>
-      <button class="fw-btn quit" id="fwQuit">Quit</button>
+      <button class="fw-btn repair" id="fwRepair">允许</button>
+      <button class="fw-btn quit" id="fwQuit">退出</button>
     </div>
     <div class="fw-hint" id="fwHint"></div>
   </div>
@@ -700,10 +710,10 @@
     <div class="fw-icon">
       <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
     </div>
-    <div class="fw-title">Opened in another tab</div>
-    <div class="fw-desc">Only one tab is needed - this one was superseded by a newer page. Browsers block auto-closing tabs, so please close it manually.</div>
+    <div class="fw-title">已在其他标签页打开</div>
+    <div class="fw-desc">此页面已被新标签页接管,请手动关闭。</div>
     <div class="fw-btns">
-      <button class="fw-btn repair" id="deadClose">Close this tab</button>
+      <button class="fw-btn repair" id="deadClose">关闭此页</button>
     </div>
   </div>
 </div>
@@ -717,38 +727,39 @@
            must be inline-only (a glyph, no network asset). -->
       <span style="font-size:44px;line-height:1">📦</span>
     </div>
-    <div class="g-title">Pairing expired</div>
-    <div class="g-desc">Pairing does not survive a restart. Scan the QR code shown on the tinbox window on the PC to connect.</div>
+    <div class="g-title">配对已过期</div>
+    <div class="g-desc">请重新扫码连接。</div>
   </div>
 </div>
 
 <!-- Home-screen web app gate (phone): since iOS 26, adding a site to the Home
      Screen opens it as a web app BY DEFAULT and no site-side meta can opt out
-     ("no matter how the site's code is configured", WebKit). That context has
-     no download manager — attachment navigations become an undismissable
-     QuickLook preview — and tinbox's whole download path rides the browser's
-     downloader, so the app refuses to run there. One card, one instruction:
-     use Safari. -->
+     ("no matter how the site's code is configured", WebKit). Chromium app
+     windows (Android standalone PWAs, desktop "install as app") land in the
+     same non-browser trap — no download manager, no chrome to hand /dl to —
+     and tinbox's whole download path rides the browser's downloader, so the
+     app refuses to run in any non-browser display mode. One card, one
+     instruction: use the browser. -->
 <div id="webAppGate">
   <div class="g-card">
     <div class="g-radar">
       <span style="font-size:44px;line-height:1">📦</span>
     </div>
-    <div class="g-title">Open in Safari</div>
-    <div class="g-desc">A home-screen app cannot hand files to the system downloader. Delete this icon and open tinbox in Safari — scan the QR code shown on the tinbox window on the PC.</div>
+    <div class="g-title">请用浏览器打开</div>
+    <div class="g-desc">tinbox 不支持以应用方式打开。</div>
   </div>
 </div>
 
 <!-- QR Lightbox (PC): enlarge the header QR for scanning -->
 <div id="qrLightbox">
   <div class="ql-card">
-    <button class="ql-close" id="qlClose" title="Close">
+    <button class="ql-close" id="qlClose" title="关闭">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
     </button>
-    <div class="ql-title">Scan to connect a device</div>
+    <div class="ql-title">扫码连接设备</div>
     <img class="ql-qr" src="/qr" alt="QR code">
     <div><div class="ql-url" id="qlUrl">…</div></div>
-    <div class="ql-hint">Pairing expires on restart — this URL changes each time you open tinbox.</div>
+    <div class="ql-hint">tinbox 重启后,手机需重新扫码</div>
   </div>
 </div>
 
@@ -758,7 +769,7 @@
 <div id="dragOverlay">
   <div class="drag-card">
     <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-    <div class="drag-title">Drop files to send immediately</div>
+    <div class="drag-title">松手即发送</div>
   </div>
 </div>
 
@@ -893,11 +904,11 @@ function showCtxMenu(x, y, it, bubble){
   let any = false;
   if(isPC){
     if(it.kind === 'text'){
-      add('Copy', copyIco, '', () => copyText(it));
+      add('复制', copyIco, '', () => copyText(it));
     } else {
-      add('Copy', copyIco, '', () => copyFile(it));
+      add('复制', copyIco, '', () => copyFile(it));
     }
-    add('Delete', delIco, 'danger', () => delItem(it));
+    add('删除', delIco, 'danger', () => delItem(it));
     any = true;
   }
   if(!any) return;
@@ -911,7 +922,7 @@ function showCtxMenu(x, y, it, bubble){
 }
 
 async function copyText(it){
-  try { await navigator.clipboard.writeText(it.text); toast('Copied to clipboard'); return; }
+  try { await navigator.clipboard.writeText(it.text); toast('已复制'); return; }
   catch {}
   // The phone reaches this page over plain LAN http, which is NOT a secure
   // context — the async Clipboard API does not exist there at all (the try
@@ -925,8 +936,8 @@ async function copyText(it){
     ta.focus(); ta.select();
     const ok = document.execCommand('copy');
     ta.remove();
-    toast(ok ? 'Copied to clipboard' : 'Copy failed');
-  } catch { toast('Copy failed'); }
+    toast(ok ? '已复制' : '复制失败');
+  } catch { toast('复制失败'); }
 }
 // File-card Copy = the FILE itself on the clipboard (CF_HDROP, written by
 // the same-process server via /copy-file — the web Clipboard API cannot
@@ -938,7 +949,7 @@ async function copyText(it){
 // path, one writer, always a file.
 async function copyFile(it){
   const r = await api('/copy-file', { method:'POST', query:{ id: it.id } });
-  toast(r.ok ? 'File copied' : 'Copy failed');
+  toast(r.ok ? '文件已复制' : '复制失败');
 }
 // No confirmation dialog: window.confirm is broken inside the Tauri WebView
 // (no dialog plugin -> it resolves to a rejected Promise, which is truthy, so
@@ -946,13 +957,13 @@ async function copyFile(it){
 // context-menu action; the toast reports the outcome.
 async function delItem(it){
   const res = await api('/rm', { method:'POST', query:{ id: it.id } });
-  if(res.ok) toast(it.kind === 'text' ? 'Deleted' : 'Deleted from Inbox');
-  else toast('Delete failed');
+  if(res.ok) toast('已删除');
+  else toast('删除失败');
   refresh();
 }
 async function revealItem(it){
   const res = await api('/reveal', { method:'POST', query:{ id: it.id } });
-  if(!res.ok) toast('File no longer exists');
+  if(!res.ok) toast('文件不存在');
 }
 function hideCtxMenu(){ $('ctxMenu').classList.remove('show'); }
 
@@ -1033,8 +1044,8 @@ function buildEmpty(){
     <div class="e-icon">
       <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m3 15 4-4 4 4"/><path d="m14 9 4-4 4 4"/><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/></svg>
     </div>
-    <div class="e-title">Ready for transfer</div>
-    <div class="e-desc">Send text messages, photos or files seamlessly across devices.</div>`;
+    <div class="e-title">准备就绪</div>
+    <div class="e-desc">跨设备互传文字、照片和文件</div>`;
   return e;
 }
 
@@ -1120,7 +1131,7 @@ function buildMsg(it, animate){
         // phone's push or the PC's own paste-to-send. The percent lives in the
         // corner ring on the receiving end only.
         info.querySelector('.fc-size').textContent +=
-          ' · ' + (mine ? 'Uploading…' : 'Receiving…');
+          ' · ' + (mine ? '发送中…' : '接收中…');
       }
       card.appendChild(info);
 
@@ -1231,7 +1242,7 @@ function render(items){
 
 async function openDefault(it){
   const res = await api('/open', { method:'POST', query:{ id: it.id } });
-  if(!res.ok) toast('File no longer exists');
+  if(!res.ok) toast('文件不存在');
 }
 
 // Downloads are NATIVE-ONLY: every file is handed to the browser's own
@@ -1340,10 +1351,10 @@ function paintCorner(id){
       btn.classList.remove('hidden');
       if(isPC){
         btn.innerHTML = BTN_FOLDER;
-        btn.title = 'Reveal in Explorer';
+        btn.title = '在资源管理器中显示';
       } else {
         btn.innerHTML = BTN_DL;
-        btn.title = 'Download';
+        btn.title = '下载';
       }
       return;
     }
@@ -1453,7 +1464,7 @@ function openOnPhone(it){
   ov.innerHTML = isVid
     ? '<video src="'+src+'" controls autoplay playsInline></video>'
     : '<img src="'+src+'">'
-    + '<button class="mo-close" aria-label="Close">'
+    + '<button class="mo-close" aria-label="关闭">'
     + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
     + '</button>';
   // Image: any tap dismisses (the whole layer IS the photo). Video: only the
@@ -1554,7 +1565,7 @@ function paintDl(id){
   const size = card.querySelector('.fc-size');
   if(size){
     if(size.dataset.base === undefined) size.dataset.base = size.textContent;
-    size.textContent = on ? size.dataset.base + ' · Sending…' : size.dataset.base;
+    size.textContent = on ? size.dataset.base + ' · 发送中…' : size.dataset.base;
   }
 }
 // render() rebuilt the DOM and wiped the pulse classes; re-apply from the
@@ -1591,8 +1602,8 @@ function sendText(){
   if(!text) return;
   api('/send-text', { method:'POST', body:{ text } }).then(r => {
     if(r.ok){ t.value = ''; autoSize(); updateSendBtn(); }
-    else toast('Send failed');
-  }).catch(() => toast('Send failed'));
+    else toast('发送失败');
+  }).catch(() => toast('发送失败'));
 }
 
 function autoSize(){
@@ -1643,9 +1654,9 @@ async function startUpload(f){
   // old load/error/abort trio collapses into just success vs failure.
   try {
     const r = await api('/upload', { method:'POST', body: fd, query:{ size: f.size || 0 } });
-    finish(r.ok ? 'Sent successfully' : 'Transfer failed');
+    finish(r.ok ? '发送成功' : '传输失败');
   } catch {
-    finish('Transfer failed');
+    finish('传输失败');
   }
 }
 
@@ -1667,7 +1678,7 @@ $('txt').addEventListener('keydown', e => {
 $('send').onclick = sendText;
 
 $('inboxBtn').onclick = () => {
-  api('/open-dir', {method:'POST'}).catch(()=>toast('Could not open inbox'));
+  api('/open-dir', {method:'POST'}).catch(()=>toast('无法打开收件箱'));
 };
 
 // iOS quirk (observed on both Safari and Chrome via log traces): the OS picker
@@ -1702,7 +1713,7 @@ async function addLocalPaths(paths){
   });
   if(!fresh.length) return;
   const r = await api('/add-local', { method:'POST', body:{ paths: fresh } });
-  if(!r.ok) toast('Could not add file(s)');
+  if(!r.ok) toast('添加失败');
 }
 // Tauri fires tauri://drag-drop with the real paths in parallel with the HTML5
 // drop. Listening to it covers platforms where the File.path injection is
@@ -1720,7 +1731,7 @@ async function pickLocal(){
     $('fileInput').click(); return;
   }
   try {
-    const picked = await T.dialog.open({ multiple: true, title: 'Select files' });
+    const picked = await T.dialog.open({ multiple: true, title: '选择文件' });
     if(!picked) return;
     let paths = [];
     if(Array.isArray(picked)) paths = picked.map(p => typeof p === 'string' ? p : p.path);
@@ -1728,7 +1739,7 @@ async function pickLocal(){
     else if(picked && picked.path) paths = [picked.path];
     addLocalPaths(paths);
   } catch(e) {
-    toast('Add failed');
+    toast('添加失败');
   }
 }
 
@@ -1784,7 +1795,7 @@ let everConnected = false;
 function applyInfo(d){
   if(!isPC || !d) return;
   const online = !!d.mobileConnected;
-  if(online && !everConnected) toast('Paired — ready to transfer');
+  if(online && !everConnected) toast('已配对,可以传输了');
   if(online) everConnected = true;
   // The gate is a pairing screen, not a splash: it never goes away by click.
   // The first LAN device arriving is the only thing that lifts it — which is
@@ -1844,15 +1855,38 @@ function connect(){
 // Home-screen web app contexts refuse service: since iOS 26 the add-to-Home-
 // Screen flow installs every site as a web app by default (the "Open as Web
 // App" toggle, on by default, is the user's — no site-side meta can opt out),
-// and a standalone web app has no download manager to hand /dl to. tinbox's
-// download path rides the browser's downloader, so that context cannot work;
-// surfacing the webAppGate card beats silent download failures there. The
-// legacy apple-mobile-web-app-* metas stay retired: on older iOS they are
+// and an app-window context has no download manager or browser chrome to hand
+// /dl to. tinbox's download path rides the browser's downloader, so that
+// context cannot work; surfacing the webAppGate card beats silent download
+// failures there. Detection follows web.dev's canonical display-mode ladder,
+// widened to every non-browser mode so the Chromium ends are covered too:
+// standalone/minimal-ui match Android + desktop Chromium app windows,
+// fullscreen covers Chrome Android fullscreen PWAs (its standalone report is
+// unreliable — mdn/content#34928), window-controls-overlay covers desktop
+// overlay windows, navigator.standalone is the iOS-only fallback, and the
+// android-app:// referrer catches TWAs. With no manifest, an Android shortcut
+// cannot enter any of these modes today, so those arms are pure defense in
+// depth. atWebAppLive closes the runtime hole: desktop Chrome can transfer an
+// open tab into a fresh app window AFTER load, flipping display-mode under a
+// live page — and it omits fullscreen, because the Fullscreen API also flips
+// display-mode to fullscreen at runtime (MDN), which is not an app window.
+// The legacy apple-mobile-web-app-* metas stay retired: on older iOS they are
 // what FORCED this context, on iOS 26 they are dead code either way.
+const atWebApp = matchMedia('(display-mode: standalone), (display-mode: minimal-ui),'
+  + ' (display-mode: fullscreen), (display-mode: window-controls-overlay)');
+const atWebAppLive = matchMedia('(display-mode: standalone), (display-mode: minimal-ui),'
+  + ' (display-mode: window-controls-overlay)');
 const inWebApp = !isPC && (navigator.standalone === true
-  || matchMedia('(display-mode: standalone)').matches);
+  || document.referrer.startsWith('android-app://')
+  || atWebApp.matches);
 if(inWebApp) $('webAppGate').classList.add('show');
 else connect();
+atWebAppLive.addEventListener('change', e => {
+  if(!isPC && e.matches && !pairExpired && !superseded){
+    try { es.close(); } catch {}
+    $('webAppGate').classList.add('show');
+  }
+});
 
 // Pairing-expiry probe: EventSource never surfaces HTTP statuses, so a token
 // rotated by a server restart looks identical to a dead server. Every SSE
@@ -1922,14 +1956,14 @@ function applyFw(needRepair){
     // repair return only means "UAC granted", the confirmation is this
     // transition.
     api('/untop', {method:'POST'}).catch(()=>{});
-    toast('Network access granted');
+    toast('网络访问已恢复');
   }
   fwWasShown = show;
 }
 $('fwRepair').onclick = async () => {
   $('fwRepair').disabled = true;
   $('fwQuit').disabled = true;
-  $('fwHint').textContent = 'Please confirm the administrator prompt (UAC)…';
+  $('fwHint').textContent = '请在弹窗中确认管理员授权(UAC)…';
   try {
     const r = await api('/repair', {method:'POST'});
     const txt = await r.text();
@@ -1938,12 +1972,12 @@ $('fwRepair').onclick = async () => {
       // The fix is confirmed by the fw worker within ~1s of the rules
       // landing: applyFw(false) closes this overlay. If the UAC prompt is
       // cancelled, nothing changes and clicking Allow retries.
-      $('fwHint').textContent = 'Confirm the UAC prompt — the overlay closes once the fix takes effect.';
+      $('fwHint').textContent = '已发起授权,确认后此弹窗会自动关闭。';
     } else {
-      $('fwHint').textContent = 'Permission not granted. Click Allow to retry.';
+      $('fwHint').textContent = '未获授权,请点击“允许”重试。';
     }
   } catch(e) {
-    $('fwHint').textContent = 'Request failed, please retry';
+    $('fwHint').textContent = '请求失败,请重试';
   }
   $('fwRepair').disabled = false;
   $('fwQuit').disabled = false;
@@ -1981,6 +2015,12 @@ document.addEventListener('keydown', e => {
 });
 
 if(isPC){
+  // The OS title bar already brands the window (icon + "tinbox") immediately
+  // above the page header; painting the brand twice in 60px of vertical space
+  // is duplication. The phone keeps its in-page brand — mobile browsers give
+  // a page almost no identity chrome of its own, so the header logo is the
+  // only branding surface there.
+  document.querySelector('.brand').style.display = 'none';
   // The gate hides only once the first device connects (everConnected latches
   // inside applyInfo); it never comes back after that. There is NO manual
   // escape: the gate is the pairing screen, and pairing is the only way to the

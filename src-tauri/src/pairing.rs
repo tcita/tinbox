@@ -82,7 +82,7 @@ fn cookie_carries_token(headers: &HeaderMap, tok: &str) -> bool {
 const UNPAIRED_PAGE: &str = concat!(
     "<!doctype html><html><head><meta charset=\"utf-8\">",
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
-    "<title>tinbox — pairing expired</title><style>",
+    "<title>tinbox — 配对已过期</title><style>",
     "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;",
     "box-sizing:border-box;background:#f2f2f7;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}",
     "@media (prefers-color-scheme: dark){body{background:#000000}}",
@@ -97,8 +97,8 @@ const UNPAIRED_PAGE: &str = concat!(
     "@media (prefers-color-scheme: dark){p{color:#8e8e93}}",
     "</style></head><body><div class=\"card\">",
     "<div class=\"glyph\">📦</div>",
-    "<h1>Pairing expired</h1>",
-    "<p>Pairing does not survive a restart. Scan the QR code shown on the tinbox window on the PC to connect.</p>",
+    "<h1>配对已过期</h1>",
+    "<p>请重新扫码连接。</p>",
     "</div></body></html>"
 );
 

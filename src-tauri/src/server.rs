@@ -13,8 +13,8 @@ use crate::logger::{loge, logf, logw};
 use crate::netinfo::{collect_ips, note_foreign_subnet, qr};
 use crate::pairing::{request_token, require_token, UNPAIRED_MARKER};
 use crate::presence::{
-    lan_peer_connected, monitor_loop, now_mono, LAST_PAIRED_ACT, LAST_PHONE_ACT,
-    LAN_EVENTS_OPEN, SSE_HEARTBEAT_SECS,
+    lan_peer_connected, monitor_loop, now_mono, LAST_PAIRED_ACT, LAN_EVENTS_OPEN,
+    SSE_HEARTBEAT_SECS,
 };
 use crate::transfer::{cancel, dl_status, download, remove, upload, view};
 use axum::{
@@ -74,14 +74,14 @@ pub(crate) enum PushEvent {
     /// anymore (see the LIVENESS block — connectivity feedback is action-
     /// coupled), so a later `info` transition past the first connect only
     /// refreshes the shown address.
-    Info { mobile_connected: bool, url: String, ip: String, port: u16 },
+    Info { mobile_connected: bool, url: String },
     /// [LIVENESS/reconcile] The one catch-up event: "you may have missed
     /// pushes — re-fetch /dl-status and reconcile your mirror, so no corner
     /// freezes on a stale percent". The complete server trigger list:
     ///   - events(): a subscriber lagged the broadcast channel and dropped
     ///     events (surfaced as BroadcastStream lag),
     ///   - monitor_loop: stale entries were pruned (finished past 15s, or
-    ///     silent past 30s),
+    ///     silent past 5s),
     ///   - cancel(): a push was refused by the PC — it pushes no terminal
     ///     progress tick, so clients must reconcile their mirrors away.
     /// Clients additionally reconcile on (re)connect and on visibilitychange
@@ -135,7 +135,6 @@ async fn log_requests(
 ) -> Response {
     let is_lan = !peer.ip().is_loopback();
     if is_lan {
-        LAST_PHONE_ACT.store(now_mono(), Ordering::Relaxed);
         note_foreign_subnet(&peer);
     }
     let method = req.method().clone();
@@ -148,15 +147,12 @@ async fn log_requests(
     }
     let resp = next.run(req).await;
     if is_lan {
-        // Two stamps, two consumers, out of the same request stream:
-        //   LAST_PHONE_ACT proves packets can arrive — firewall evidence — and
-        //   a pairing refusal is still an arrival, so it was already stamped
-        //   above.
-        //   LAST_PAIRED_ACT proves a PAIRED device is present, and only gets
-        //   this request when the pairing gate let it through. Previously ONE
-        //   stamp fed presence: an expired tab (403 for everything) visibly
-        //   lifted the PC's QR gate into "Paired" by merely refetching — the
-        //   report that produced this split.
+        // Stamped only when the pairing gate let the request through (a
+        // refusal carries the marker and never reaches here). Presence and
+        // the PC gate latch must mean "a PAIRED device is alive": previously
+        // ONE stamp fed presence, and an expired tab (403 for everything)
+        // visibly lifted the PC's QR gate into "Paired" by merely refetching
+        // — the report that produced the paired-only stamp.
         if resp.headers().get(UNPAIRED_MARKER).is_none() {
             LAST_PAIRED_ACT.store(now_mono(), Ordering::Relaxed);
         }
@@ -689,13 +685,13 @@ fn fw_event() -> Event {
 }
 
 fn info_event() -> Event {
-    let (ip, port, url) = current_url();
+    let url = current_url();
     let online = lan_peer_connected();
     Event::default()
         .retry(Duration::from_secs(1))
         .event("info")
         .json_data(serde_json::json!({
-            "mobileConnected": online, "ip": ip, "port": port, "url": url
+            "mobileConnected": online, "url": url
         }))
         .unwrap()
 }
@@ -715,27 +711,29 @@ fn push_event_to_sse(ev: PushEvent) -> Event {
             .event("fw")
             .json_data(serde_json::json!({ "needRepair": need }))
             .unwrap(),
-        PushEvent::Info { mobile_connected, url, ip, port } => Event::default()
+        PushEvent::Info { mobile_connected, url } => Event::default()
             .event("info")
             .json_data(serde_json::json!({
-                "mobileConnected": mobile_connected, "url": url, "ip": ip, "port": port
+                "mobileConnected": mobile_connected, "url": url
             }))
             .unwrap(),
         PushEvent::Resync => Event::default().event("resync").data("1"),
     }
 }
 
-/// Best LAN IP + bound port + full URL, shared by the /qr code and `info` events.
-/// The URL carries the pairing token, so scanning the QR and copy-pasting the
-/// address elsewhere are one and the same gesture.
-pub(crate) fn current_url() -> (String, u16, String) {
+/// The full pairing URL (best LAN IP + bound port + token): shown on the PC
+/// (header, gate, lightbox) and pushed in `info` events. The URL carries the
+/// pairing token, so scanning the QR and copy-pasting the address elsewhere
+/// are one and the same gesture. This is the ONE place the URL is assembled —
+/// netinfo's /qr route reuses it so the QR and the displayed address can never
+/// drift apart.
+pub(crate) fn current_url() -> String {
     let ip = collect_ips()
         .first()
         .cloned()
         .unwrap_or_else(|| "127.0.0.1".to_string());
     let port = BOUND_PORT.get().copied().unwrap_or(PORT);
-    let url = format!("http://{}:{}/?t={}", ip, port, request_token());
-    (ip, port, url)
+    format!("http://{}:{}/?t={}", ip, port, request_token())
 }
 
 /// Return the embedded app logo (header brand, connect gate emblem and

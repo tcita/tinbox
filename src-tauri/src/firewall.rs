@@ -34,25 +34,6 @@
 //      confirms the invariant within ~1s and the overlay closes through the
 //      same flag path as everything else. Rule changes take effect
 //      immediately, so the phone connects within the same session.
-//   3. the fw worker: ONE long-lived powershell process owns every rule
-//      transition after startup (a per-tick "powershell spawn" costs ~1.1s
-//      of CPU, so the old spawn-per-tick pollers are gone). The script
-//      loops in-process (~100ms per pass, 500ms cadence) and emits a line
-//      only when the state changes, judged against a ROAMING-PROOF
-//      invariant: the app's enabled inbound Allow rules must collectively
-//      cover every profile ({Public, Private, Domain}) — the Windows
-//      dialog's Allow is scoped to the category active at answer time, so
-//      "current network works" does not survive a network switch, and
-//      retiring on it would reopen the silent-failure hole. A block
-//      appearing sets the flag; missing coverage sets it too (preventive:
-//      the phone may still work right now, the NEXT network would not);
-//      the invariant being met clears it and retires the worker (rules
-//      cannot change by themselves — nothing left to watch). The script
-//      self-exits when its parent dies (an app quit never leaks the
-//      child), and an unexpected child death respawns after 5s. The one
-//      long-lived case is the fresh-install window where the Windows
-//      dialog is still unanswered — the OS gets the first chance to
-//      satisfy the invariant before the overlay demands the repair.
 //
 // A temp .ps1 file is used instead of passing the script via -ArgumentList to
 // avoid quotes/braces being mangled while being passed on the command line.
@@ -350,37 +331,18 @@ fn clear_need_repair() {
 }
 
 /// Queried by the frontend (the monitor pushes transitions as SSE `fw`
-/// events): whether the firewall repair overlay should be shown.
-///
-/// The flag is moved by two writers, in order of trustworthiness:
-///   1. Positive evidence (this branch): a LAN device's requests or transfer
-///      bytes still arriving is proof that inbound is open, whatever the
-///      rules say. It clears the flag and closes the overlay — including
-///      after a repair whose result could not be confirmed by inspection.
-///      Positive evidence also includes bytes flowing to a phone mid-
-///      download: a request that opens a Range stream proved inbound is
-///      open, and a transfer can then hold that stream for many seconds
-///      with no new requests arriving (which lan_seen_recently alone would
-///      miss).
-///   2. The fw worker's rule transitions: a block appearing sets the flag,
-///     the block vanishing clears it. An unparseable check emits nothing,
-///     so it can neither set nor clear — "could not verify" is not
-///     "verified fine".
+/// events): whether the firewall repair overlay should be shown. ONE writer
+/// moves the flag: the fw worker's rule verdicts (dirty sets it, canonical
+/// clears it). A traffic-evidence veto (any request or transfer byte within
+/// 30s pinned the flag down) was deliberately removed: the invariant is
+/// roaming-proof and the overlay is PREVENTIVE — "rules not canonical, the
+/// NEXT network breaks" — so working traffic does not contradict the flag,
+/// and suppressing the overlay mid-transfer only postpones the one-click
+/// permanent fix. Silence sets nothing either way: only the worker's
+/// inspection raises the flag, and a restart re-judges everything, which
+/// covers the accepted "external mutation after retirement" risk.
 pub fn need_repair() -> bool {
-    #[cfg(windows)]
-    {
-        if crate::presence::lan_seen_recently(30)
-            || crate::transfer::transfer_active_recently(30)
-        {
-            PENDING_REPAIR.store(false, Ordering::SeqCst);
-            return false;
-        }
-        PENDING_REPAIR.load(Ordering::SeqCst)
-    }
-    #[cfg(not(windows))]
-    {
-        false
-    }
+    PENDING_REPAIR.load(Ordering::SeqCst)
 }
 
 /// Frontend "Repair" click: launch the elevated UAC script that deletes the
