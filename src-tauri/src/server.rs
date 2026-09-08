@@ -31,7 +31,6 @@ use std::sync::atomic::Ordering;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::broadcast;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt as _};
 use tauri::Manager;
@@ -484,11 +483,12 @@ async fn add_local(
             continue;
         }
         attempted += 1;
-        match copy_into_inbox(&canon).await {
-            Ok((id, dest, safe)) => {
-                catalog::add_remote("pc", &id, &dest, &safe);
+        match crate::transfer::copy_into_inbox(&canon).await {
+            Ok((_id, dest, _safe)) => {
                 added += 1;
-                // The card appears now that the file is fully in inbox.
+                // copy_into_inbox registered the pending row, graduated it
+                // (sentinel rename + mark_remote_ready) and already pushed its
+                // registration List; this push repaints the row as ready.
                 let _ = notifier().send(PushEvent::List(catalog::all_items()));
                 logf(&format!(
                     "add-local: copied {} -> {}",
@@ -504,44 +504,6 @@ async fn add_local(
     }
     logf(&format!("add-local: added {added} file(s) to inbox"));
     (StatusCode::OK, format!("added: {added}")).into_response()
-}
-
-/// Stream one file into inbox as `{id}__{safe_name}` with async I/O (never
-/// blocks a runtime thread). Returns (id, inbox path, display name) only once the
-/// whole file is on disk; on error the partial destination is removed so no
-/// half-written file lingers.
-async fn copy_into_inbox(src: &Path) -> std::io::Result<(String, PathBuf, String)> {
-    let safe = safe_name(
-        src.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("unnamed"),
-    );
-    if safe.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "bad file name",
-        ));
-    }
-    let id = catalog::new_id();
-    let dest = catalog::inbox_dir().join(format!("{id}__{safe}"));
-
-    let src_f = tokio::fs::File::open(src).await?;
-    let dst_f = tokio::fs::File::create(&dest).await?;
-    let mut reader = tokio::io::BufReader::with_capacity(512 * 1024, src_f);
-    let mut writer = tokio::io::BufWriter::with_capacity(512 * 1024, dst_f);
-    if let Err(e) = tokio::io::copy_buf(&mut reader, &mut writer).await {
-        drop(writer); // release the handle so remove_file works on Windows
-        let _ = tokio::fs::remove_file(&dest).await;
-        return Err(e);
-    }
-    // Flush to surface disk-full / late write errors before registering ready.
-    if let Err(e) = writer.flush().await {
-        drop(writer);
-        let _ = tokio::fs::remove_file(&dest).await;
-        return Err(e);
-    }
-    drop(writer);
-    Ok((id, dest, safe))
 }
 
 /// For frontend error reporting: write client-side exceptions into the server

@@ -18,11 +18,11 @@ use axum::{
 };
 use std::collections::HashSet;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::StreamExt as _;
 use tokio_util::io::ReaderStream;
 /// Live transfer counters. Two key spaces share the map:
@@ -318,6 +318,129 @@ pub(crate) async fn upload(
             }
         }
     }
+}
+
+/// PC drag-and-drop / paste: copy a local file into the inbox through the
+/// SAME pipeline as a phone upload — pending row registered first (the card
+/// and its ring appear at drop instant instead of after a silent copy), a
+/// sentinel-named destination, a chunked copy that feeds the shared ledger so
+/// the throttled `progress` pushes move the PC's corner ring, and the
+/// graduation rename that strips the sentinel. Failure cleans itself exactly
+/// like a failed upload, so even a mid-copy process death leaves a residue
+/// that self-identifies (reconcile kills the sentinel; the original never
+/// left the source disk, so nothing is lost).
+pub(crate) async fn copy_into_inbox(src: &Path) -> std::io::Result<(String, PathBuf, String)> {
+    let safe = safe_name(
+        src.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("unnamed"),
+    );
+    if safe.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "bad file name",
+        ));
+    }
+    let id = catalog::new_id();
+    let stored = catalog::inbox_dir().join(format!("pending__{id}__{safe}"));
+    let final_path = catalog::inbox_dir().join(format!("{id}__{safe}"));
+    let size = tokio::fs::metadata(src).await.map(|m| m.len()).unwrap_or(0);
+
+    // Self-clean on any failure past registration: the pending row, the
+    // ledger entry and the sentinel file all go; the List push repaints both
+    // ends. Mirrors the upload handler's Err arm one-for-one.
+    async fn fail(stored: &Path, id: &str) {
+        catalog::remove(id);
+        let _ = tokio::fs::remove_file(stored).await;
+        dl_lock().remove(id);
+        let _ = notifier().send(PushEvent::List(catalog::all_items()));
+    }
+
+    // Register the pending row + ledger entry FIRST, so feedback starts at
+    // drop instant and the copy below just fills the ring. The declared total
+    // is exact (a local stat, not the sender's claim).
+    catalog::add_remote_pending("pc", &id, &stored, &safe, size);
+    let _ = notifier().send(PushEvent::List(catalog::all_items()));
+    {
+        let mut map = dl_lock();
+        let e = map.entry(id.clone()).or_default();
+        e.total = size;
+        e.sent = 0;
+        touch_entry(e);
+    }
+
+    let src_f = match tokio::fs::File::open(src).await {
+        Ok(f) => f,
+        Err(e) => {
+            fail(&stored, &id).await;
+            return Err(e);
+        }
+    };
+    let dst_f = match tokio::fs::File::create(&stored).await {
+        Ok(f) => f,
+        Err(e) => {
+            fail(&stored, &id).await;
+            return Err(e);
+        }
+    };
+    let mut reader = tokio::io::BufReader::with_capacity(512 * 1024, src_f);
+    let mut writer = tokio::io::BufWriter::with_capacity(512 * 1024, dst_f);
+    // Chunked copy instead of copy_buf (a black box): every 512 KiB lands in
+    // the ledger and drives the throttled ring update. Same buffering
+    // profile, so throughput is unchanged.
+    let mut buf = vec![0u8; 512 * 1024];
+    let mut sent: u64 = 0;
+    let copy = loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break Ok(()),
+            Ok(n) => {
+                if let Err(e) = writer.write_all(&buf[..n]).await {
+                    break Err(e);
+                }
+                sent += n as u64;
+                {
+                    let mut map = dl_lock();
+                    let e = map.entry(id.clone()).or_default();
+                    e.sent = sent;
+                    touch_entry(e);
+                    push_progress(&mut map, &id, now_ms(), false);
+                }
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    // Flush to surface disk-full / late write errors before registering ready.
+    let copy = match copy {
+        Ok(()) => writer.flush().await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = copy {
+        drop(writer); // release the handle so remove_file works on Windows
+        fail(&stored, &id).await;
+        return Err(e);
+    }
+    drop(writer);
+    // Graduation: strip the sentinel with a same-volume atomic rename, then
+    // flip the row ready. The crash windows fail safe on both sides, exactly
+    // like uploads: before the rename the sentinel still marks the (maybe
+    // complete) bytes for reconcile — the source disk holds the original;
+    // after the rename the final name is a complete file, so even if the
+    // catalog update is lost, reconcile's adoption of it is correct.
+    if let Err(e) = tokio::fs::rename(&stored, &final_path).await {
+        fail(&stored, &id).await;
+        return Err(e);
+    }
+    catalog::mark_remote_ready(&id, &final_path);
+    {
+        // Final tick (sent == total) closes the ring immediately, unthrottled.
+        let mut map = dl_lock();
+        if let Some(e) = map.get_mut(&id) {
+            e.sent = e.total.max(sent);
+            touch_entry(e);
+        }
+        push_progress(&mut map, &id, now_ms(), true);
+    }
+    Ok((id, final_path, safe))
 }
 
 /// Infer Content-Type from the file extension for /view so the browser can
