@@ -1865,12 +1865,10 @@ let esDown = false;
 function connect(){
   if(pairExpired) return;
   es = new EventSource('/events');
-  // Observability: onopen and the FIRST error are tagged into the server log.
-  // onopen proves JS was alive at the reconnect instant; the first error marks
-  // the moment JS discovered the link dead — for a page waking from a freeze,
-  // that IS the unfreeze timestamp. Later errors stay silent (EventSource
-  // fires them on a ~1s retry cadence; logging those would only spam).
-  es.onopen = () => { esDown = false; lastSeen = Date.now(); reportClientError('es onopen'); reconcile(); };
+  // Observability: only the FIRST error is tagged into the server log — it
+  // marks the moment JS discovered the link dead. onopen stays quiet: it fires
+  // on every (re)connect including the watchdog's, and would only spam /log.
+  es.onopen = () => { esDown = false; lastSeen = Date.now(); reconcile(); };
   es.onerror = () => { if(!esDown) reportClientError('es first error'); esDown = true; probePairing(); };
   // The server heartbeats as unnamed `message` events (see /events keep_alive);
   // this is the only hook that sees them.
@@ -1974,11 +1972,7 @@ setInterval(() => {
 // it "open" but delivers nothing), so on return to the foreground there is no
 // new SSE event to nudge a refresh. Reconcile here.
 document.addEventListener('visibilitychange', () => {
-  // Observability: reconcile's fetches hit quiet-poll endpoints, so a
-  // foreground return leaves no server-side trace by itself. Tag the
-  // transition — this is how background/foreground mysteries get attributed
-  // after the fact (e.g. the locked-screen delivery question).
-  reportClientError('visibility -> ' + document.visibilityState);
+  // Quiet by design: every lock/unlock would otherwise POST /log.
   if(document.visibilityState === 'visible') reconcile();
 });
 

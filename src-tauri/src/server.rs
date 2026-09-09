@@ -171,8 +171,20 @@ async fn log_requests(
 /// Endpoints hit once per SSE connect (or on a rare one-shot resync), whose
 /// successful responses are not worth a log line. /info and /fw-status are gone
 /// entirely: their state now arrives over the /events push channel.
+/// /log, /events and the static brand assets are also quiet: they fire on
+/// every reconnect/page load and would otherwise bury meaningful events.
 fn is_quiet_poll(path: &str) -> bool {
-    matches!(path, "/dl-status" | "/list")
+    matches!(
+        path,
+        "/dl-status"
+            | "/list"
+            | "/log"
+            | "/events"
+            | "/logo"
+            | "/favicon.ico"
+            | "/apple-touch-icon.png"
+            | "/apple-touch-icon-precomposed.png"
+    )
 }
 
 /// Find an available port starting from the preferred one: try 7765..7780 one
@@ -512,8 +524,17 @@ async fn add_local(
 struct ClientLogPayload {
     msg: String,
 }
-async fn client_log(axum::Json(payload): axum::Json<ClientLogPayload>) -> impl IntoResponse {
-    logf(&format!("client: {}", payload.msg));
+async fn client_log(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    axum::Json(payload): axum::Json<ClientLogPayload>,
+) -> impl IntoResponse {
+    // Sanitize: single line + bounded length, so a client cannot inject fake
+    // log lines via embedded newlines or bloat the file with a 2MB body.
+    let mut msg = payload.msg.replace(['\r', '\n'], " ");
+    if msg.chars().count() > 1000 {
+        msg = msg.chars().take(1000).collect();
+    }
+    logf(&format!("client {}: {}", peer.ip(), msg));
     (StatusCode::OK, "logged").into_response()
 }
 

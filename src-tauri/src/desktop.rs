@@ -40,7 +40,14 @@ fn reveal_path(path: &str) {
 
 /// Open a file with the system default viewer (PC side single-click on a file
 /// card). Only File messages; Text has no file to open.
-pub(crate) async fn open_file(Query(p): Query<IdParam>) -> impl IntoResponse {
+pub(crate) async fn open_file(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(p): Query<IdParam>,
+) -> impl IntoResponse {
+    if from_by_peer(peer) != "pc" {
+        logw("open: rejected from phone (would open viewer on the PC)");
+        return (StatusCode::FORBIDDEN, "phone cannot open PC files").into_response();
+    }
     let Some(entry) = catalog::find(&p.id) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
