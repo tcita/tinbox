@@ -981,6 +981,13 @@ let curItems = [];   // latest message list, mirrors what render() is showing
 // state makes no /list requests at all).
 function applyList(items){
   lastServer = items;
+  // A pending from="pc" row is the PC's LOCAL copy into its own inbox — the
+  // phone is neither sender nor receiver of those bytes, so showing it as a
+  // transfer would lie twice ("发送中/接收中" over a wire that carries
+  // nothing). The phone first sees the file when the copy graduates; until
+  // then the row stays PC-internal. The PC keeps it: its ring rides the
+  // copy's progress pushes.
+  if(!isPC) items = items.filter(i => !(i.pending && i.from === 'pc'));
   // Merge the sending phone's optimistic "just picked a file" cards in until the
   // server's real (pending) row appears, so the UI shows the card instantly.
   const view = withOptimistic(items);
@@ -1127,11 +1134,14 @@ function buildMsg(it, animate){
       info.querySelector('.fc-name').textContent = it.name;
       info.querySelector('.fc-size').textContent = fmtSize(it.size);
       if(it.pending){
-        // Direction caption by sender, not by device: a pending row can be the
-        // phone's push or the PC's own paste-to-send. The percent lives in the
-        // corner ring on the receiving end only.
+        // Caption by WHAT IS MOVING, not by sender alone: a pending
+        // from="phone" row is bytes crossing Wi-Fi (发送 on the phone, 接收
+        // on the PC); a pending from="pc" row is a LOCAL copy into the inbox
+        // — 导入 on the PC, and the phone shows nothing at all (it receives
+        // nothing; its card appears when the copy graduates). The percent
+        // lives in the corner ring on the copying end.
         info.querySelector('.fc-size').textContent +=
-          ' · ' + (mine ? '发送中…' : '接收中…');
+          ' · ' + (it.from === 'pc' ? '导入中…' : (mine ? '发送中…' : '接收中…'));
       }
       card.appendChild(info);
 
@@ -1312,11 +1322,12 @@ const GLYPH_DONE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" s
 function cornerState(id){
   const it = itemById(id);
   if(!it || it.kind !== 'file') return null;
-  // Only the receiver draws, and on this page the receiver is only ever the
-  // PC receiving a phone push (the pending row IS the transfer). Pulls draw
-  // nothing here — the puller's browser owns that UI — and uploads on the
-  // sending phone draw nothing either (sender-side).
-  if(!isPC || !it.pending || it.from !== 'phone') return null;
+  // Only the receiver draws, and on this page the receiver is the PC for
+  // every pending row: a phone push (bytes crossing Wi-Fi land here) and the
+  // PC's own drag-in copy (bytes land here from the source disk) alike. Pulls
+  // draw nothing here — the puller's browser owns that UI — and the sending
+  // phone draws nothing either (sender-side).
+  if(!isPC || !it.pending) return null;
   const prog = progCache[id];
   const total = (prog && prog.total) || it.size || 1;
   const sent = prog ? Math.min(prog.sent, total) : 0;
@@ -1511,7 +1522,10 @@ function syncProgress(list){
   const now = Date.now();
   for(const d of list){
     const item = itemById(d.id);
-    if(!item || !item.pending || item.from !== 'phone') continue;
+    // Any pending row's ring paints on the PC: both a phone push AND the
+    // PC's own drag-in copy stream progress pushes with this end as the
+    // place where the bytes land.
+    if(!item || !item.pending) continue;
     progCache[d.id] = { sent: d.sent, total: d.total, t: now };
     paintCorner(d.id);
   }
@@ -1851,8 +1865,13 @@ let esDown = false;
 function connect(){
   if(pairExpired) return;
   es = new EventSource('/events');
-  es.onopen = () => { esDown = false; lastSeen = Date.now(); reconcile(); };
-  es.onerror = () => { esDown = true; probePairing(); };
+  // Observability: onopen and the FIRST error are tagged into the server log.
+  // onopen proves JS was alive at the reconnect instant; the first error marks
+  // the moment JS discovered the link dead — for a page waking from a freeze,
+  // that IS the unfreeze timestamp. Later errors stay silent (EventSource
+  // fires them on a ~1s retry cadence; logging those would only spam).
+  es.onopen = () => { esDown = false; lastSeen = Date.now(); reportClientError('es onopen'); reconcile(); };
+  es.onerror = () => { if(!esDown) reportClientError('es first error'); esDown = true; probePairing(); };
   // The server heartbeats as unnamed `message` events (see /events keep_alive);
   // this is the only hook that sees them.
   es.onmessage = () => { lastSeen = Date.now(); };
@@ -1955,6 +1974,11 @@ setInterval(() => {
 // it "open" but delivers nothing), so on return to the foreground there is no
 // new SSE event to nudge a refresh. Reconcile here.
 document.addEventListener('visibilitychange', () => {
+  // Observability: reconcile's fetches hit quiet-poll endpoints, so a
+  // foreground return leaves no server-side trace by itself. Tag the
+  // transition — this is how background/foreground mysteries get attributed
+  // after the fact (e.g. the locked-screen delivery question).
+  reportClientError('visibility -> ' + document.visibilityState);
   if(document.visibilityState === 'visible') reconcile();
 });
 
@@ -2054,9 +2078,19 @@ if(isPC){
 
 // Report client-side exceptions into the server log, so a failure on the phone
 // (where tinbox.log is not directly readable) still lands in tinbox.log with a
-// "client:" prefix. Fire-and-forget; a dead server must not loop on errors.
+// "client:" prefix. Every line carries a monotonic sequence number, so a lost
+// POST (e.g. a fetch that loses the unfreeze race right after a page wakes and
+// its catch swallows the failure) shows up as a visible gap instead of a
+// silent hole. One silent retry on a fresh connection — same decision tree as
+// add-local.
+let clientLogSeq = 0;
 function reportClientError(msg){
-  api('/log', { method:'POST', body:{ msg } }).catch(()=>{});
+  const tag = '#' + (++clientLogSeq) + ' ' + msg;
+  api('/log', { method:'POST', body:{ msg: tag } }).catch(() => {
+    setTimeout(() => {
+      api('/log', { method:'POST', body:{ msg: tag + ' (retry)' } }).catch(()=>{});
+    }, 1000);
+  });
 }
 window.addEventListener('error', e => {
   reportClientError((e.message || 'unknown error') + ' @' + (e.filename || '') + ':' + (e.lineno || ''));
