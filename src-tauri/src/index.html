@@ -24,7 +24,7 @@
     --accent: #0071e3;
     --accent-hover: #0077ed;
     --accent-bg: rgba(0, 113, 227, 0.1);
-    --bubble-me: #0071e3;
+      --bubble-me: #2bb457;
     --bubble-me-text: #ffffff;
     --bubble-them: #ffffff;
     --bubble-them-text: #1d1d1f;
@@ -56,7 +56,7 @@
       --accent: #0a84ff;
       --accent-hover: #409cff;
       --accent-bg: rgba(10, 132, 255, 0.15);
-      --bubble-me: #0a84ff;
+    --bubble-me: #2bb457;
       --bubble-me-text: #ffffff;
       --bubble-them: #1c1c1e;
       --bubble-them-text: #f5f5f7;
@@ -377,7 +377,7 @@
      this end paints no ✕, no percent and no tap target. */
   .file-card.downloading { animation: pendingPulse 1.6s ease-in-out infinite; }
 
-  /* Fullscreen media preview (phone "open" for image/video) */
+  /* Fullscreen media preview (both ends, image/video) */
   .media-ov {
     position: fixed; inset: 0; z-index: 400; background: rgba(0,0,0,0.92);
     display: flex; align-items: center; justify-content: center; padding: 16px;
@@ -395,6 +395,18 @@
     display: flex; align-items: center; justify-content: center;
   }
   .mo-close:active { transform: scale(0.92); }
+  /* hover只有PC鼠标吃得到：加亮背景（dismiss语义，不用红色抢“危险”含义）。 */
+  .mo-close:hover { background: rgba(255,255,255,0.28); }
+  /* PC-only二级动作：在浮层里用系统默认应用打开（/open）。胶囊按钮，
+     点透不关闭浮层（stopPropagation），外抛后浮层留在原处。 */
+  .mo-open {
+    position: absolute; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); left: 50%;
+    transform: translateX(-50%); border: none; cursor: pointer; white-space: nowrap;
+    background: rgba(255,255,255,0.14); color: #fff;
+    font-size: 13px; padding: 8px 16px; border-radius: 999px;
+  }
+  .mo-open:active { transform: translateX(-50%) scale(0.96); }
+  .mo-open:hover { background: rgba(255,255,255,0.28); }
   @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
 
   /* Empty state */
@@ -483,7 +495,8 @@
 
   /* Toast */
   .toast {
-    position: fixed; top: 20px; left: 50%; transform: translateX(-50%) translateY(-20px) scale(0.95);
+    position: fixed; top: auto; bottom: calc(76px + env(safe-area-inset-bottom, 0px)); left: 50%;
+    transform: translateX(-50%) translateY(20px) scale(0.95);
     background: rgba(30, 30, 32, 0.9); color: #ffffff;
     padding: 9px 18px; border-radius: 999px; font-size: 13px; font-weight: 500;
     backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
@@ -701,20 +714,6 @@
       <button class="fw-btn quit" id="fwQuit">退出</button>
     </div>
     <div class="fw-hint" id="fwHint"></div>
-  </div>
-</div>
-
-<!-- Superseded Overlay -->
-<div class="fw-overlay" id="deadOverlay">
-  <div class="fw-card danger">
-    <div class="fw-icon">
-      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
-    </div>
-    <div class="fw-title">已在其他标签页打开</div>
-    <div class="fw-desc">此页面已被新标签页接管,请手动关闭。</div>
-    <div class="fw-btns">
-      <button class="fw-btn repair" id="deadClose">关闭此页</button>
-    </div>
   </div>
 </div>
 
@@ -1108,12 +1107,14 @@ function buildMsg(it, animate){
         img.alt = it.name;
         img.loading = 'lazy';
         img.onerror = () => { img.remove(); card.classList.remove('has-preview'); };
-        // Phone: preview opens from the image ITSELF. The card surface stays
-        // dead, so a long-press that lands on the card's padding (not the
-        // image) cannot click-through into the preview on release — on an
-        // ordinary webpage the padding is dead too. Long-press ON the image
-        // is the browser's native menu.
-        if(!isPC) img.onclick = () => openOnPhone(it);
+        // Preview opens from the media element ITSELF on both ends. The card
+        // surface stays dead for media, so a long-press that lands on the
+        // card's padding (not the image) cannot click-through into the
+        // preview on release — on an ordinary webpage the padding is dead
+        // too. Long-press ON the image is the browser's native menu.
+        // stopPropagation: the card below also opens the preview (padding
+        // taps), without it one tap would stack two overlays.
+        img.onclick = (e) => { e.stopPropagation(); openPreview(it); };
         card.appendChild(img);
       } else if(isVid){
         card.classList.add('has-preview');
@@ -1122,7 +1123,7 @@ function buildMsg(it, animate){
         v.muted = true; v.playsInline = true; v.preload = 'metadata';
         v.onloadedmetadata = () => { try { v.currentTime = 0.01; } catch {} };
         v.onerror = () => { v.remove(); card.classList.remove('has-preview'); };
-        if(!isPC) v.onclick = () => openOnPhone(it);
+        v.onclick = (e) => { e.stopPropagation(); openPreview(it); };
         card.appendChild(v);
       } else {
         card.innerHTML = `<div class="fc-ico">${iconFor(it.name)}</div>`;
@@ -1166,14 +1167,21 @@ function buildMsg(it, animate){
       ring.onclick = (e) => { e.stopPropagation(); ringTap(it); };
       card.appendChild(ring);
 
-      if(isPC){
+      // Media on both ends opens the instant in-app preview (bytes are
+      // already at hand — no reason to cold-start an external viewer for a
+      // first glance). On the PC the overlay carries a "用默认应用打开"
+      // button for the full viewer; other file types still shell out
+      // directly since no in-app viewer beats their native app.
+      if(isImg || isVid){
+        card.onclick = () => {
+          if(it.pending) return;                          // still uploading
+          openPreview(it);
+        };
+      } else if(isPC){
         card.onclick = () => {
           if(it.pending) return;                          // still uploading
           openDefault(it);
         };
-      } else if(isImg || isVid){
-        // Preview lives on the media element (see above); the card surface
-        // is deliberately click-dead on the phone.
       } else {
         card.onclick = () => {
           if(it.pending) return;                          // still uploading
@@ -1461,28 +1469,37 @@ function checkUploadGone(items){
   }
 }
 
-// Phone "open": fullscreen preview for media, a hint otherwise (the phone has
-// no generic file viewer). The fullscreen layer deliberately keeps the
-// BROWSER's native long-press callout: it shows the ORIGINAL bytes, so the
-// platform's "Save Image" / "Download" / share sheet operates on the real
-// photo — the one place where native menus are both natural and byte-correct.
-function openOnPhone(it){
+// Fullscreen media preview for image/video, both ends: the bytes are already
+// at hand (the card pulled /view), so this is instant where ShellExecuteing
+// an external viewer costs a cold start. The fullscreen layer deliberately
+// keeps the BROWSER's native long-press callout: it shows the ORIGINAL bytes,
+// so the platform's "Save Image" / "Download" / share sheet operates on the
+// real photo — the one place where native menus are both natural and
+// byte-correct. PC-only second step: a pill button shells out to the system
+// default viewer (openDefault → /open) for zoom/edit and for formats whose
+// native app beats any in-app view.
+function openPreview(it){
   if(!isImgName(it.name) && !isVidName(it.name)) return;   // only media previews
   const isVid = isVidName(it.name);
   const ov = document.createElement('div');
   ov.className = 'media-ov';
   const src = '/view?id='+encodeURIComponent(it.id);
-  ov.innerHTML = isVid
+  // NOTE: parens are load-bearing — ?: binds looser than +, without them the
+  // video branch would swallow the buttons below (overlay with no ✕, then a
+  // null.onclick throw before appendChild, i.e. tap does nothing at all).
+  ov.innerHTML = (isVid
     ? '<video src="'+src+'" controls autoplay playsInline></video>'
-    : '<img src="'+src+'">'
+    : '<img src="'+src+'">')
     + '<button class="mo-close" aria-label="关闭">'
     + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
-    + '</button>';
+    + '</button>'
+    + (isPC ? '<button class="mo-open">用默认应用打开</button>' : '');
   // Image: any tap dismisses (the whole layer IS the photo). Video: only the
   // backdrop or the ✕ dismisses — taps on the video itself must reach the
   // native controls (play/pause/seek), not close the layer under the finger.
   ov.onclick = (e) => { if(!isVid || e.target === ov) ov.remove(); };
   ov.querySelector('.mo-close').onclick = (e) => { e.stopPropagation(); ov.remove(); };
+  if(isPC) ov.querySelector('.mo-open').onclick = (e) => { e.stopPropagation(); openDefault(it); };
   document.body.appendChild(ov);
 }
 
@@ -1919,7 +1936,7 @@ const inWebApp = !isPC && (navigator.standalone === true
 if(inWebApp) $('webAppGate').classList.add('show');
 else connect();
 atWebAppLive.addEventListener('change', e => {
-  if(!isPC && e.matches && !pairExpired && !superseded){
+  if(!isPC && e.matches && !pairExpired){
     try { es.close(); } catch {}
     $('webAppGate').classList.add('show');
   }
@@ -1935,7 +1952,7 @@ atWebAppLive.addEventListener('change', e => {
 // EventSource can fire `error` on a ~1s retry cadence.
 let pairProbeInFlight = false;
 function probePairing(){
-  if(superseded || pairExpired || pairProbeInFlight) return;
+  if(pairExpired || pairProbeInFlight) return;
   pairProbeInFlight = true;
   fetch('/list')
     .then(r => { if(r.status === 403) pairExpiredNow(); })
@@ -1960,7 +1977,7 @@ function reconcile(){
 // EventSource will never notice on its own. Force a fresh connection; its
 // `open` replays state.
 setInterval(() => {
-  if(superseded || pairExpired) return;
+  if(pairExpired) return;
   if(!esDown && lastSeen && Date.now() - lastSeen > 3000){
     lastSeen = Date.now();
     try { es.close(); } catch {}
@@ -2021,24 +2038,6 @@ $('fwRepair').onclick = async () => {
   $('fwQuit').disabled = false;
 };
 $('fwQuit').onclick = () => { api('/quit', {method:'POST'}).catch(()=>{}); };
-
-function supersede(){
-  if(superseded) return;
-  superseded = true;
-  try { es.close(); } catch {}
-  $('deadOverlay').classList.add('show');
-  setTimeout(() => window.close(), 300);
-}
-// Browsers only allow window.close() for script-opened windows, and tabs opened
-// by scanning a QR are user-opened - so this button may also be ignored on iOS,
-// but under a user gesture some browsers grant self-close.
-$('deadClose').onclick = () => { try { window.close(); } catch {} };
-let superseded = false;
-const takeover = 'BroadcastChannel' in window ? new BroadcastChannel('tinbox-page') : null;
-if(takeover){
-  takeover.onmessage = e => { if(e.data === 'hello') supersede(); };
-  takeover.postMessage('hello');
-}
 
 // QR lightbox: the small header QR opens a large scan-ready version on click.
 // Closing is explicit — the card's ✕ button or the Escape key; the backdrop
