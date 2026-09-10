@@ -537,7 +537,7 @@
     background: #ffffff; padding: 12px; border-radius: 18px; display: inline-block;
     box-shadow: 0 4px 20px rgba(0,0,0,0.06); border: 1px solid rgba(0,0,0,0.04);
   }
-  #gateQr { width: 190px; height: 190px; display: block; border-radius: 8px; }
+  #gateQr { width: 200px; height: 200px; display: block; border-radius: 8px; }
 
   #gateUrl {
     margin-top: 18px; font-size: 12.5px; font-weight: 600; color: var(--accent);
@@ -548,18 +548,18 @@
     cursor: text; user-select: text; -webkit-user-select: text;
   }
   #gateUrl span { cursor: text; user-select: text; -webkit-user-select: text; }
-  /* Dismiss the gate and jump straight to the message list without waiting */
-  .g-actions {
-    margin-top: 18px; display: flex; justify-content: center;
+  /* Waiting indicator: the gate's only "live" element — a breathing dot that
+     says the server is up and listening. Dies with the gate on first connect
+     (everConnected), so no state to manage. */
+  .g-wait {
+    margin-top: 16px; display: flex; align-items: center; justify-content: center;
+    gap: 7px; font-size: 12px; color: var(--sub);
   }
-  .g-inbox {
-    display: inline-flex; align-items: center; gap: 7px;
-    background: var(--accent); color: #fff; border: none; border-radius: 12px;
-    padding: 10px 20px; font-size: 13.5px; font-weight: 600; cursor: pointer;
-    transition: transform 0.15s var(--ease-spring), filter 0.15s;
+  .g-dot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
+    animation: gPulse 1.6s ease-in-out infinite;
   }
-  .g-inbox:hover { filter: brightness(1.06); transform: translateY(-1px); }
-  .g-inbox:active { transform: scale(0.95); }
+  @keyframes gPulse { 0%, 100% { opacity: .35; transform: scale(.85); } 50% { opacity: 1; transform: scale(1); } }
   @media (pointer: coarse) { #gate { display: none !important; } }
 
   /* Modals (Firewall & Superseded) */
@@ -681,23 +681,15 @@
 <!-- Connect Gate (PC Only) -->
 <div id="gate">
   <div class="g-card">
-    <div class="g-radar">
-      <img src="/logo" alt="tinbox">
-    </div>
     <div class="g-title" id="gateTitle">扫码连接</div>
-    <div class="g-desc" id="gateDesc">请保持手机与电脑在同一 Wi-Fi<br>tinbox 重启后需重新扫码</div>
+    <div class="g-desc" id="gateDesc">请保持手机与电脑在同一 Wi-Fi</div>
     <div class="qr-frame">
       <img id="gateQr" src="/qr" alt="QR code">
     </div>
     <div>
       <div id="gateUrl"><span>…</span></div>
     </div>
-    <div class="g-actions">
-      <button class="g-inbox" id="gateInbox" title="打开收件箱文件夹">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-        打开收件箱
-      </button>
-    </div>
+    <div class="g-wait"><span class="g-dot"></span>等待手机扫码连接…</div>
   </div>
 </div>
 
@@ -2064,9 +2056,6 @@ if(isPC){
   // in-app timeline. The Inbox button is a real folder — the transfer landing
   // zone on disk — and nothing else.
   $('gate').classList.add('show');
-  $('gateInbox').onclick = async () => {
-    try { await api('/open-dir', { method: 'POST' }); } catch {}
-  };
 }
 
 // Report client-side exceptions into the server log, so a failure on the phone
