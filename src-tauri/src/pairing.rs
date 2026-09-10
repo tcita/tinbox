@@ -73,35 +73,41 @@ fn cookie_carries_token(headers: &HeaderMap, tok: &str) -> bool {
 
 /// What an unpaired, non-loopback visitor sees: a card visually identical to
 /// the in-app pairing overlay (same glyph, card geometry, type,
-/// theme-following palette). One message for every unpaired arrival:
-/// expired session, first-time visitor, stale link, or a shared/forwarded
-/// link (which can never work — LAN-only, paired device only); the
-/// instruction is the same "rescan", so the wording is one. All CSS and the
-/// emoji are inline; the page makes ZERO further requests (every asset it
-/// could want is behind the very gate that served it). The PC's loopback
-/// window never reaches this branch, so the text below is visitor-only.
-const UNPAIRED_PAGE: &str = concat!(
-    "<!doctype html><html><head><meta charset=\"utf-8\">",
-    "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
-    "<title>tinbox — 请重新扫码连接</title><style>",
-    "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;",
-    "box-sizing:border-box;background:#f2f2f7;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}",
-    "@media (prefers-color-scheme: dark){body{background:#000000}}",
-    ".card{max-width:380px;width:100%;box-sizing:border-box;text-align:center;padding:36px 32px 30px;",
-    "background:#ffffff;border-radius:28px;border:1px solid rgba(0,0,0,0.04);",
-    "box-shadow:0 16px 48px rgba(0,0,0,0.08)}",
-    "@media (prefers-color-scheme: dark){.card{background:#1c1c1e;border-color:rgba(255,255,255,0.08)}}",
-    ".glyph{font-size:44px;line-height:1;margin-bottom:12px}",
-    "h1{font-size:20px;font-weight:700;letter-spacing:-0.4px;margin:0 0 6px;color:#1a1a1e}",
-    "@media (prefers-color-scheme: dark){h1{color:#ffffff}}",
-    "p{font-size:13px;line-height:1.55;margin:0;color:#86868b}",
-    "@media (prefers-color-scheme: dark){p{color:#8e8e93}}",
-    "</style></head><body><div class=\"card\">",
-    "<div class=\"glyph\">📦</div>",
-    "<h1>请重新扫码连接</h1>",
-    "<p>通过分享/转发打开的 tinbox 文件无法访问，仅限同一 Wi-Fi 下扫码配对的设备打开。<br>发给他人请先保存或复制后再分享；本机继续用请重扫电脑上的二维码。</p>",
-    "</div></body></html>"
-);
+/// theme-following palette). Two variants, picked by request path in
+/// require_token (a refused credential is a given in both):
+///   - file link (/view, /dl): a shared/forwarded URL, which can never work
+///     (LAN-only, paired device only) — the copy says so, not "rescan";
+///   - anything else (/ and the rest): expired session or stale link — the
+///     copy says rescan. Bare-IP first visits don't happen (entry always
+///     carries ?t= or the cookie), so no third variant.
+/// All CSS and the emoji are inline; the page makes ZERO further requests
+/// (every asset it could want is behind the very gate that served it). The
+/// PC's loopback window never reaches this branch, so the text below is
+/// visitor-only.
+fn unpaired_page(title: &str, heading: &str, body: &str) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\">\
+        <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+        <title>{title}</title><style>\
+        body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;\
+        box-sizing:border-box;background:#f2f2f7;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}}\
+        @media (prefers-color-scheme: dark){{body{{background:#000000}}}}\
+        .card{{max-width:380px;width:100%;box-sizing:border-box;text-align:center;padding:36px 32px 30px;\
+        background:#ffffff;border-radius:28px;border:1px solid rgba(0,0,0,0.04);\
+        box-shadow:0 16px 48px rgba(0,0,0,0.08)}}\
+        @media (prefers-color-scheme: dark){{.card{{background:#1c1c1e;border-color:rgba(255,255,255,0.08)}}}}\
+        .glyph{{font-size:44px;line-height:1;margin-bottom:12px}}\
+        h1{{font-size:20px;font-weight:700;letter-spacing:-0.4px;margin:0 0 6px;color:#1a1a1e}}\
+        @media (prefers-color-scheme: dark){{h1{{color:#ffffff}}}}\
+        p{{font-size:13px;line-height:1.65;margin:0;color:#86868b;text-align:left}}\
+        @media (prefers-color-scheme: dark){{p{{color:#8e8e93}}}}\
+        </style></head><body><div class=\"card\">\
+        <div class=\"glyph\">📦</div>\
+        <h1>{heading}</h1>\
+        <p>{body}</p>\
+        </div></body></html>"
+    )
+}
 
 /// Response marker the pairing gate attaches to every refusal: log_requests
 /// reads it after the fact to decide which of the two presence stamps this
@@ -137,13 +143,30 @@ pub(crate) async fn require_token(
         }
         return resp;
     }
+    // Refused: pick the copy by path. A file link (/view, /dl) opened without
+    // a valid credential is a shared/forwarded URL — say it can't work that
+    // way. Anything else is an expired session or stale link — say rescan.
+    let path = req.uri().path();
+    let (title, heading, body) = if path.starts_with("/view") || path.starts_with("/dl") {
+        (
+            "tinbox — 无效的分享链接",
+            "无效的分享链接",
+            "tinbox 文件不能靠分享/转发网页链接发给别人，仅限同一 Wi-Fi 下扫码配对的设备打开。<br>发给他人请先保存或复制后再分享；自己用请重扫电脑上的二维码。",
+        )
+    } else {
+        (
+            "tinbox — 请重新扫码连接",
+            "请重新扫码连接",
+            "电脑重启后配对会失效，请重扫电脑上的二维码重新连接。",
+        )
+    };
     let mut resp = (
         StatusCode::FORBIDDEN,
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
             (header::CACHE_CONTROL, "no-cache".to_string()),
         ],
-        UNPAIRED_PAGE,
+        unpaired_page(title, heading, body),
     )
         .into_response();
     resp.headers_mut().insert(UNPAIRED_MARKER, HeaderValue::from_static("1"));
