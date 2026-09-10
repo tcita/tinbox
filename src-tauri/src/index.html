@@ -378,7 +378,9 @@
   /* hover只有PC鼠标吃得到：加亮背景（dismiss语义，不用红色抢“危险”含义）。 */
   .mo-close:hover { background: rgba(255,255,255,0.28); }
   /* PC-only二级动作：在浮层里用系统默认应用打开（/open）。胶囊按钮，
-     点透不关闭浮层（stopPropagation），外抛后浮层留在原处。 */
+     点透不关闭浮层（stopPropagation），外抛后浮层留在原处。手机浮层只有✕：
+     下载已在卡片角标常驻，同一个动作不配第二颗钮（PC 胶囊是卡片上没有的
+     动作，才够格进浮层）。 */
   .mo-open {
     position: absolute; bottom: calc(18px + env(safe-area-inset-bottom, 0px)); left: 50%;
     transform: translateX(-50%); border: none; cursor: pointer; white-space: nowrap;
@@ -783,6 +785,22 @@ function iconFor(name){
   return '📦';
 }
 
+// A preview that fails (unsupported codec, truncated bytes) falls back to a
+// plain icon card — same shape as non-media — instead of stranding the row as
+// bare text: no media pixels means the phone long-press has nothing native to
+// offer, and without the icon even the failure is invisible.
+function mediaFailed(card, it){
+  card.querySelectorAll('img,video').forEach(m => m.remove());
+  card.classList.remove('has-preview');
+  if(!card.querySelector('.fc-ico')){
+    const d = document.createElement('div');
+    d.className = 'fc-ico';
+    d.innerHTML = iconFor(it.name);
+    card.prepend(d);
+  }
+  paintCorner(it.id);
+}
+
 // ---- Server API -----------------------------------------------------------
 
 // Media-class helpers, single source of truth: the renderer, the phone
@@ -1069,7 +1087,7 @@ function buildMsg(it, animate){
         img.src = '/view?id=' + encodeURIComponent(it.id);
         img.alt = it.name;
         img.loading = 'lazy';
-        img.onerror = () => { img.remove(); card.classList.remove('has-preview'); paintCorner(it.id); };
+        img.onerror = () => mediaFailed(card, it);
         // Preview opens from the media element ITSELF on both ends. The card
         // surface stays dead for media, so a long-press that lands on the
         // card's padding (not the image) cannot click-through into the
@@ -1085,7 +1103,7 @@ function buildMsg(it, animate){
         v.src = '/view?id='+encodeURIComponent(it.id);
         v.muted = true; v.playsInline = true; v.preload = 'metadata';
         v.onloadedmetadata = () => { try { v.currentTime = 0.01; } catch {} };
-        v.onerror = () => { v.remove(); card.classList.remove('has-preview'); paintCorner(it.id); };
+        v.onerror = () => mediaFailed(card, it);
         v.onclick = (e) => { e.stopPropagation(); openPreview(it); };
         card.appendChild(v);
       } else {
@@ -1328,20 +1346,15 @@ function paintCorner(id){
       // The corner's idle occupant is a persistent action button on both
       // ends, each pointing at what that end can do with the file: the PC
       // (the file's source) reveals its folder; the phone re-downloads
-      // through its browser. Both yield the corner only to a receiver-side
-      // ring, so each never gets hidden by the transfers the other end runs.
-      // One exception: phone media WITH a live preview hides the button. The
-      // native long-press (存储图像/视频 → Photos) is the better destination
-      // — this button drops bytes into the browser download dir where nobody
-      // finds them — and the disc mars the photo. Non-media (and media whose
-      // preview failed, i.e. no has-preview) keeps it: there is no other
-      // route to the bytes.
+      // through its browser (Files/Downloads dir). Uniform on every card
+      // including images: the Files destination is a real need (originals,
+      // re-sharing), and per-type exceptions only puzzle. Both yield the
+      // corner only to a receiver-side ring, so each never gets hidden by
+      // the transfers the other end runs.
       if(isPC){
         btn.classList.remove('hidden');
         btn.innerHTML = BTN_FOLDER;
         btn.title = '在资源管理器中显示';
-      } else if(card.classList.contains('has-preview')){
-        btn.classList.add('hidden');
       } else {
         btn.classList.remove('hidden');
         btn.innerHTML = BTN_DL;
