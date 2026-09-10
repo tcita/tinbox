@@ -84,7 +84,7 @@ fn cookie_carries_token(headers: &HeaderMap, tok: &str) -> bool {
 /// (every asset it could want is behind the very gate that served it). The
 /// PC's loopback window never reaches this branch, so the text below is
 /// visitor-only.
-fn unpaired_page(title: &str, heading: &str, body: &str) -> String {
+fn unpaired_page(glyph: &str, title: &str, heading: &str, body: &str) -> String {
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
@@ -102,7 +102,7 @@ fn unpaired_page(title: &str, heading: &str, body: &str) -> String {
         p{{font-size:13px;line-height:1.65;margin:0;color:#86868b;text-align:left}}\
         @media (prefers-color-scheme: dark){{p{{color:#8e8e93}}}}\
         </style></head><body><div class=\"card\">\
-        <div class=\"glyph\">📦</div>\
+        <div class=\"glyph\">{glyph}</div>\
         <h1>{heading}</h1>\
         <p>{body}</p>\
         </div></body></html>"
@@ -143,21 +143,26 @@ pub(crate) async fn require_token(
         }
         return resp;
     }
-    // Refused: pick the copy by path. A file link (/view, /dl) opened without
-    // a valid credential is a shared/forwarded URL — say it can't work that
-    // way. Anything else is an expired session or stale link — say rescan.
+    // Refused: pick the copy AND the glyph by path. The glyph sits in the
+    // status-icon slot, so it must read as status, not brand: 📦 (the tinbox
+    // box) says "package" on a page that is about neither packages nor boxes.
+    // A file link (/view, /dl) opened without a valid credential is a
+    // shared/forwarded URL — 🔗 names the culprit. Anything else is an expired
+    // session or stale link — 📷 names the fix (scan again).
     let path = req.uri().path();
-    let (title, heading, body) = if path.starts_with("/view") || path.starts_with("/dl") {
+    let (glyph, title, heading, body) = if path.starts_with("/view") || path.starts_with("/dl") {
         (
+            "🔗",
             "tinbox — 无效的分享链接",
             "无效的分享链接",
             "tinbox 文件不能靠分享/转发网页链接发给别人，仅限同一 Wi-Fi 下扫码配对的设备打开。<br>发给他人请先保存或复制后再分享。",
         )
     } else {
         (
+            "📷",
             "tinbox — 请重新扫码连接",
             "请重新扫码连接",
-            "电脑重启后配对会失效，请重扫电脑上的二维码重新连接。",
+            "tinbox 每次启动配对都会更新，请重扫电脑上的二维码重新连接。",
         )
     };
     let mut resp = (
@@ -166,7 +171,7 @@ pub(crate) async fn require_token(
             (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
             (header::CACHE_CONTROL, "no-cache".to_string()),
         ],
-        unpaired_page(title, heading, body),
+        unpaired_page(glyph, title, heading, body),
     )
         .into_response();
     resp.headers_mut().insert(UNPAIRED_MARKER, HeaderValue::from_static("1"));
