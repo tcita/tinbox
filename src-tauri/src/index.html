@@ -1069,7 +1069,7 @@ function buildMsg(it, animate){
         img.src = '/view?id=' + encodeURIComponent(it.id);
         img.alt = it.name;
         img.loading = 'lazy';
-        img.onerror = () => { img.remove(); card.classList.remove('has-preview'); };
+        img.onerror = () => { img.remove(); card.classList.remove('has-preview'); paintCorner(it.id); };
         // Preview opens from the media element ITSELF on both ends. The card
         // surface stays dead for media, so a long-press that lands on the
         // card's padding (not the image) cannot click-through into the
@@ -1085,7 +1085,7 @@ function buildMsg(it, animate){
         v.src = '/view?id='+encodeURIComponent(it.id);
         v.muted = true; v.playsInline = true; v.preload = 'metadata';
         v.onloadedmetadata = () => { try { v.currentTime = 0.01; } catch {} };
-        v.onerror = () => { v.remove(); card.classList.remove('has-preview'); };
+        v.onerror = () => { v.remove(); card.classList.remove('has-preview'); paintCorner(it.id); };
         v.onclick = (e) => { e.stopPropagation(); openPreview(it); };
         card.appendChild(v);
       } else {
@@ -1326,15 +1326,24 @@ function paintCorner(id){
     card.classList.remove('transferring');
     if(!card.dataset.pending){
       // The corner's idle occupant is a persistent action button on both
-      // ends, each pointing at what that end can do with the file: the phone
-      // re-downloads through its browser; the PC (the file's source) reveals
-      // its folder. Both yield the corner only to a receiver-side ring, so
-      // each never gets hidden by the transfers the other end runs.
-      btn.classList.remove('hidden');
+      // ends, each pointing at what that end can do with the file: the PC
+      // (the file's source) reveals its folder; the phone re-downloads
+      // through its browser. Both yield the corner only to a receiver-side
+      // ring, so each never gets hidden by the transfers the other end runs.
+      // One exception: phone media WITH a live preview hides the button. The
+      // native long-press (存储图像/视频 → Photos) is the better destination
+      // — this button drops bytes into the browser download dir where nobody
+      // finds them — and the disc mars the photo. Non-media (and media whose
+      // preview failed, i.e. no has-preview) keeps it: there is no other
+      // route to the bytes.
       if(isPC){
+        btn.classList.remove('hidden');
         btn.innerHTML = BTN_FOLDER;
         btn.title = '在资源管理器中显示';
+      } else if(card.classList.contains('has-preview')){
+        btn.classList.add('hidden');
       } else {
+        btn.classList.remove('hidden');
         btn.innerHTML = BTN_DL;
         btn.title = '下载';
       }
@@ -1618,6 +1627,12 @@ function uploadFiles(files){
   for(const f of files) startUpload(f);
   reapply();
 }
+// MIME-derived fallback for nameless uploads (see startUpload): keeps the
+// server's filename, so cache keys and inbox names stay meaningful.
+function fallbackName(f){
+  const m = /^image\/([a-z0-9]+)/i.exec(f.type || '');
+  return 'pasted-image.' + (m ? m[1].toLowerCase() : 'bin');
+}
 async function startUpload(f){
   const opt = { id: 'opt-' + (++optSeq), name: f.name, size: f.size || 0, at: Date.now() };
   // Draw the sending side's card immediately ("Uploading…") before the server
@@ -1625,7 +1640,12 @@ async function startUpload(f){
   // soon as that arrives.
   optUploads.push(opt);
   const fd = new FormData();
-  fd.append('file', f);
+  // Pasted clipboard images (long-press 拷贝 on a card, then paste into the
+  // composer) often arrive with an EMPTY filename — Safari puts the image AND
+  // its URL on the pasteboard, and the file half can be nameless. The server
+  // rejects those with a 400 ("bad filename") and the user only sees 传输失败.
+  // Name them here from the MIME type so the paste flow uploads like a file.
+  fd.append('file', f, f.name || fallbackName(f));
   // The abort handle is what checkUploadGone pulls when the receiver refuses
   // the push: aborting cancels the request mid-stream, so the phone stops
   // writing bytes into a socket the server is already tearing down.
@@ -1655,13 +1675,17 @@ async function startUpload(f){
 }
 
 $('txt').addEventListener('input', () => { autoSize(); updateSendBtn(); });
-// Paste-to-send on the composer: a screenshot on the PC, or an image just
-// copied from a card on the phone, sends immediately — the same flow as the
+// Paste-to-send on the composer: a screenshot on the PC, or an image copied
+// from another app on the phone, sends immediately — the same flow as the
 // plus button, no staging UI. Text-only pastes are untouched, and a
 // <textarea> cannot render an image anyway, so intercepting the file
-// representation is the only way it reaches the app. Some mobile keyboards
-// never offer 粘贴 for an image-only clipboard; there the plus button stays
-// the path (failure mode = today's behavior, nothing lost).
+// representation is the only way it reaches the app. Nameless clipboard files
+// are named from their MIME type in startUpload (Safari puts copied card
+// images on the pasteboard without a name); pasting a card's own image just
+// duplicates it as a new card — visible and deletable, the user's choice.
+// Some mobile keyboards never offer 粘贴 for an image-only clipboard; there
+// the plus button stays the path (failure mode = today's behavior, nothing
+// lost).
 $('txt').addEventListener('paste', e => {
   const files = [...(e.clipboardData ? e.clipboardData.files : [])];
   if(files.length){ e.preventDefault(); uploadFiles(files); }
@@ -1757,13 +1781,27 @@ async function pickLocal(){
   }
 }
 
-// Drag and drop overlay
+// Drag and drop overlay. The overlay (and only it) is gated on the drag
+// carrying real FILES: dragging a chat <img> around (long-press + move, esp.
+// on iOS Safari) fires dragenter too, but its types are URL/HTML with an empty
+// files list — showing 松手即发送 there is a lie (drop would no-op, and even
+// if it carried bytes it would re-upload the server's own file). preventDefault
+// stays unconditional so a stray drop can never navigate the page away.
+function dragHasFiles(e){
+  try { return [...(e.dataTransfer ? e.dataTransfer.types : [])].includes('Files'); }
+  catch { return false; }
+}
 let dragCounter = 0;
 const dOverlay = $('dragOverlay');
 window.addEventListener('dragenter', e => {
   e.preventDefault();
+  // Phone has no drag-upload at all: uploads ride the plus-button picker.
+  // Letting drops/pastes through would only re-upload the server's own bytes
+  // (a long-pressed card image) back to it under a made-up name. preventDefault
+  // stays so a stray drop can never navigate the page away.
+  if(!isPC) return;
   dragCounter++;
-  dOverlay.classList.add('active');
+  if(dragHasFiles(e)) dOverlay.classList.add('active');
 });
 window.addEventListener('dragleave', e => {
   e.preventDefault();
@@ -1778,6 +1816,12 @@ window.addEventListener('drop', e => {
   e.preventDefault();
   dragCounter = 0;
   dOverlay.classList.remove('active');
+  // Phone: every drop is swallowed, composer included. Drops of in-page
+  // images carry broken file entries (multipart that never parses — the log
+  // proves it: "upload rejected: multipart read"), so even the deliberate
+  // composer-drop misfires into a 传输失败 toast. Uploads ride the
+  // plus-button picker, full stop.
+  if(!isPC) return;
   const files = [...e.dataTransfer.files];
   if(!files.length) return;
   // PC drag-and-drop behaves like the plus button: real paths go to /add-local,
