@@ -24,7 +24,7 @@
     --accent: #0071e3;
     --accent-hover: #0077ed;
     --accent-bg: rgba(0, 113, 227, 0.1);
-      --bubble-me: #2bb457;
+    --bubble-me: #2bb457;
     --bubble-me-text: #ffffff;
     --bubble-them: #ffffff;
     --bubble-them-text: #1d1d1f;
@@ -107,7 +107,6 @@
   }
   #inboxBtn:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
   #inboxBtn:active { transform: scale(0.95); }
-  @media (pointer: coarse) { #inboxBtn { display: none; } }
 
   #qrBox {
     display: flex; align-items: center;
@@ -122,17 +121,10 @@
     width: 28px; height: 28px; border-radius: 6px; background: #fff;
     padding: 2px; display: block; cursor: pointer;
   }
-  .addrbar {
-    flex: none; padding: 3px 16px;
-    border-bottom: 1px solid var(--line);
-    text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  }
-  #qrUrl {
-    font-size: 11px; font-weight: 500; color: var(--sub);
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    cursor: text; user-select: text; -webkit-user-select: text;
-  }
-  @media (pointer: coarse) { #qrBox { display: none; } .addrbar { display: none; } }
+  /* Phone (coarse pointer): the header holds nothing the phone needs
+     (brand only — inbox/QR tiles are PC tools), so hide the whole bar and
+     give the rows back to the chat. */
+  @media (pointer: coarse) { .head { display: none; } }
 
   /* QR lightbox: click the small header QR to enlarge it for scanning */
   #qrLightbox {
@@ -199,21 +191,10 @@
   }
   .msg.me { flex-direction: row-reverse; }
 
-  .avatar {
-    width: 30px; height: 30px; flex: none; border-radius: 50%;
-    display: flex; align-items: center; justify-content: center;
-    background: var(--card); border: 1px solid var(--line);
-    color: var(--sub); box-shadow: 0 1px 3px rgba(0,0,0,0.03);
-    margin-bottom: 2px;
-  }
-  .msg.me .avatar {
-    background: var(--accent-bg); border-color: transparent; color: var(--accent);
-  }
-
   .bubble-container {
-    max-width: 72%; display: flex; flex-direction: column;
+    max-width: 78%; display: flex; flex-direction: column;
   }
-  @media (max-width: 600px) { .bubble-container { max-width: 84%; } }
+  @media (max-width: 600px) { .bubble-container { max-width: 88%; } }
 
   .bubble {
     padding: 10px 14px; border-radius: 18px;
@@ -223,7 +204,7 @@
   .msg.me .bubble {
     background: var(--bubble-me); color: var(--bubble-me-text);
     border-bottom-right-radius: 4px;
-    box-shadow: 0 2px 8px rgba(0, 113, 227, 0.22);
+    box-shadow: 0 2px 8px rgba(43, 180, 87, 0.25);
   }
   .msg.them .bubble {
     background: var(--bubble-them); color: var(--bubble-them-text);
@@ -240,7 +221,6 @@
        gives the app menu. */
     user-select: text; -webkit-user-select: text;
   }
-  .bubble.text:active { transform: scale(0.995); }
 
   .meta-line {
     font-size: 10px; font-weight: 500; color: var(--sub);
@@ -645,15 +625,11 @@
     <button id="inboxBtn" title="打开收件箱">
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
     </button>
-    <div id="qrBox">
+    <div id="qrBox" title="点击放大，扫码连接设备">
       <img id="qr" src="/qr" alt="QR">
     </div>
   </div>
 </div>
-
-<!-- Address strip: separate from the QR tile so the two don't crowd each
-     other; shows the address for manual entry when scanning fails -->
-<div class="addrbar" id="addrbar"><span id="qrUrl">…</span></div>
 
 <div id="chat">
   <div class="empty" id="empty">
@@ -1057,13 +1033,8 @@ function buildMsg(it, animate){
     // rebuild of an existing id (pending turning ready) must not blink.
     if(!animate) msg.style.animation = 'none';
 
-    const avatar = document.createElement('div');
-    avatar.className = 'avatar';
-    avatar.innerHTML = it.from === 'pc'
-      ? '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>'
-      : '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>';
-    msg.appendChild(avatar);
-
+    // Direction + bubble color carry the sender (one-to-one transfer: no
+    // per-message avatar needed — that chrome belongs to group chats).
     const bWrap = document.createElement('div');
     bWrap.className = 'bubble-container';
 
@@ -1845,7 +1816,6 @@ function applyInfo(d){
   // exactly the reported question "已连接了吗？" answered in one gesture.
   $('gate').classList.toggle('show', !everConnected);
   if(d.url){
-    $('qrUrl').textContent = d.url;
     $('gateUrl').querySelector('span').textContent = d.url;
     $('qlUrl').textContent = d.url;
   }
