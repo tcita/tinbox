@@ -171,14 +171,25 @@ pub(crate) async fn upload(
     loop {
         let mut field = match multipart.next_field().await {
             Ok(Some(f)) => f,
-            Ok(None) => return (StatusCode::BAD_REQUEST, "no file field").into_response(),
-            Err(e) => return (StatusCode::BAD_REQUEST, format!("read: {e}")).into_response(),
+            // Early rejections happen before any pending row exists, so the
+            // access log's error line is the only trace — log the reason here
+            // or the next silent 400 is undebuggable (e.g. pasted clipboard
+            // images once arrived with empty filenames).
+            Ok(None) => {
+                logw(&format!("upload rejected: no file field from {peer} (?size={:?})", q.size));
+                return (StatusCode::BAD_REQUEST, "no file field").into_response();
+            }
+            Err(e) => {
+                logw(&format!("upload rejected: multipart read from {peer}: {e}"));
+                return (StatusCode::BAD_REQUEST, format!("read: {e}")).into_response();
+            }
         };
         if field.name() != Some("file") {
             continue;
         }
         let filename = safe_name(field.file_name().unwrap_or("unnamed"));
         if filename.is_empty() {
+            logw(&format!("upload rejected: empty filename from {peer} (?size={:?})", q.size));
             return (StatusCode::BAD_REQUEST, "bad filename").into_response();
         }
         // Write to inbox under a SENTINEL name, not the final one:
