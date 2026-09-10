@@ -4,7 +4,7 @@
 // through Windows Firewall' screen" problem.
 //
 // Mechanism (normal privileges can only read rules; New/Remove need admin):
-//   1. the fw worker: ONE long-lived powershell process owns the ENTIRE rule
+//   1. the firewall worker: ONE long-lived powershell process owns the ENTIRE rule
 //      judgment — there is no separate startup pre-check (the worker's first
 //      pass ~1s after launch IS the startup check; two judges would either
 //      duplicate the logic or disagree with it). The script loops in-process
@@ -93,7 +93,7 @@ pub(crate) fn run_ps(script: &str) -> Option<(bool, String)> {
             Some((ok, String::from_utf8_lossy(&o.stdout).to_string()))
         }
         Err(e) => {
-            loge(&format!("could not launch powershell: {}", e));
+                loge(&format!("ps: could not launch powershell: {}", e));
             None
         }
     }
@@ -185,7 +185,7 @@ $ppid = {ppid}
 $prev = ''
 while ($true) {{
   if (-not (Get-Process -Id $ppid -ErrorAction SilentlyContinue)) {{ break }}
-  $rules = @(Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue | Get-NetFirewallRule | Where-Object {{ $_.Direction -eq 'Inbound' }})
+  $rules = @(Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {{ $_.Direction -eq 'Inbound' }})
   $s = ''
   if ($rules.Count -eq 0) {{
     $s = 'none'
@@ -204,7 +204,16 @@ while ($true) {{
     }}
     $s = 'dirty:' + $detail
   }}
-  if ($s -ne $prev) {{ $prev = $s; [Console]::WriteLine($s) }}
+  if ($s -ne $prev) {{
+    $prev = $s; [Console]::WriteLine($s)
+    # Dirty-transition rule dump (the "before" picture): verdicts alone
+    # (dirty:block) never show WHAT the table looks like — a surviving Block,
+    # a mis-scoped Allow, dialog Query strays. Transitions only, so no spam.
+    if ($s.StartsWith('dirty')) {{
+      $info = @($rules | ForEach-Object {{ $p = ($_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue).Program; '{{0}}|{{1}}|{{2}}|{{3}}|{{4}}' -f $_.DisplayName,$_.Action,$_.Enabled,$_.Profile,$p }}) -join ' ;; '
+      [Console]::WriteLine('rules:' + $info)
+    }}
+  }}
   Start-Sleep -Milliseconds 500
 }}"#
         );
@@ -226,7 +235,7 @@ while ($true) {{
             {
                 Ok(c) => c,
                 Err(e) => {
-                    loge(&format!("fw worker: could not launch powershell: {e}"));
+                    loge(&format!("firewall worker: could not launch powershell: {e}"));
                     std::thread::sleep(Duration::from_secs(5));
                     continue;
                 }
@@ -234,7 +243,7 @@ while ($true) {{
             let stdout = match child.stdout.take() {
                 Some(s) => s,
                 None => {
-                    loge("fw worker: stdout unavailable");
+                    loge("firewall worker: stdout unavailable");
                     std::thread::sleep(Duration::from_secs(5));
                     continue;
                 }
@@ -251,12 +260,22 @@ while ($true) {{
             let mut policy_dead = false;
             loop {
                 match rx.recv_timeout(Duration::from_secs(1)) {
-                    Ok(line) => match line.trim() {
-                        s if s.starts_with("dirty:") => {
+                    Ok(line) => {
+                        let state = line.trim().to_string();
+                        // Report only recognized verdicts: the child's stdout
+                        // can carry stray PowerShell error text (a transient
+                        // CIM hiccup when the repair hammers the same rule
+                        // store mid-pass) — consuming the one-shot on garbage
+                        // both wastes it and prints nonsense as "state".
+                        let recognized = state == "ok"
+                            || state == "none"
+                            || state.starts_with("dirty:");
+                        match state.as_str() {
+                            s if s.starts_with("dirty:") => {
                             let detail = &s["dirty:".len()..];
                             if !PENDING_REPAIR.load(Ordering::SeqCst) {
                                 logf(&format!(
-                                    "fw worker: rule set is not canonical ({detail}) — flagging repair to restore it"
+                                    "firewall worker: rule set is not canonical ({detail}) — flagging repair to restore it"
                                 ));
                                 mark_need_repair(&app);
                             }
@@ -266,10 +285,10 @@ while ($true) {{
                         }
                         "ok" => {
                             if PENDING_REPAIR.load(Ordering::SeqCst) {
-                                logf("fw worker: coverage restored, clearing repair flag");
+                                logf("firewall worker: coverage restored, clearing repair flag");
                                 clear_need_repair();
                             } else {
-                                logf("fw worker: all-profile Allow coverage in place — invariant met");
+                                logf("firewall worker: all-profile Allow coverage in place — invariant met");
                             }
                             // The invariant is roaming-proof: rules cannot
                             // change by themselves, so there is nothing left
@@ -278,7 +297,7 @@ while ($true) {{
                         }
                         "none" => {
                             if PENDING_REPAIR.load(Ordering::SeqCst) {
-                                logf("fw worker: applicable Block rule gone, clearing repair flag");
+                                logf("firewall worker: applicable Block rule gone, clearing repair flag");
                                 clear_need_repair();
                             }
                             // No rules at all: the Windows dialog is pending.
@@ -286,7 +305,25 @@ while ($true) {{
                             // satisfy the invariant, the worker re-judges on
                             // the next pass.
                         }
+                        // Table line from the dirty-transition dump above —
+                        // WHAT the rules look like, not just the verdict.
+                        // Never touches the flag or the worker's life cycle;
+                        // pure evidence.
+                        s if s.starts_with("rules:") => {
+                            let t = s["rules:".len()..].trim();
+                            logf(&format!(
+                                "firewall worker: rule table [{}]",
+                                if t.is_empty() { "(empty)" } else { t }
+                            ));
+                        }
                         _ => {}
+                        }
+                        // One-shot post-repair verdict: log the very next
+                        // RECOGNIZED verdict even when nothing changed, so
+                        // post-click silence always has an answer in the log.
+                        if recognized && LOG_NEXT_VERDICT.swap(false, Ordering::SeqCst) {
+                            logf(&format!("firewall worker: post-repair rule state={state}"));
+                        }
                     },
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break, // child died
@@ -311,6 +348,7 @@ while ($true) {{
 #[cfg(windows)]
 fn mark_need_repair(app: &AppHandle) {
     PENDING_REPAIR.store(true, Ordering::SeqCst);
+    logf("firewall: repair flag SET — overlay up");
     // Push the repair flag over the SSE channel so the frontend shows the
     // overlay immediately instead of waiting for the background monitor.
     let _ = crate::server::notifier().send(crate::server::PushEvent::Fw(true));
@@ -327,6 +365,7 @@ fn mark_need_repair(app: &AppHandle) {
 #[cfg(windows)]
 fn clear_need_repair() {
     PENDING_REPAIR.store(false, Ordering::SeqCst);
+    logf("firewall: repair flag CLEARED — overlay down");
     let _ = crate::server::notifier().send(crate::server::PushEvent::Fw(false));
 }
 
@@ -356,7 +395,30 @@ pub fn repair() -> bool {
         // script deletes the previous tinbox_Allow_Inbound before creating
         // the new one, so N grants still converge to exactly one rule.
         let Some(exe) = exe_path() else { return false; };
-        repair_as_admin(&exe)
+        // A stale result file from a previous attempt would let the watcher
+        // below report old news — remove it before launching.
+        let _ = std::fs::remove_file(result_path());
+        let started = repair_as_admin(&exe);
+        if started {
+            // Two one-shot diagnostics for the window after the click:
+            // the worker logs its very next verdict even when unchanged
+            // (post-repair silence is otherwise ambiguous), and the watcher
+            // below reports what the elevated script actually did.
+            LOG_NEXT_VERDICT.store(true, Ordering::SeqCst);
+            std::thread::spawn(watch_repair_result);
+            // Belt and suspenders for the steady-dirty hole: the worker only
+            // emits on CHANGE, so "still dirty" prints nothing and the flag
+            // above never fires. This active re-check asks the rules directly
+            // at +5s/+30s regardless of worker liveness.
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                spot_check_rules("5s");
+                std::thread::sleep(std::time::Duration::from_secs(25));
+                spot_check_rules("30s");
+            });
+            logf("firewall repair: awaiting elevated script result (120s window)");
+        }
+        started
     }
     #[cfg(not(windows))]
     {
@@ -364,10 +426,113 @@ pub fn repair() -> bool {
     }
 }
 
+/// One-shot flag: set by repair(), consumed by the fw worker on its next
+/// verdict line. The worker normally logs transitions only, so "still dirty"
+/// after a repair would print nothing — indistinguishable from a dead worker
+/// or a killed process. With this, the log always answers "what did the
+/// worker see after the click".
+static LOG_NEXT_VERDICT: AtomicBool = AtomicBool::new(false);
+
+/// Active one-shot re-check of the rule invariant, asked directly instead of
+/// through the worker's change-only pipe (which stays silent on steady-dirty).
+/// Same judgment as the worker: ok / dirty:block|shape / none / ps-failed.
+#[cfg(windows)]
+fn spot_check_rules(tag: &str) {
+    let Some(exe) = exe_path() else {
+        return;
+    };
+    let exe = exe.replace('\'', "''");
+    let ps = format!(
+        r#"$exe = '{exe}'
+$rules = @(Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {{ $_.Direction -eq 'Inbound' }})
+if ($rules.Count -eq 0) {{ 'none' }}
+elseif ($rules.Count -eq 1 -and $rules[0].Enabled -eq 'True' -and $rules[0].Action -eq 'Allow' -and $rules[0].Profile -eq 'Any' -and $rules[0].DisplayName -eq 'tinbox_Allow_Inbound') {{ 'ok' }}
+else {{
+  $detail = 'shape'
+  $active = @((Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object {{ $_.NetworkCategory }}) | ForEach-Object {{ if ($_ -eq 'DomainAuthenticated') {{ 'Domain' }} else {{ $_ }} }} | Sort-Object -Unique)
+  foreach ($r in $rules) {{
+    if ($r.Enabled -eq 'True' -and $r.Action -eq 'Block') {{
+      $applies = $false
+      if ($r.Profile -eq 'Any') {{ $applies = $true }}
+      else {{ foreach ($p in (($r.Profile -split ',') | ForEach-Object {{ $_.Trim() }})) {{ if ($active -contains $p) {{ $applies = $true }} }} }}
+      if ($applies) {{ $detail = 'block'; break }}
+    }}
+  }}
+  'dirty:' + $detail
+}}
+# The "after" picture: every inbound rule that could matter — all Program==exe
+# rules under ANY display name (the dialog's Query strays don't carry our
+# name), plus tinbox_/FileDrop_-named strays on other programs (path drift
+# after moving the exe). Same DisplayName|Action|Enabled|Profile|Program
+# shape as the worker's dump so the two are comparable line to line.
+$seen = @($rules | ForEach-Object {{ $_.Name }})
+$extra = @(Get-NetFirewallRule -Direction Inbound -ErrorAction SilentlyContinue | Where-Object {{ ($seen -notcontains $_.Name) -and ($_.DisplayName -like 'tinbox_*' -or $_.DisplayName -like 'FileDrop_*') }})
+$all = @($rules) + @($extra)
+$info = @($all | ForEach-Object {{ $p = ($_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue).Program; '{{0}}|{{1}}|{{2}}|{{3}}|{{4}}' -f $_.DisplayName,$_.Action,$_.Enabled,$_.Profile,$p }}) -join ' ;; '
+'rules:' + $info"#
+    );
+    match run_ps(&ps) {
+        Some((true, out)) => {
+            let mut state = "?";
+            let mut table = "(empty)";
+            for ln in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                if let Some(t) = ln.strip_prefix("rules:") {
+                    if !t.trim().is_empty() {
+                        table = t.trim();
+                    }
+                } else if state == "?" {
+                    state = ln;
+                }
+            }
+            logf(&format!("firewall repair: rule state {tag} after click={state}"));
+            logf(&format!("firewall repair: rule table {tag} after click=[{table}]"));
+        }
+        _ => logf(&format!("firewall repair: rule state {tag} after click=ps-failed")),
+    }
+}
+/// Result file the elevated repair script writes next to the .ps1 (OK or
+/// FAIL:<reason>, UTF-8 — localized Windows errors are non-ASCII, hence the
+/// explicit encoding on the write side and the BOM trim on the read side).
+#[cfg(windows)]
+fn result_path() -> PathBuf {
+    data_dir().join("tinbox_fw_fix.result")
+}
+
+/// Watcher for the elevated script's result: ShellExecute runas is
+/// fire-and-forget, so without this the log can never separate "UAC
+/// dismissed" from "granted but the script failed" from "rules landed".
+/// A missing file after 120s means the elevated run never reported back
+/// (UAC still sitting, dismissed, or the launch died silently).
+#[cfg(windows)]
+fn watch_repair_result() {
+    let path = result_path();
+    for _ in 0..120 {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let s = String::from_utf8_lossy(&bytes)
+            .trim_start_matches('\u{FEFF}')
+            .trim()
+            .to_string();
+        if s.is_empty() {
+            continue;
+        }
+        if s == "OK" {
+            logf("firewall repair: elevated script reports OK — canonical rule written, awaiting worker 'ok' verdict");
+        } else {
+            logf(&format!("firewall repair: elevated script reports {s}"));
+        }
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    logf("firewall repair: no result file after 120s (UAC likely dismissed, or the elevated run never started)");
+}
+
 /// Frontend "Quit" click: no network access means the app is pointless, just
 /// exit.
 pub fn quit(app: &AppHandle) {
-    logf("user chose to quit (without repairing)");
+    logf("firewall: user chose to quit (without repairing)");
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.close();
     }
@@ -389,7 +554,7 @@ pub fn quit(app: &AppHandle) {
 /// must return instantly (the UAC dialog may sit unanswered for minutes, and
 /// blocking on it once froze the overlay's buttons for 11 minutes). A
 /// cancelled UAC simply changes nothing; the user retries. The verdict
-/// belongs to the fw worker: it re-judges the invariant within ~1s and
+/// belongs to the firewall worker: it re-judges the invariant within ~1s and
 /// closes the overlay via the SSE flag.
 ///
 /// Blocks the calling thread: but the frontend modal already covers the UI
@@ -405,15 +570,37 @@ fn repair_as_admin(exe: &str) -> bool {
     // strays). New-first ordering: at least one valid Allow exists at every
     // instant. The canonical check on the worker side requires exactly this
     // rule set, so a successful run always flips the worker to 'ok'.
+    // Filter-FIRST deletion (ApplicationFilter -Program, the worker's own
+    // query direction): the old code enumerated the WHOLE inbound table and
+    // ran a per-rule filter query — ~40s on a rule-heavy machine (Allow
+    // landed in seconds, the duplicate Blocks survived another half minute).
+    // Scoped to our exe it is a handful of rules and returns in ~1s. The
+    // Direction guard stays: only inbound rules are ours to touch, a user's
+    // hand-made outbound rules are never wiped.
+    // The outcome (OK / FAIL:<reason>) is written to a result file for the
+    // Rust watcher — the elevated console is born hidden and its stdout is
+    // unread, so without this a failed repair is silent. UTF-8 explicitly:
+    // localized Windows errors are non-ASCII and WinPS 5.1 defaults to ANSI.
     // Note: Get-NetFirewallRule's -DisplayName cannot be combined with
     // -Direction/-Action (different parameter sets).
+    let res = result_path()
+        .to_string_lossy()
+        .replace('\'', "''");
     let script = format!(
         r#"$exe = '{exe}'
+$res = '{res}'
 try {{
   $new = New-NetFirewallRule -DisplayName '{RULE_ALLOW}' -Direction Inbound -Action Allow -Program $exe -Profile Any -ErrorAction Stop
-  Get-NetFirewallRule -Direction Inbound -ErrorAction SilentlyContinue | ForEach-Object {{
+  Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {{ $_.Direction -eq 'Inbound' -and $_.Name -ne $new.Name }} | ForEach-Object {{
+    Remove-NetFirewallRule -Name $_.Name -ErrorAction SilentlyContinue
+  }}
+  # Cross-path hygiene: our Allow rule is per-exe-path, so moving the exe
+  # litters dead Allows (Desktop\, D:\, …) that confuse every future rule
+  # table. Remove the ones WE created that point elsewhere; anything else
+  # with our display name cannot exist (we own the name).
+  Get-NetFirewallRule -DisplayName '{RULE_ALLOW}' -ErrorAction SilentlyContinue | ForEach-Object {{
     $f = $_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
-    if ($f -and $f.Program -ieq $exe -and $_.Name -ne $new.Name) {{
+    if ($f -and $f.Program -ine $exe) {{
       Remove-NetFirewallRule -Name $_.Name -ErrorAction SilentlyContinue
     }}
   }}
@@ -422,13 +609,15 @@ try {{
   Get-NetFirewallRule -DisplayName 'FileDrop_Allow_Inbound' -ErrorAction SilentlyContinue | ForEach-Object {{
     Remove-NetFirewallRule -Name $_.Name -ErrorAction SilentlyContinue
   }}
+  $out = 'OK'
 }} catch {{
-  Write-Host ('FAIL:' + $_.Exception.Message)
+  $out = 'FAIL:' + $_.Exception.Message
 }}
+Set-Content -LiteralPath $res -Value $out -Encoding UTF8 -ErrorAction SilentlyContinue
 Remove-Item $MyInvocation.MyCommand.Path -ErrorAction SilentlyContinue"#
     );
     if std::fs::write(&ps1, &script).is_err() {
-        loge("repair: failed to write temp ps1");
+        loge("firewall repair: failed to write temp ps1");
         return false;
     }
 
@@ -460,7 +649,7 @@ Remove-Item $MyInvocation.MyCommand.Path -ErrorAction SilentlyContinue"#
         // not kill it, and it exits on its own once ShellExecute returns.
         Ok(_) => true,
         Err(e) => {
-            loge(&format!("repair: could not launch powershell: {e}"));
+            loge(&format!("firewall repair: could not launch powershell: {e}"));
             false
         }
     }

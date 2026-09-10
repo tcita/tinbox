@@ -541,12 +541,16 @@ async fn client_log(
 /// Frontend "Repair" click: launch elevated UAC to delete the Block and add an
 /// Allow rule.
 async fn repair(State(_app): State<tauri::AppHandle>) -> impl IntoResponse {
-    // repair() blocks synchronously waiting for UAC + Block removal (can take
-    // 10s+), so run it in spawn_blocking to keep the axum runtime responsive.
+    // repair() only SPAWNS the elevated launcher and returns — fire-and-
+    // forget by design (the UAC dialog may sit unanswered for minutes, and
+    // blocking on it once froze the overlay's buttons for 11 minutes). So
+    // "ok" below means the prompt is on screen, NOT that the rules landed:
+    // the elevated script reports back via a result file and the fw worker
+    // re-judges the invariant; the overlay closes through that flag path.
     let ok = tokio::task::spawn_blocking(crate::firewall::repair)
         .await
         .unwrap_or(false);
-    logf(if ok { "/repair: repair succeeded" } else { "/repair: not fixed (UAC cancelled or failed)" });
+    logf(if ok { "repair: launcher started (UAC prompt up); script result + worker verdict to follow" } else { "repair: launcher failed to start" });
     (StatusCode::OK, if ok { "ok" } else { "failed" }).into_response()
 }
 
