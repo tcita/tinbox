@@ -72,17 +72,18 @@ fn cookie_carries_token(headers: &HeaderMap, tok: &str) -> bool {
 }
 
 /// What an unpaired, non-loopback visitor sees: a card visually identical to
-/// the in-app "Pairing expired" overlay (same glyph, card geometry, type,
-/// theme-following palette and the SAME wording — one message for every
-/// unpaired arrival: expired session, first-time visitor, stale link; the
-/// instruction is the same "rescan", so the wording is one). All CSS and the
+/// the in-app pairing overlay (same glyph, card geometry, type,
+/// theme-following palette). One message for every unpaired arrival:
+/// expired session, first-time visitor, stale link, or a shared/forwarded
+/// link (which can never work — LAN-only, paired device only); the
+/// instruction is the same "rescan", so the wording is one. All CSS and the
 /// emoji are inline; the page makes ZERO further requests (every asset it
 /// could want is behind the very gate that served it). The PC's loopback
 /// window never reaches this branch, so the text below is visitor-only.
 const UNPAIRED_PAGE: &str = concat!(
     "<!doctype html><html><head><meta charset=\"utf-8\">",
     "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">",
-    "<title>tinbox — 配对已过期</title><style>",
+    "<title>tinbox — 请重新扫码连接</title><style>",
     "body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;",
     "box-sizing:border-box;background:#f2f2f7;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}",
     "@media (prefers-color-scheme: dark){body{background:#000000}}",
@@ -97,8 +98,8 @@ const UNPAIRED_PAGE: &str = concat!(
     "@media (prefers-color-scheme: dark){p{color:#8e8e93}}",
     "</style></head><body><div class=\"card\">",
     "<div class=\"glyph\">📦</div>",
-    "<h1>配对已过期</h1>",
-    "<p>请重新扫码连接。</p>",
+    "<h1>请重新扫码连接</h1>",
+    "<p>通过分享/转发打开的 tinbox 文件无法访问，仅限同一 Wi-Fi 下扫码配对的设备打开。<br>发给他人请先保存或复制后再分享；本机继续用请重扫电脑上的二维码。</p>",
     "</div></body></html>"
 );
 
