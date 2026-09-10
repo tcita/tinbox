@@ -53,13 +53,19 @@ fn exe_path() -> Option<String> {
         .and_then(|p| p.to_str().map(|s| s.to_string()))
 }
 
-/// Directory next to the exe, used to hold the temp .ps1 and result files.
+/// Scratch home for the repair helper files (the .ps1 + its result file).
+/// This is %TEMP%, deliberately NOT the exe directory: the exe may live
+/// somewhere read-only (Program Files), and an app dir that litters scripts
+/// next to the binary reads as malware to humans and AV alike. %TEMP% is the
+/// standard home for such helpers and is per-user, so no collisions. NOT
+/// embedded via -EncodedCommand on purpose: a base64 blob on a runas command
+/// line is more opaque — to AV heuristics and to anyone auditing — than a
+/// plain-text script, and opacity is the wrong trade for an app asking for
+/// firewall elevation. (The run_ps one-liners elsewhere stay inline: short
+/// enough to survive -Command quoting, unlike the repair script.)
 #[cfg(windows)]
 fn data_dir() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."))
+    std::env::temp_dir()
 }
 
 /// Windows process creation flag: CREATE_NO_WINDOW, so launching powershell
@@ -115,6 +121,29 @@ fn log_network_profile() {
     }
 }
 
+/// One-time backdrop for the speed question: this PC's Wi-Fi link (PHY) rate.
+/// Source is Get-NetAdapter's LinkSpeed (pure PowerShell, unelevated) —
+/// deliberately NOT `netsh wlan show interfaces`: since Win11 24H2 it needs
+/// location permission/elevation for unprivileged callers (WlanQueryInterface
+/// error 5), so netsh fails exactly where we run. Only Up WLAN*/Wi-Fi*
+/// adapters are listed (tunnels, vEthernet and wired are not this leg);
+/// silent on wired-only PCs. Labeled as what it is — ONE leg's negotiated
+/// rate, not end-to-end throughput (the phone's leg is invisible from here,
+/// real TCP runs ~50-65% of PHY on WiFi). Context for reading the
+/// per-transfer `ul`/`dl` MB/s verdicts, never a verdict itself.
+#[cfg(windows)]
+fn log_wifi_link_rate() {
+    let ps = "(Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Status -eq 'Up' -and ($_.Name -like 'WLAN*' -or $_.Name -like 'Wi-Fi*') } | ForEach-Object { $_.Name + '=' + $_.LinkSpeed }) -join ', '";
+    if let Some((true, out)) = run_ps(ps) {
+        let s = out.trim();
+        if !s.is_empty() {
+            logf(&format!(
+                "wifi: this PC's link {s} (PHY rate, this leg only — end-to-end is the ul/dl MB/s lines)"
+            ));
+        }
+    }
+}
+
 static PENDING_REPAIR: AtomicBool = AtomicBool::new(false);
 
 /// Entry point: run the firewall check in the background, without blocking
@@ -127,11 +156,22 @@ pub fn ensure_background(app: AppHandle) {
     #[cfg(windows)]
     {
         std::thread::spawn(move || {
+            // Sweep stale repair scratch files first (exe-independent): a
+            // UAC-denied click leaves the .ps1 behind — the elevated run
+            // never starts, so nothing self-deletes it — and a crash can
+            // leave the result too. Anything present at startup is residue
+            // by definition (a fresh repair() deletes before launching).
+            for f in ["tinbox_fw_fix.ps1", "tinbox_fw_fix.result"] {
+                if std::fs::remove_file(data_dir().join(f)).is_ok() {
+                    logf(&format!("firewall: removed stale repair scratch file {f}"));
+                }
+            }
             let Some(exe) = exe_path() else {
                 logf("firewall: could not get exe path, skipping");
                 return;
             };
             log_network_profile();
+            log_wifi_link_rate();
             // No startup rule pre-check: the worker's FIRST pass (~1s after
             // launch) IS the startup check. One judge, one verdict — a
             // separate pre-check would either duplicate the worker's logic
@@ -594,16 +634,14 @@ try {{
   Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {{ $_.Direction -eq 'Inbound' -and $_.Name -ne $new.Name }} | ForEach-Object {{
     Remove-NetFirewallRule -Name $_.Name -ErrorAction SilentlyContinue
   }}
-  # Cross-path hygiene: our Allow rule is per-exe-path, so moving the exe
-  # litters dead Allows (Desktop\, D:\, …) that confuse every future rule
-  # table. Remove the ones WE created that point elsewhere; anything else
-  # with our display name cannot exist (we own the name).
-  Get-NetFirewallRule -DisplayName '{RULE_ALLOW}' -ErrorAction SilentlyContinue | ForEach-Object {{
-    $f = $_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
-    if ($f -and $f.Program -ine $exe) {{
-      Remove-NetFirewallRule -Name $_.Name -ErrorAction SilentlyContinue
-    }}
-  }}
+  # Per-path isolation is INTENTIONAL, not a gap: Windows keys rules by exact
+  # program path, so two copies (release/ vs Desktop/) are disjoint rule sets
+  # and each worker judges only its own exe. In particular this script must
+  # NEVER touch another path's tinbox_Allow_Inbound: with two instances
+  # running, deleting A's Allow while A's worker has already retired on
+  # 'canonical' orphans A with no rule and no watcher — its phone dies
+  # silently with no overlay. Each copy minds its own rules; stale Allows
+  # after moving the exe are cosmetic litter (one manual sweep clears them).
   # One-time migration: clean up the old (filedrop-era) allow rule — its
   # program points at the old exe path, so the program scan above misses it.
   Get-NetFirewallRule -DisplayName 'FileDrop_Allow_Inbound' -ErrorAction SilentlyContinue | ForEach-Object {{

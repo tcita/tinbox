@@ -46,6 +46,10 @@ pub(crate) struct DlProg {
     /// Last time a progress event was pushed for this transfer, to throttle SSE
     /// emissions to ~1/s per transfer (the frontend used to poll /dl-status).
     last_emit_ms: u64,
+    /// Wall ms when this pull registered (0 = unset): feeds the abort-speed
+    /// line in StreamCutGuard::drop, so a cut transfer still reports the rate
+    /// it was achieving instead of just a byte count.
+    start_ms: u64,
 }
 
 /// Monotonic source of per-request download transfer ids ("msg#n").
@@ -234,6 +238,11 @@ pub(crate) async fn upload(
         };
         let mut file = file;
         let mut total: u64 = 0;
+        // Upload-direction twin of the download `Measured` wrapper below:
+        // when the body lands, log MB/s socket->disk for >= 4 MB pushes, so
+        // either direction can prove whether the code or the WiFi is the
+        // ceiling. (Create time excluded — pure body time.)
+        let t0 = tokio::time::Instant::now();
         let write_result: Result<(), String> = loop {
             // The PC (receiver) asked to stop this upload (/cancel): drop it as a
             // failure so the row + partial file are cleaned up below. Noticed per
@@ -300,6 +309,18 @@ pub(crate) async fn upload(
             Ok(()) => {
                 catalog::mark_remote_ready(&id, &final_path);
                 logf(&format!("upload done: {} ({} bytes) -> inbox", filename, total));
+                if total >= 4 * 1024 * 1024 {
+                    let secs = t0.elapsed().as_secs_f64();
+                    if secs > 0.0 {
+                        logf(&format!(
+                            "ul {}: {:.1} MB in {:.2}s = {:.1} MB/s",
+                            filename,
+                            total as f64 / (1024.0 * 1024.0),
+                            secs,
+                            total as f64 / secs / (1024.0 * 1024.0)
+                        ));
+                    }
+                }
                 // Final tick (sent == total) closes the ring on both ends.
                 {
                     let mut map = dl_lock();
@@ -517,13 +538,29 @@ impl Drop for StreamCutGuard {
         if incomplete {
             let sent = map.get(&self.tid).map(|e| e.sent).unwrap_or(0);
             let total = map.get(&self.tid).map(|e| e.total).unwrap_or(0);
+            let start_ms = map.get(&self.tid).map(|e| e.start_ms).unwrap_or(0);
             map.remove(&self.tid);
             push_dl_state(&map, &self.msg_id);
             drop(map);
-            logf(&format!(
-                "download closed by receiver {} ({}): {}/{} bytes",
-                self.tid, self.name, sent, total
-            ));
+            // Cuts of real size carry their achieved rate (same shape as the
+            // completion `dl` line): an abort with a speed needs no follow-up
+            // test to judge the pipeline.
+            let ms = now_ms().saturating_sub(start_ms);
+            if sent >= 4 * 1024 * 1024 && start_ms > 0 && ms > 0 {
+                logf(&format!(
+                    "download cut by receiver {} ({}): {}/{} bytes, {:.1} MB/s",
+                    self.tid,
+                    self.name,
+                    sent,
+                    total,
+                    sent as f64 / (ms as f64 / 1000.0) / (1024.0 * 1024.0)
+                ));
+            } else {
+                logf(&format!(
+                    "download closed by receiver {} ({}): {}/{} bytes",
+                    self.tid, self.name, sent, total
+                ));
+            }
         }
     }
 }
@@ -631,6 +668,7 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
             // always-from-zero. A full body starts at 0.
             e.sent = start;
             e.total = len;
+            e.start_ms = now_ms();
             touch_entry(e);
         }
         // The new pull makes the file "being served" (a fresh counter is
@@ -684,6 +722,9 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
                                 let e = map.entry(tid.clone()).or_default();
                                 e.total = len;
                                 e.sent = sent;
+                                // Fresh entry, fresh clock: the rate a resumed
+                                // pull reports is post-resume, not whole-life.
+                                e.start_ms = now_ms();
                                 touch_entry(e);
                                 map.get_mut(&tid).unwrap()
                             }

@@ -136,19 +136,20 @@ pub fn now_ts() -> String {
         .unwrap_or_default()
 }
 
-/// Directory of the exe: portable base (data always lands in the same place,
-/// no matter where the app is launched from).
+/// Directory of the exe: now ONLY the legacy-shared-dir lookup below. Live
+/// data (inbox, catalog.json) lives under the app data root, which survives
+/// exe moves and read-only install dirs.
 fn exe_parent() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
     exe.parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
 }
 
 pub fn inbox_dir() -> PathBuf {
-    exe_parent().join("inbox")
+    crate::logger::data_root().join("inbox")
 }
 
 pub fn catalog_path() -> PathBuf {
-    exe_parent().join("catalog.json")
+    crate::logger::data_root().join("catalog.json")
 }
 
 /// Legacy shared directory (only used for a one-time migration).

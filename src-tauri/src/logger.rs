@@ -1,16 +1,42 @@
-// Minimal file logger: writes to tinbox.log next to the exe.
+// Minimal file logger: writes to tinbox.log under the app data root.
 // Release builds use windows_subsystem=windows with no console, so logs are
 // written to disk to be inspectable.
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+
+/// App data home: %LOCALAPPDATA%\tinbox on Windows (log, inbox, catalog),
+/// exe directory everywhere else (today's portable behavior). Split because
+/// the exe may live somewhere read-only (Program Files) or move between
+/// runs — data must be writable and stable in both cases. No migration from
+/// the old exe-side layout: no users exist yet. Created once on first use,
+/// so every caller (logger, catalog) can assume the root exists; subdirs
+/// (inbox) are still created by their owners.
+pub(crate) fn data_root() -> PathBuf {
+    static ROOT: OnceLock<PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        #[cfg(windows)]
+        let base = std::env::var("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|_| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+                .unwrap_or_else(|| PathBuf::from("."))
+        });
+        #[cfg(not(windows))]
+        let base = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| PathBuf::from("."));
+        let dir = base.join("tinbox");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+    .clone()
+}
 
 fn log_path() -> PathBuf {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
-    exe.parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("tinbox.log")
+    data_root().join("tinbox.log")
 }
 
 static F: Mutex<()> = Mutex::new(());

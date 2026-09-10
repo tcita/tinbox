@@ -233,12 +233,13 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| "<unknown>".to_string());
             logf(&format!(
-                "tinbox v{} starting; exe={}; log file at tinbox.log next to the exe",
+                "tinbox v{} starting; exe={}; data at {}",
                 env!("CARGO_PKG_VERSION"),
-                exe
+                exe,
+                crate::logger::data_root().display()
             ));
 
-            // Inbox directory (next to the exe); ensure it exists on first run.
+            // Inbox directory (under the data root); ensure it exists on first run.
             if let Err(e) = std::fs::create_dir_all(catalog::inbox_dir()) {
                 loge(&format!("could not create inbox directory: {}", e));
             }
