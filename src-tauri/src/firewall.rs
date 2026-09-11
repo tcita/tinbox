@@ -393,6 +393,8 @@ fn mark_need_repair(app: &AppHandle) {
     // overlay immediately instead of waiting for the background monitor.
     let _ = crate::server::notifier().send(crate::server::PushEvent::Fw(true));
     if let Some(w) = app.get_webview_window("main") {
+        // The window may be tray-hidden: show it first or the overlay stays invisible.
+        let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
         let _ = w.set_always_on_top(true);
