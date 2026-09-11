@@ -677,10 +677,12 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
         logf(&format!("download start {id}: {name} [{start}-{end}]/{len}"));
     }
     // Take() caps the read at the range end so a partial response carries
-    // exactly end-start+1 bytes, not the rest of the file. A large read buffer
-    // matters for throughput: 16KB chunks (ReaderStream default) saturate the
-    // LAN poorly, 512KB keeps the TCP send buffer full and pushes real WiFi
-    // speeds instead of 2 MB/s.
+    // exactly end-start+1 bytes, not the rest of the file. 1 MiB read buffer:
+    // A/B-tested 2026-09-11 (16 KiB vs 1 MiB, same spot, same file class):
+    // 39.0 vs 42.6 MB/s — noise, chunk size is insensitive here. The old
+    // "16K -> 2MB/s" story was weak signal misattributed to code. Kept at
+    // 1 MiB anyway: fewer syscalls per GB for free, and 1 MiB in flight per
+    // stream is nothing.
     let base = ReaderStream::with_capacity(file.take(end - start + 1), 1024 * 1024);
     let stream: std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<axum::body::Bytes, std::io::Error>> + Send>,
@@ -732,6 +734,23 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
                         e.sent = sent;
                         touch_entry(e);
                         if e.sent >= e.total && e.total > 0 {
+                            // Completion throughput, measured here and not in
+                            // a stream wrapper: hyper drops the body once
+                            // Content-Length is satisfied WITHOUT a final
+                            // None poll, so an end-of-stream hook never fires
+                            // on a normal complete pull (verified: the old
+                            // Measured wrapper only ever fired on truncated
+                            // bodies). The ledger's start_ms is the clock.
+                            let ms = now_ms().saturating_sub(e.start_ms);
+                            if e.start_ms > 0 && ms > 0 {
+                                logf(&format!(
+                                    "dl {}: {:.1} MB in {:.1}s = {:.1} MB/s",
+                                    name,
+                                    e.total as f64 / (1024.0 * 1024.0),
+                                    ms as f64 / 1000.0,
+                                    e.total as f64 / (ms as f64 / 1000.0) / (1024.0 * 1024.0)
+                                ));
+                            }
                             logf(&format!("download done {tid}: {} bytes", e.sent));
                             // This pull no longer counts as active; if it was
                             // the LAST active pull of the file, end the
@@ -754,19 +773,9 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
         }
         None => Box::pin(base),
     };
-    // Downloads (not inline previews) get a throughput measurement: when the
-    // stream completes, log MB/s server->socket. If the server logs fast but
-    // the phone UI is slow, the bottleneck is the client/WiFi, not this side.
-    let body = if inline {
-        Body::from_stream(stream)
-    } else {
-        Body::from_stream(Measured {
-            inner: stream,
-            label: format!("{} [{start}-{end}]", name),
-            start: tokio::time::Instant::now(),
-            bytes: 0,
-        })
-    };
+    // Downloads ride the counted stream directly: completion (and abort)
+    // throughput is logged at the ledger sites above, not in a wrapper.
+    let body = Body::from_stream(stream);
     let ct = if inline {
         mime_for(name)
     } else {
@@ -853,52 +862,6 @@ pub(crate) async fn download(q: Query<IdParam>, headers: HeaderMap, uri: Uri) ->
 
 pub(crate) async fn view(q: Query<IdParam>, headers: HeaderMap, uri: Uri) -> impl IntoResponse {
     serve(q, true, headers, uri).await
-}
-
-/// Wraps a download stream and logs server-side throughput when it completes.
-struct Measured<S> {
-    inner: S,
-    label: String,
-    start: tokio::time::Instant,
-    bytes: u64,
-}
-
-impl<S, E> tokio_stream::Stream for Measured<S>
-where
-    S: tokio_stream::Stream<Item = Result<axum::body::Bytes, E>> + Unpin,
-{
-    type Item = Result<axum::body::Bytes, E>;
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        match std::pin::Pin::new(&mut self.inner).poll_next(cx) {
-            std::task::Poll::Ready(Some(Ok(b))) => {
-                self.bytes += b.len() as u64;
-                std::task::Poll::Ready(Some(Ok(b)))
-            }
-            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
-            std::task::Poll::Ready(None) => {
-                if self.bytes >= 4 * 1024 * 1024 {
-                    let secs = self.start.elapsed().as_secs_f64();
-                    let mbps = if secs > 0.0 {
-                        self.bytes as f64 / secs / (1024.0 * 1024.0)
-                    } else {
-                        0.0
-                    };
-                    logf(&format!(
-                        "dl {}: {:.1} MB in {:.2}s = {:.1} MB/s",
-                        self.label,
-                        self.bytes as f64 / (1024.0 * 1024.0),
-                        secs,
-                        mbps
-                    ));
-                }
-                std::task::Poll::Ready(None)
-            }
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
-    }
 }
 
 /// Live transfer progress snapshot: every download the server is currently
