@@ -4088,6 +4088,7 @@ dependencies = [
  "axum",
  "chrono",
  "clipboard-win",
+ "getrandom 0.3.4",
  "image",
  "local-ip-address",
  "open",

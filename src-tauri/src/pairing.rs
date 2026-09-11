@@ -19,27 +19,28 @@ use std::sync::OnceLock;
 // and knowing the bare IP:PORT on this LAN is not enough after a restart.
 static REQ_TOKEN: OnceLock<String> = OnceLock::new();
 
-/// The per-process pairing token, lazily generated on first use. Desktop-sized
-/// secrets are plenty against a LAN attacker who might see but mistype the
-/// QR once; 8 characters are also hand-typable for manual phone entry, which
-/// is why the alphabet avoids look-alike glyphs.
+/// The per-process pairing token, lazily generated on first use. 8 chars from
+/// a 31-symbol alphabet without look-alike glyphs (~39.6 bits): the length is
+/// for hand-typable manual phone entry when a scan fails, and the entropy is
+/// plenty against LAN online guessing — every miss logs a 403 line, and any
+/// restart rotates the token anyway. Bytes come straight from the OS CSPRNG
+/// (rejection-sampled to keep the 31-way mapping unbiased); no hand-rolled
+/// hashing anywhere in this pipeline.
 pub(crate) fn request_token() -> &'static String {
     REQ_TOKEN.get_or_init(|| {
-        // No crypto dependency here: RandomState's SipHash keys come from the
-        // OS CSPRNG, so folding a process id through two fresh hashers yields
-        // two independent words of OS-grade randomness per run.
-        use std::hash::{BuildHasher, Hasher};
         const RAND_CHARS: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
         let mut buf = String::with_capacity(8);
-        let pid = std::process::id() as u64;
-        for salt in [0u8, 1] {
-            let mut h = std::collections::hash_map::RandomState::new()
-                .build_hasher();
-            h.write_u64(pid ^ 0x5a1fe93b2346_0000 | (salt as u64) << 24);
-            let mut v = h.finish();
-            for _ in 0..4 {
-                buf.push(RAND_CHARS[(v % 31) as usize] as char);
-                v /= 31;
+        // 248 = 31 * 8: bytes above it are redrawn so no symbol is favored.
+        while buf.len() < 8 {
+            let mut chunk = [0u8; 16];
+            getrandom::fill(&mut chunk).expect("OS randomness unavailable");
+            for b in chunk {
+                if buf.len() >= 8 {
+                    break;
+                }
+                if b < 248 {
+                    buf.push(RAND_CHARS[(b % 31) as usize] as char);
+                }
             }
         }
         buf
