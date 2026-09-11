@@ -76,6 +76,11 @@
     -moz-osx-font-smoothing: grayscale;
     display: flex; flex-direction: column; height: 100vh; height: 100dvh;
     overflow: hidden; user-select: none;
+    /* App-shell hygiene, not gesture theft: kills double-tap-zoom only.
+       Scroll, pinch-zoom and the long-press callout all still belong to the
+       browser. Without this, double-tapping buttons/cards zooms the viewport
+       on some mobile browsers. */
+    touch-action: manipulation;
   }
 
   /* Header */
@@ -301,6 +306,13 @@
   .cardring .cr-glyph svg { width: 13px; height: 13px; display: block; }
   .cardring .cr-glyph.stop { font-size: 13px; font-weight: 600; line-height: 1; }
   .cardring.show { display: flex; }
+  /* Same 44px invisible hit zone as the corner button: the ring IS the stop
+     affordance and stops are urgent — a near-miss must widen into the ring,
+     never fall through to the card beneath (preview/navigation instead of
+     a stop). Painting nothing, like the button's halo. */
+  .cardring::before {
+    content: ''; position: absolute; inset: -7px; border-radius: 50%;
+  }
   /* A transferring upload card stops its idle pulse so the ring is the only
      motion signal (higher specificity than .file-card.pending). */
   .file-card.pending.transferring { animation: none; opacity: 1; }
@@ -348,6 +360,12 @@
   @media (pointer: coarse) {
     .file-card, .fc-name, .fc-size, .meta-line { -webkit-user-select: none; user-select: none; }
     .file-card.has-preview img, .file-card.has-preview video {
+      -webkit-user-select: auto; user-select: auto; -webkit-touch-callout: default;
+    }
+    /* Same bug, second surface: the fullscreen overlay's media is appended to
+       body, so it inherits the same suppression and Safari long-press there
+       is dead too. Fixed together or not at all. */
+    .media-ov img, .media-ov video {
       -webkit-user-select: auto; user-select: auto; -webkit-touch-callout: default;
     }
   }
@@ -449,7 +467,9 @@
        for any form field set below 16px (it ignores user-scalable=no since
        iOS 10), which shears the whole chat layout when the keyboard opens. */
     font-size: 16px; font-family: inherit; background: transparent; color: var(--text);
-    line-height: 1.4; user-select: text;
+    /* Prefix parity with every other text rule: the unprefixed property alone
+       does not reliably re-enable selection inside form fields on iOS. */
+    line-height: 1.4; user-select: text; -webkit-user-select: text;
   }
 
   .send-btn {
