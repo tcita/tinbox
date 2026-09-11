@@ -96,7 +96,9 @@ fn unpaired_page(glyph: &str, title: &str, heading: &str, body: &str) -> String 
         background:#ffffff;border-radius:28px;border:1px solid rgba(0,0,0,0.04);\
         box-shadow:0 16px 48px rgba(0,0,0,0.08)}}\
         @media (prefers-color-scheme: dark){{.card{{background:#1c1c1e;border-color:rgba(255,255,255,0.08)}}}}\
-        .glyph{{font-size:44px;line-height:1;margin-bottom:12px}}\
+        .glyph{{font-size:44px;line-height:1;margin-bottom:12px;color:#1a1a1e}}\
+        @media (prefers-color-scheme: dark){{.glyph{{color:#ffffff}}}}\
+        .glyph svg{{width:44px;height:auto;display:inline-block;vertical-align:top}}\
         h1{{font-size:20px;font-weight:700;letter-spacing:-0.4px;margin:0 0 6px;color:#1a1a1e}}\
         @media (prefers-color-scheme: dark){{h1{{color:#ffffff}}}}\
         p{{font-size:13px;line-height:1.65;margin:0;color:#86868b;text-align:left}}\
@@ -108,6 +110,17 @@ fn unpaired_page(glyph: &str, title: &str, heading: &str, body: &str) -> String 
         </div></body></html>"
     )
 }
+
+/// Inline "scan" glyph for the expired-session variant (SVG Repo
+/// "qr-code-scanner" illustration; same "SVG Vector" collection family whose
+/// siblings are CC0 — confirm the CC0 grant on this icon's own page before
+/// shipping a release with it).
+/// Optimized for inline use: prolog/dimensions stripped, fill=currentColor so
+/// it follows the page's light/dark palette. Inline, not /logo: this page
+/// makes ZERO further requests by design, so it cannot reference any served
+/// asset. Kept as a file (like logo.svg) instead of a string literal so the
+/// 1.5KB of path data stays out of the source.
+const SCAN_GLYPH: &str = include_str!("scan.svg");
 
 /// Response marker the pairing gate attaches to every refusal: log_requests
 /// reads it after the fact to decide which of the two presence stamps this
@@ -150,7 +163,9 @@ pub(crate) async fn require_token(
     // shared/forwarded URL — ⛓️‍💥 names the culprit (broken chain, Emoji
     // 15.1; pre-support systems fall back to ⛓️💥 side by side — both halves
     // are ancient codepoints, so no tofu, still reads as broken). Anything else is an expired
-    // session or stale link — 📷 names the fix (scan again).
+    // session or stale link — SCAN_GLYPH names the fix (scan again): an inline
+    // SVG illustration instead of the 📷 emoji, which never had a dedicated
+    // QR-scan codepoint and read as "camera" rather than "scan".
     let path = req.uri().path();
     let (glyph, title, heading, body) = if path.starts_with("/view") || path.starts_with("/dl") {
         (
@@ -161,7 +176,7 @@ pub(crate) async fn require_token(
         )
     } else {
         (
-            "📷",
+            SCAN_GLYPH,
             "tinbox — 请重新扫码连接",
             "请重新扫码连接",
             "tinbox 每次启动配对都会更新，请重扫电脑上的二维码重新连接。",
