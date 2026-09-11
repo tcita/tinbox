@@ -175,6 +175,18 @@ pub fn run() {
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building app")
+        .run(|_app_handle, event| {
+            // Destroying the last window fires ExitRequested{code: None} and
+            // would end the process (the tray icon does NOT keep it alive).
+            // Prevent exactly that: a closed window means "tray-hide", the LAN
+            // server keeps serving. Programmatic exits (tray Quit / restart,
+            // code Some) pass through untouched.
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                if code.is_none() {
+                    api.prevent_exit();
+                }
+            }
+        });
 }
