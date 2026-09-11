@@ -17,13 +17,72 @@ use tauri::{
     WindowEvent,
 };
 
-/// Bring the main window back on screen (from tray-hidden or minimized).
+/// Build the main window against the already-bound LAN server port, and arm
+/// the close interceptor (desktop only — see below).
+fn create_main_window<R: tauri::Runtime>(
+    manager: &impl Manager<R>,
+    port: u16,
+) -> tauri::Result<tauri::WebviewWindow<R>> {
+    let window = WebviewWindowBuilder::new(
+        manager,
+        "main",
+        WebviewUrl::External(format!("http://localhost:{port}").parse().unwrap()),
+    )
+    .title("tinbox")
+    .inner_size(520.0, 720.0)
+    .min_inner_size(360.0, 480.0)
+    .center()
+    // Keep Tauri's drag-drop handler ENABLED: it injects the real
+    // `path` onto dropped File objects (that is what lets the frontend
+    // send the path to /add-local, which copies it into Inbox locally
+    // instead of the phone uploading a copy). It also preventDefaults
+    // the drop, so no navigation to the file.
+    .build()?;
+
+    // Close (x) DESTROYS the window instead of quitting: the LAN server (and
+    // its pairing token) is process-lifetime, so a quit-on-close would force
+    // the phone to rescan on every window reopen — while a merely hidden
+    // webview keeps its renderer alive at ~hundreds of MB. Destroying frees
+    // the whole WebView2 tree; the page is a stateless view (state replays
+    // over /events on reload), so rebuilding later is cheap. Quitting stays
+    // explicit via the tray menu / repair overlay.
+    #[cfg(desktop)]
+    {
+        let doomed = window.clone();
+        window.on_window_event(move |event| {
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let _ = doomed.destroy();
+                crate::logger::logf(
+                    "window destroyed on close (webview memory freed; server keeps running)",
+                );
+            }
+        });
+    }
+
+    Ok(window)
+}
+
+/// Make sure the main window is on screen: focus it if present, rebuild it
+/// if a tray-hide destroyed it. Serialized so a double-click / second launch
+/// racing a rebuild cannot build the window twice.
 #[cfg(desktop)]
-fn show_main(app: &tauri::AppHandle) {
+pub(crate) fn ensure_main_window(app: &tauri::AppHandle) {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
+        return;
+    }
+    let port = crate::server::BOUND_PORT
+        .get()
+        .copied()
+        .unwrap_or(crate::server::PORT);
+    match create_main_window(app, port) {
+        Ok(_) => crate::logger::logf("tray: main window rebuilt"),
+        Err(e) => crate::logger::loge(&format!("tray: could not rebuild main window: {e}")),
     }
 }
 
@@ -41,7 +100,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
-            "show" => show_main(app),
+            "show" => ensure_main_window(app),
             "quit" => {
                 crate::logger::logf("tray: user chose to quit");
                 app.exit(0);
@@ -61,7 +120,7 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                 _ => false,
             };
             if restore {
-                show_main(tray.app_handle());
+                ensure_main_window(tray.app_handle());
             }
         })
         .build(app)?;
@@ -84,8 +143,8 @@ pub fn run() {
             crate::logger::logf(&format!(
                 "second launch from {cwd} — already running, focused existing window",
             ));
-            // The window may be tray-hidden, not just minimized.
-            show_main(app);
+            // The window may be tray-destroyed, not just minimized.
+            ensure_main_window(app);
         }));
     }
 
@@ -107,44 +166,11 @@ pub fn run() {
             // window creation (a cold powershell start can hang for seconds).
             firewall::ensure_background(app.handle().clone());
 
-            let window = WebviewWindowBuilder::new(
-                app,
-                "main",
-                WebviewUrl::External(format!("http://localhost:{port}").parse().unwrap()),
-            )
-            .title("tinbox")
-            .inner_size(520.0, 720.0)
-            .min_inner_size(360.0, 480.0)
-            .center()
-            // Keep Tauri's drag-drop handler ENABLED: it injects the real
-            // `path` onto dropped File objects (that is what lets the frontend
-            // send the path to /add-local, which copies it into Inbox locally
-            // instead of the phone uploading a copy). It also preventDefaults
-            // the drop, so no navigation to the file.
-            .build()?;
-            #[cfg(not(desktop))]
-            let _ = &window;
+            let _window = create_main_window(app, port)?;
 
-            // Close (x) hides to the tray instead of quitting: the LAN
-            // server (and its pairing token) is process-lifetime, so a
-            // quit-on-close would force the phone to rescan on every
-            // window reopen. A hidden window keeps serving; quitting is
-            // explicit via the tray menu / repair overlay.
             #[cfg(desktop)]
-            {
-                let hidden = window.clone();
-                window.on_window_event(move |event| {
-                    if let WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = hidden.hide();
-                        crate::logger::logf(
-                            "window hidden to tray (server keeps running; quit from the tray menu)",
-                        );
-                    }
-                });
-                if let Err(e) = build_tray(app.handle()) {
-                    crate::logger::loge(&format!("tray: could not build tray icon: {e}"));
-                }
+            if let Err(e) = build_tray(app.handle()) {
+                crate::logger::loge(&format!("tray: could not build tray icon: {e}"));
             }
 
             Ok(())

@@ -392,9 +392,10 @@ fn mark_need_repair(app: &AppHandle) {
     // Push the repair flag over the SSE channel so the frontend shows the
     // overlay immediately instead of waiting for the background monitor.
     let _ = crate::server::notifier().send(crate::server::PushEvent::Fw(true));
+    // The window may be tray-destroyed: rebuild it first or the overlay has
+    // nowhere to show (a blocked phone with no visible repair path).
+    crate::ensure_main_window(app);
     if let Some(w) = app.get_webview_window("main") {
-        // The window may be tray-hidden: show it first or the overlay stays invisible.
-        let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
         let _ = w.set_always_on_top(true);
