@@ -332,19 +332,24 @@
   .file-card.has-preview .fc-info { width: 100%; }
   .file-card.has-preview .fc-name { max-width: none; }
 
-  /* Only the card's TEXT is selection-suppressed on touch — the img/video
-     themselves stay at user-select:auto, exactly like any ordinary website's
-     <img>: Safari's long-press 拷贝 has a long-standing quirk of putting the
-     image AND its URL on the pasteboard (text-ish paste targets then take
-     the URL), and the media element's own selectability is the one page-side
-     lever we have for behaving like a vanilla site. The explicit -webkit-
-     prefix matters: body's unprefixed user-select:none does not cascade to
-     descendants on iOS (user-select is non-inherited), which is what used to
-     paint a stray selection rect over the image during a long-press. No
-     -webkit-touch-callout anywhere in the card — that would block the native
-     menu. */
+  /* Only the card's TEXT is selection-suppressed on touch. The media needs an
+     explicit restore below: -webkit-user-select:none on .file-card INHERITS
+     into img/video on iOS Safari (the prefixed property inherits in WebKit
+     practice — every mobile framework re-enables inputs for exactly this
+     reason), and Safari's NATIVE callout honors that suppression, so an
+     unstyled <img> in a suppressed card gets no long-press menu. Chrome-iOS
+     is unaffected (its self-built menu fires on touch duration alone — the
+     reason one browser mourned and the other worked on identical DOM).
+     Regression record: 88fa5ad added the card-level suppression and killed
+     Safari image long-press; the explicit auto below restores it. A faint
+     selection flash during the press is the price; the menu is worth it. No
+     -webkit-touch-callout:none anywhere — that would block the native menu
+     outright. */
   @media (pointer: coarse) {
     .file-card, .fc-name, .fc-size, .meta-line { -webkit-user-select: none; user-select: none; }
+    .file-card.has-preview img, .file-card.has-preview video {
+      -webkit-user-select: auto; user-select: auto; -webkit-touch-callout: default;
+    }
   }
 
   /* A file that is still uploading pulses gently (no numeric progress). */
