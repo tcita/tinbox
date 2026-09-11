@@ -147,12 +147,14 @@ pub(crate) async fn require_token(
     // status-icon slot, so it must read as status, not brand: 📦 (the tinbox
     // box) says "package" on a page that is about neither packages nor boxes.
     // A file link (/view, /dl) opened without a valid credential is a
-    // shared/forwarded URL — 🔗 names the culprit. Anything else is an expired
+    // shared/forwarded URL — ⛓️‍💥 names the culprit (broken chain, Emoji
+    // 15.1; pre-support systems fall back to ⛓️💥 side by side — both halves
+    // are ancient codepoints, so no tofu, still reads as broken). Anything else is an expired
     // session or stale link — 📷 names the fix (scan again).
     let path = req.uri().path();
     let (glyph, title, heading, body) = if path.starts_with("/view") || path.starts_with("/dl") {
         (
-            "🔗",
+            "⛓️‍💥",
             "tinbox — 无效的分享链接",
             "无效的分享链接",
             "tinbox 文件不能靠分享/转发网页链接发给别人，仅限同一 Wi-Fi 下扫码配对的设备打开。<br>发给他人请先保存或复制后再分享。",
