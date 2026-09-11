@@ -112,9 +112,8 @@ fn unpaired_page(glyph: &str, title: &str, heading: &str, body: &str) -> String 
 }
 
 /// Inline "scan" glyph for the expired-session variant (SVG Repo
-/// "qr-code-scanner" illustration; same "SVG Vector" collection family whose
-/// siblings are CC0 — confirm the CC0 grant on this icon's own page before
-/// shipping a release with it).
+/// "Qr Code Scanner Phone Qr Code Smartphone", Objects Infographic Icons
+/// collection, CC0 License, uploader SVG Repo).
 /// Optimized for inline use: prolog/dimensions stripped, fill=currentColor so
 /// it follows the page's light/dark palette. Inline, not /logo: this page
 /// makes ZERO further requests by design, so it cannot reference any served
