@@ -15,10 +15,17 @@ pub fn run() {
     let mut builder = tauri::Builder::default();
 
     // Single instance: if one is already running, a second launch only brings
-    // the old window to the front instead of starting a new server.
+    // the old window to the front instead of starting a new server. Keyed by
+    // bundle id, NOT exe path — launching a copy from another folder focuses
+    // the running one (no second server, no shared-catalog race, no second
+    // firewall verdict). Log the attempt with its cwd so a "wrong copy"
+    // focus is explainable from the log instead of mysterious.
     #[cfg(desktop)]
     {
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, cwd| {
+            crate::logger::logf(&format!(
+                "second launch from {cwd} — already running, focused existing window",
+            ));
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.set_focus();
                 let _ = w.unminimize();
