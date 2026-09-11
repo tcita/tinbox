@@ -1888,10 +1888,16 @@ window.addEventListener('drop', e => {
 // the moment. The SSE channel below still reconnects + replays state
 // invisibly; it just never paints.
 let everConnected = false;
+// The first `info` is a replayed snapshot, not a transition: it latches the
+// gate either way but never toasts. Only a later false->true flip (a device
+// arriving under a live page) is a "newly paired" worth announcing — without
+// this, every rebuilt window re-toasts for a phone that never left.
+let seenInfo = false;
 function applyInfo(d){
   if(!isPC || !d) return;
   const online = !!d.mobileConnected;
-  if(online && !everConnected) toast('已配对,可以传输了');
+  if(seenInfo && online && !everConnected) toast('已配对,可以传输了');
+  seenInfo = true;
   if(online) everConnected = true;
   // The gate is a pairing screen, not a splash: it never goes away by click.
   // The first LAN device arriving is the only thing that lifts it — which is
@@ -2102,12 +2108,15 @@ if(isPC){
   // a page almost no identity chrome of its own, so the header logo is the
   // only branding surface there.
   document.querySelector('.brand').style.display = 'none';
-  // The gate hides only once the first device connects (everConnected latches
-  // inside applyInfo); it never comes back after that. There is NO manual
-  // escape: the gate is the pairing screen, and pairing is the only way to the
-  // in-app timeline. The Inbox button is a real folder — the transfer landing
-  // zone on disk — and nothing else.
-  $('gate').classList.add('show');
+  // The gate is driven by the first `info` event (a replayed snapshot), never
+  // shown by default: a rebuilt window with a live phone must land straight
+  // on the timeline instead of flashing the QR gate. It hides once the first
+  // device connects (everConnected latches inside applyInfo) and never comes
+  // back after that. There is NO manual escape: the gate is the pairing
+  // screen, and pairing is the only way to the in-app timeline. The Inbox
+  // button is a real folder — the transfer landing zone on disk — and
+  // nothing else. The timeout is the fallback for a silent channel.
+  setTimeout(() => { if(!seenInfo) $('gate').classList.add('show'); }, 3000);
 }
 
 // Report client-side exceptions into the server log, so a failure on the phone
