@@ -605,15 +605,13 @@
   .fw-btn:disabled { opacity: 0.5; pointer-events: none; }
   .fw-hint { font-size: 11.5px; color: var(--sub); margin-top: 12px; line-height: 1.4; }
 
-  /* Pairing-expired overlay (phone): the PC process restarted, the pairing
-   cookie no longer matches — only a fresh scan restores access. The
-   home-screen web app gate shares the geometry: same card, same one-message-
-   one-action language. */
-#pairGate, #webAppGate {
+  /* Home-screen web app gate (phone): same card geometry as the retired
+   pairing overlay — one-message-one-action language. */
+#webAppGate {
   position: fixed; inset: 0; z-index: 90; background: var(--bg);
   display: none; align-items: center; justify-content: center; padding: 20px;
 }
-#pairGate.show, #webAppGate.show { display: flex; }
+#webAppGate.show { display: flex; }
 
 /* Context Menu */
   .ctx-menu {
@@ -709,20 +707,6 @@
       <button class="fw-btn quit" id="fwQuit">退出</button>
     </div>
     <div class="fw-hint" id="fwHint"></div>
-  </div>
-</div>
-
-<!-- Pairing-expired overlay: the PC closed and reopened tinbox; old pairing
-     dies with the process. A new scan (fresh tab) reconnects. -->
-<div id="pairGate">
-  <div class="g-card">
-    <div class="g-radar">
-      <!-- No /logo here: in the expired state every fetch 403s, so imagery
-           must be inline-only (a glyph, no network asset). -->
-      <span style="font-size:44px;line-height:1">📦</span>
-    </div>
-    <div class="g-title">配对已过期</div>
-    <div class="g-desc">请重新扫码连接。</div>
   </div>
 </div>
 
@@ -846,15 +830,18 @@ const isVidName = n => VID_EXTS.includes((n.split('.').pop()||'').toLowerCase())
 // the multipart boundary itself; anything else is JSON-encoded.
 function qs(query){ return '?' + new URLSearchParams(query); }
 // 403 from any server call = the pairing cookie failed the server's check:
-// the process restarted and its token rotated. Once seen, the pairing-expired
-// gate is latched — only a fresh scan fixes it; the SSE stream is stopped so
-// a dead connection can't keep the page pretending to be live.
+// the process restarted and its token rotated. Reload so the server renders
+// its unpaired page (the single expired-session surface, with per-path copy):
+// a live tab must not keep pretending to be live on a dead pairing. No
+// reload-loop risk: the unpaired page makes zero further requests. Bonus:
+// the cookie jar is shared across tabs, so if another tab already rescanned,
+// this reload lands straight back in the app instead of a dead card.
 let pairExpired = false;
 function pairExpiredNow(){
   if(pairExpired) return;
   pairExpired = true;
   try { es.close(); } catch {}
-  $('pairGate').classList.add('show');
+  location.reload();
 }
 async function api(path, { method = 'GET', query, body, signal } = {}){
   const init = { method, signal };
