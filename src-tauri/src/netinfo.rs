@@ -241,7 +241,7 @@ fn virtual_adapter(s: &str) -> bool {
 
 /// Probe several (source address, gateway) pairs concurrently; each answer
 /// is cached for 60s because collect_ips runs on every `info` event / connect
-/// replay and a probe costs up to 1s of ping timeout.
+/// replay and a probe costs up to ~2s of ping timeout (1s per attempt, two attempts).
 fn probe_gateways(
     probes: &[(Ipv4Addr, Ipv4Addr)],
 ) -> std::collections::HashMap<(Ipv4Addr, Ipv4Addr), bool> {

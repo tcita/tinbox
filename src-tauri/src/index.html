@@ -1571,7 +1571,7 @@ function syncProgress(list){
 // SSE events (pushed at each transition: pull registered, one pull done or
 // cut); a /dl-status snapshot rebuilds the whole set on (re)connect and on
 // every `resync` — which is also the convergence path for a hard-dead pull
-// (socket hung, no FIN): its entry lingers until the monitor's 30s silence
+// (socket hung, no FIN): its entry lingers until the monitor's 5s silence
 // prune, whose resync turns the pulse off then.
 const dlActive = {};   // msg id -> some download of it is being served
 function syncDlState(id, active){

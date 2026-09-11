@@ -30,7 +30,8 @@ pub(crate) static LAST_PAIRED_ACT: AtomicU64 = AtomicU64::new(0);
 /// DlProg::last_ts). With a 0-based clock, `now - 0` = uptime, which made a
 /// freshly started process read as "a device was seen PRESENCE_ACT_SECS ago":
 /// a phantom `device present` that latched the PC scan gate away before any
-/// phone ever connected, and 30s of fake inbound-proof for the firewall. Every
+/// phone ever connected (historically this also faked inbound-proof for the
+/// firewall veto; that veto is removed — the flag is worker-verdict only). Every
 /// liveness stamp in the pipeline is only ever compared against a later
 /// `now_mono()`, so wall-clock jumps (NTP correction, manual clock change)
 /// cannot freeze stall detection, pruning or presence either: a backward step
@@ -215,7 +216,7 @@ pub(crate) async fn monitor_loop() {
             let before = map.len();
             map.retain(|id, e| {
                 let stale = now.saturating_sub(e.last_ts);
-                let keep = if e.sent >= e.total { stale <= 15 } else { stale <= 30 };
+                let keep = if e.sent >= e.total { stale <= 15 } else { stale <= 5 };
                 if !keep && e.sent < e.total {
                     // Only the incomplete reap gets a line: the finished one is
                     // lifecycle noise. Say "stalled pull" so it reads next to
