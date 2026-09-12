@@ -179,7 +179,11 @@
     flex: 1; overflow-y: overlay; overflow-x: hidden;
     padding: 16px 16px 12px;
     display: flex; flex-direction: column; gap: 14px;
-    scroll-behavior: smooth;
+    /* No scroll-behavior:smooth: the opening jump to the latest message and
+       the settlePin() frames that follow it must be instant. With smooth, a
+       programmatic jump becomes an animation toward a scrollHeight captured
+       before images decoded, so the target goes stale and the view stops
+       short of the bottom. */
   }
   #chat::-webkit-scrollbar { width: 5px; }
   #chat::-webkit-scrollbar-thumb { background: transparent; border-radius: 10px; }
@@ -1271,21 +1275,51 @@ function buildMsg(it, animate){
 
 // Stick-to-bottom: a fresh window always opens pinned to the latest message
 // (firstPaint — there is no saved position; the webview is rebuilt on every
-// open) and stays pinned while the user sits at the bottom. The pin must be
-// instant, not smooth: #chat paints scroll-behavior:smooth, so a smooth jump
-// animates toward a target captured before lazy media resolved its height —
-// cards grow mid-animation, scrollHeight outruns the target, and the view
-// strands mid-list at the same files every launch. Media calls maybeRepin on
-// load to finish the trip; a manual scroll-up clears stickBottom so reading
+// open), which is exactly what a chat app does: the newest message is what
+// you came back to see. The hard part is late layout — at first paint every
+// media box is 0px tall, then images decode/lazy-load and video metadata
+// arrives, so the timeline keeps growing after the first scrollTop assign and
+// a one-shot jump strands the view mid-list. Two things fix that together:
+// #chat no longer sets scroll-behavior:smooth (see CSS), and settlePin()
+// re-pins on every frame while the content is still changing. Each media
+// element also re-pins on load, so a slow image that lands after settle still
+// finishes the trip. A manual scroll-up clears stickBottom, so reading
 // history is never yanked.
 let stickBottom = true;
 let firstPaint = true;
 function pinToBottom(){
   const c = $('chat');
-  try { c.scrollTo({ top: c.scrollHeight, behavior: 'instant' }); }
-  catch { c.scrollTop = c.scrollHeight; }
+  c.scrollTop = c.scrollHeight;
 }
 function maybeRepin(){ if(stickBottom) pinToBottom(); }
+// Re-pin across late layout: every rAF while scrollHeight keeps changing,
+// stopping once it has held still for ~half a second (or after a 2s cap). A
+// newer call cancels an older loop, so a burst of list events does not stack
+// loops. This is what makes startup land at the bottom even when the last
+// screenful is all images that finish decoding several frames later.
+let settleGen = 0;
+function settlePin(){
+  if(!stickBottom) return;
+  const gen = ++settleGen;
+  const c = $('chat');
+  const start = Date.now();
+  let last = -1, still = 0;
+  const tick = () => {
+    if(gen !== settleGen || !stickBottom) return;
+    const h = c.scrollHeight;
+    if(h !== last){ last = h; still = 0; pinToBottom(); }
+    else if(++still >= 30) return;          // height held still: done
+    if(Date.now() - start > 2000) return;   // hard cap
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+}
+// The phone's toolbar collapse changes the viewport height after load; a pin
+// taken against the pre-collapse viewport sits slightly high. Re-pin on any
+// viewport resize while parked at the bottom.
+function repinOnResize(){ if(stickBottom) pinToBottom(); }
+window.addEventListener('resize', repinOnResize);
+if(window.visualViewport) window.visualViewport.addEventListener('resize', repinOnResize);
 // Unseen-below counter backing the jump-to-latest button: render() bumps it by
 // the number of genuinely new cards (appends only — in-place rebuilds and
 // deletes don't count), a manual scroll back to the bottom clears it.
@@ -1301,7 +1335,7 @@ function hideToBottom(){
   $('toBottomCount').classList.remove('show');
   $('toBottom').classList.remove('show');
 }
-$('toBottom').onclick = () => { pinToBottom(); hideToBottom(); };
+$('toBottom').onclick = () => { pinToBottom(); settlePin(); hideToBottom(); };
 $('chat').addEventListener('scroll', () => {
   const c = $('chat');
   stickBottom = c.scrollTop + c.clientHeight >= c.scrollHeight - 32;
@@ -1349,7 +1383,7 @@ function render(items){
   }
   for(const el of kept.values()) el.remove();
 
-  if(firstPaint || wasAtBottom) pinToBottom();
+  if(firstPaint || wasAtBottom){ pinToBottom(); settlePin(); }
   else if(added > 0){ unseenCount += added; showToBottom(); }
   firstPaint = false;
 }
