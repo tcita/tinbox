@@ -16,7 +16,7 @@ use crate::presence::{
     lan_peer_connected, monitor_loop, now_mono, LAST_PAIRED_ACT, LAN_EVENTS_OPEN,
     SSE_HEARTBEAT_SECS,
 };
-use crate::transfer::{cancel, dl_status, download, remove, upload, view};
+use crate::transfer::{cancel, dl_status, download, remove, remove_all, upload, view};
 use axum::{
     extract::{connect_info::ConnectInfo, DefaultBodyLimit, Request, State},
     http::{header, StatusCode},
@@ -287,6 +287,7 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 .route("/view", get(view))
                 .route("/open", post(open_file))
                 .route("/rm", post(remove))
+                .route("/rm-all", post(remove_all))
                 .route("/qr", get(qr))
                 .route("/logo", get(logo))
                 .route("/favicon.ico", get(logo))

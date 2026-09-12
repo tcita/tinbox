@@ -1031,3 +1031,48 @@ pub(crate) async fn remove(
     let _ = notifier().send(PushEvent::List(catalog::all_items()));
     (StatusCode::OK, "deleted").into_response()
 }
+
+/// Delete EVERYTHING in one sweep: every record plus every tinbox-owned inbox
+/// copy. PC-only like /rm (same rationale, amplified — a phone visitor must
+/// not be able to vaporize the owner's history). Per-entry semantics mirror
+/// remove(): Remote inbox copies are deleted from disk, legacy Local
+/// originals are kept, pending writers are flagged so their partials tear
+/// down. One persist (take_all) and one List push for the whole sweep, not N.
+pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> impl IntoResponse {
+    if from_by_peer(peer) != "pc" {
+        logw("remove-all: rejected delete request from phone");
+        return (StatusCode::FORBIDDEN, "phone cannot delete").into_response();
+    }
+    let all = catalog::take_all();
+    if all.is_empty() {
+        return (StatusCode::OK, "nothing to delete").into_response();
+    }
+    let mut files = 0usize;
+    let mut texts = 0usize;
+    for e in &all {
+        // Same teardown as remove(): stop the writer, drop the mirror.
+        if e.pending {
+            cancel_lock().insert(e.id.clone());
+        }
+        dl_lock().remove(&e.id);
+        match &e.body {
+            catalog::MsgBody::File { source, .. } => {
+                files += 1;
+                if let catalog::Source::Remote { path } = source {
+                    if std::fs::remove_file(path).is_err() {
+                        logw(&format!("remove-all: could not delete inbox file {}", path));
+                    }
+                }
+            }
+            catalog::MsgBody::Text { .. } => texts += 1,
+        }
+    }
+    let _ = notifier().send(PushEvent::List(catalog::all_items()));
+    logf(&format!(
+        "remove-all: cleared {} entries ({} files, {} texts)",
+        all.len(),
+        files,
+        texts
+    ));
+    (StatusCode::OK, format!("deleted: {}", all.len())).into_response()
+}

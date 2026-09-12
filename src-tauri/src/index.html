@@ -103,15 +103,15 @@
   .brand-icon img { width: 20px; height: 20px; display: block; }
   .head-actions { display: flex; align-items: center; gap: 10px; }
 
-  #inboxBtn {
+  #inboxBtn, #clearBtn {
     border: 1px solid var(--line); background: var(--card); color: var(--text);
     width: 32px; height: 32px; border-radius: 10px;
     display: flex; align-items: center; justify-content: center;
     cursor: pointer; transition: all 0.2s var(--ease-out);
     box-shadow: 0 1px 3px rgba(0,0,0,0.04);
   }
-  #inboxBtn:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
-  #inboxBtn:active { transform: scale(0.95); }
+  #inboxBtn:hover, #clearBtn:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
+  #inboxBtn:active, #clearBtn:active { transform: scale(0.95); }
 
   #qrBox {
     display: flex; align-items: center;
@@ -627,6 +627,8 @@
   .fw-btn:active { transform: scale(0.97); }
   .fw-btn.repair { background: var(--accent); color: #fff; }
   .fw-btn.repair:hover { background: var(--accent-hover); }
+  .fw-btn.danger { background: var(--danger); color: #fff; }
+  .fw-btn.danger:hover { filter: brightness(0.92); }
   .fw-btn.quit { background: var(--card-subtle); color: var(--text); border: 1px solid var(--line); }
   .fw-btn.quit:hover { background: var(--line); }
   .fw-btn:disabled { opacity: 0.5; pointer-events: none; }
@@ -674,6 +676,9 @@
     <span>tinbox</span>
   </div>
   <div class="head-actions">
+    <button id="clearBtn" title="清空全部消息">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+    </button>
     <button id="inboxBtn" title="打开收件箱">
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
     </button>
@@ -734,6 +739,23 @@
       <button class="fw-btn quit" id="fwQuit">退出</button>
     </div>
     <div class="fw-hint" id="fwHint"></div>
+  </div>
+</div>
+
+<!-- Clear-all confirm (PC): window.confirm is broken inside the Tauri WebView
+     (see delItem), so destructive confirmation gets its own card. No backdrop
+     dismiss — clearing is deliberate, both exits are explicit buttons. -->
+<div class="fw-overlay" id="clearOverlay">
+  <div class="fw-card danger">
+    <div class="fw-icon">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+    </div>
+    <div class="fw-title">清空全部消息？</div>
+    <div class="fw-desc">将删除全部文字与文件记录，收件箱内的文件副本一并删除，此操作不可撤销。</div>
+    <div class="fw-btns">
+      <button class="fw-btn quit" id="clearCancel">取消</button>
+      <button class="fw-btn danger" id="clearConfirm">清空</button>
+    </div>
   </div>
 </div>
 
@@ -1814,6 +1836,21 @@ $('inboxBtn').onclick = () => {
   api('/open-dir', {method:'POST'}).catch(()=>toast('无法打开收件箱'));
 };
 
+// Clear-all lives in the header, so it is PC-only the same way the inbox and
+// QR tiles are (the whole bar hides on coarse pointers); the backend enforces
+// PC-only again like /rm. Double-submit is harmless by construction: the
+// second POST finds an empty index and answers "nothing to delete".
+$('clearBtn').onclick = () => { $('clearOverlay').classList.add('show'); };
+$('clearCancel').onclick = () => { $('clearOverlay').classList.remove('show'); };
+$('clearConfirm').onclick = async () => {
+  $('clearOverlay').classList.remove('show');
+  try {
+    const r = await api('/rm-all', {method:'POST'});
+    toast(r.ok ? '已清空' : '清空失败');
+  } catch { toast('清空失败'); }
+  refresh();
+};
+
 // iOS quirk (observed on both Safari and Chrome via log traces): the OS picker
 // service intermittently drops the presentation — showPicker()/click() are
 // accepted without error, but no sheet appears and no change/cancel event ever
@@ -2175,7 +2212,7 @@ function closeQrLightbox(){ $('qrLightbox').classList.remove('show'); }
 $('qrBox').onclick = openQrLightbox;
 $('qlClose').onclick = closeQrLightbox;
 document.addEventListener('keydown', e => {
-  if(e.key === 'Escape') closeQrLightbox();
+  if(e.key === 'Escape'){ closeQrLightbox(); $('clearOverlay').classList.remove('show'); }
 });
 
 if(isPC){

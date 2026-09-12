@@ -542,6 +542,16 @@ pub fn remove(id: &str) -> Option<Entry> {
     }
 }
 
+/// Drain the whole index, persisting once. The caller owns the per-entry
+/// aftermath (file deletes, mirror drops) with remove() semantics per entry.
+pub fn take_all() -> Vec<Entry> {
+    let mut v = cat_lock();
+    let all: Vec<Entry> = v.drain(..).collect();
+    drop(v);
+    save();
+    all
+}
+
 /// Message list sorted by ts ascending (timeline order).
 pub fn all_items() -> Vec<MsgItem> {
     let mut v = cat_lock();
