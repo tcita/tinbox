@@ -347,6 +347,25 @@
   .msg.me .file-card.has-preview video { background: rgba(255, 255, 255, 0.15); }
   .file-card.has-preview .fc-info { width: 100%; }
   .file-card.has-preview .fc-name { max-width: none; }
+  /* Timeline video tile: blank by design (no src, no preload — see the isVid
+     branch). A fixed 16:9 box keeps the height deterministic from first
+     paint; the play glyph marks it tappable. Clicks fall through to the card,
+     which opens the fullscreen preview that actually pulls bytes. */
+  .vc-wrap { position: relative; width: 100%; }
+  .file-card.has-preview .vc-wrap video {
+    aspect-ratio: 16 / 9; height: auto; background: rgba(0,0,0,0.45);
+  }
+  .vc-play {
+    position: absolute; inset: 0; display: flex;
+    align-items: center; justify-content: center; pointer-events: none;
+  }
+  .vc-play span {
+    width: 44px; height: 44px; border-radius: 50%;
+    background: rgba(0,0,0,0.55); color: #fff;
+    display: flex; align-items: center; justify-content: center;
+    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
+  }
+  .vc-play svg { width: 18px; height: 18px; margin-left: 2px; display: block; }
 
   /* Only the card's TEXT is selection-suppressed on touch. The media needs an
      explicit restore below: -webkit-user-select:none on .file-card INHERITS
@@ -1146,19 +1165,21 @@ function buildMsg(it, animate){
       const isVid = !it.pending && isVidName(it.name);
 
       // Preview bytes follow the long-press contract: the native media menu
-      // (Safari loupe + 存储图像) saves img.src, so cards pull the ORIGINAL
-      // (/view) on both ends — the phone so "Save Image" stores real bytes,
-      // the PC because it holds the file on disk and the pull is loopback.
+      // (Safari loupe + 存储图像) saves img.src, so IMAGE cards pull the
+      // ORIGINAL (/view) on both ends — the phone so "Save Image" stores real
+      // bytes, the PC because it holds the file on disk and the pull is
+      // loopback. VIDEO cards are exempt (see the isVid branch): pulling
+      // video bytes for a thumbnail can cost hundreds of MB on an unlucky
+      // file, so the timeline tile stays a blank play button until opened.
       // With the diff-render below a kept card never refetches; only a
       // genuine rebuild does. Undecodable formats (HEIC on old iOS) fail as
       // before: onerror drops the preview, the card falls back to its icon.
       if(isImg){
         card.classList.add('has-preview');
         const img = document.createElement('img');
-        // onload first: a cached image can resolve before the lines below run.
-        // maybeRepin re-pins while the user sits at the bottom, so the card's
-        // late height (lazy load + network) doesn't strand the view mid-list.
-        img.onload = maybeRepin;
+        // No onload hook: the innerRO gravity already re-pins on every image
+        // growth, and one pinning path beats two. onerror stays — a broken
+        // image still falls back to its icon card.
         img.onerror = () => mediaFailed(card, it);
         img.src = '/view?id=' + encodeURIComponent(it.id) + '&ctx=card';
         img.alt = it.name;
@@ -1174,14 +1195,22 @@ function buildMsg(it, animate){
         card.appendChild(img);
       } else if(isVid){
         card.classList.add('has-preview');
+        // preload="none" and NO src: a timeline tile must never pull video
+        // bytes (measured: ~1GB card traffic for one 500MB moov-at-end file
+        // per open, zero taps). Bytes flow only on the explicit fullscreen
+        // open, which autoplays. The tile is a fixed-ratio blank box (see
+        // .vc-wrap CSS), so card heights are deterministic from the first
+        // paint and there is no metadata wait at all.
+        const wrap = document.createElement('div');
+        wrap.className = 'vc-wrap';
         const v = document.createElement('video');
-        v.src = '/view?id='+encodeURIComponent(it.id);
-        v.muted = true; v.playsInline = true; v.preload = 'metadata';
-        // Dimensions are known at metadata: same late-height re-pin as images.
-        v.onloadedmetadata = () => { try { v.currentTime = 0.01; } catch {} maybeRepin(); };
-        v.onerror = () => mediaFailed(card, it);
-        v.onclick = (e) => { e.stopPropagation(); openPreview(it); };
-        card.appendChild(v);
+        v.preload = 'none';
+        wrap.appendChild(v);
+        const play = document.createElement('div');
+        play.className = 'vc-play';
+        play.innerHTML = '<span><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></span>';
+        wrap.appendChild(play);
+        card.appendChild(wrap);
       } else {
         card.innerHTML = `<div class="fc-ico">${iconFor(it.name)}</div>`;
       }
