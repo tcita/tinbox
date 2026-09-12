@@ -2011,7 +2011,16 @@ async function addLocalPaths(paths){
       return;
     }
   }
-  if(!r.ok) toast('添加失败');
+  if(!r.ok){ toast('添加失败'); return; }
+  // Success reports its count: the server answers "added: N" (partial success
+  // is normal — a locked/OneDrive-placeholder/missing source is skipped while
+  // its siblings land, so N can be smaller than what was picked).
+  let n = fresh.length;
+  try {
+    const m = /added:\s*(\d+)/.exec(await r.text());
+    if(m) n = parseInt(m[1], 10);
+  } catch {}
+  toast(n >= fresh.length ? `导入成功 ${n} 个文件` : `导入成功 ${n}/${fresh.length} 个文件`);
 }
 // Tauri fires tauri://drag-drop with the real paths in parallel with the HTML5
 // drop. Listening to it covers platforms where the File.path injection is
