@@ -110,7 +110,10 @@
     cursor: pointer; transition: all 0.2s var(--ease-out);
     box-shadow: 0 1px 3px rgba(0,0,0,0.04);
   }
-  #inboxBtn:hover, #clearBtn:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
+  #inboxBtn:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
+  /* Destructive trails neutral: the trash hovers danger-red, never the
+     inviting accent blue — a tap here must feel warned, not welcomed. */
+  #clearBtn:hover { border-color: var(--danger); color: var(--danger); transform: translateY(-1px); }
   #inboxBtn:active, #clearBtn:active { transform: scale(0.95); }
 
   #qrBox {
@@ -330,6 +333,12 @@
     background: rgba(255, 255, 255, 0.2); color: #fff;
   }
   .fc-info { min-width: 0; flex: 1; }
+  /* Icon rows (documents, video) carry an OVERLAID corner button
+     (dlcardbtn / cardring, absolute top-right of the card), so the name line
+     must end before it: without this clearance long names slide under the
+     disc and its invisible 7px halo — visible but untappable text. Image
+     tiles are exempt (their button sits over the photo, the info below it). */
+  .file-card:not(.has-preview) .fc-info { padding-right: 40px; }
   .fc-name {
     font-size: 13.5px; font-weight: 600; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; max-width: 170px;
@@ -339,34 +348,13 @@
   .file-card.has-preview {
     flex-direction: column; align-items: flex-start; gap: 10px; min-width: 220px;
   }
-  .file-card.has-preview img,
-  .file-card.has-preview video {
+  .file-card.has-preview img {
     display: block; width: 100%; max-height: 240px; object-fit: cover;
     border-radius: 12px; background: rgba(0,0,0,0.06);
   }
-  .msg.me .file-card.has-preview img,
-  .msg.me .file-card.has-preview video { background: rgba(255, 255, 255, 0.15); }
+  .msg.me .file-card.has-preview img { background: rgba(255, 255, 255, 0.15); }
   .file-card.has-preview .fc-info { width: 100%; }
   .file-card.has-preview .fc-name { max-width: none; }
-  /* Timeline video tile: blank by design (no src, no preload — see the isVid
-     branch). A fixed 16:9 box keeps the height deterministic from first
-     paint; the play glyph marks it tappable. Clicks fall through to the card,
-     which opens the fullscreen preview that actually pulls bytes. */
-  .vc-wrap { position: relative; width: 100%; }
-  .file-card.has-preview .vc-wrap video {
-    aspect-ratio: 16 / 9; height: auto; background: rgba(0,0,0,0.45);
-  }
-  .vc-play {
-    position: absolute; inset: 0; display: flex;
-    align-items: center; justify-content: center; pointer-events: none;
-  }
-  .vc-play span {
-    width: 44px; height: 44px; border-radius: 50%;
-    background: rgba(0,0,0,0.55); color: #fff;
-    display: flex; align-items: center; justify-content: center;
-    backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
-  }
-  .vc-play svg { width: 18px; height: 18px; margin-left: 2px; display: block; }
 
   /* Only the card's TEXT is selection-suppressed on touch. The media needs an
      explicit restore below: -webkit-user-select:none on .file-card INHERITS
@@ -383,7 +371,7 @@
      outright. */
   @media (pointer: coarse) {
     .file-card, .fc-name, .fc-size, .meta-line { -webkit-user-select: none; user-select: none; }
-    .file-card.has-preview img, .file-card.has-preview video {
+    .file-card.has-preview img {
       -webkit-user-select: auto; user-select: auto; -webkit-touch-callout: default;
     }
     /* Same bug, second surface: the fullscreen overlay's media is appended to
@@ -651,7 +639,7 @@
   }
   .fw-card.danger .fw-icon { background: var(--danger-bg); color: var(--danger); }
   .fw-title { font-size: 17px; font-weight: 700; margin: 0 0 8px; letter-spacing: -0.3px; }
-  .fw-desc { font-size: 13px; color: var(--sub); line-height: 1.5; margin: 0 0 22px; }
+  .fw-desc { font-size: 13px; color: var(--sub); line-height: 1.5; margin: 0 0 22px; text-align: left; }
   .fw-btns { display: flex; gap: 10px; }
   .fw-btn {
     flex: 1; border: 0; border-radius: 12px; padding: 11px 0; font-size: 14px;
@@ -709,15 +697,15 @@
     <span>tinbox</span>
   </div>
   <div class="head-actions">
-    <button id="clearBtn" title="清空全部消息">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-    </button>
     <button id="inboxBtn" title="打开收件箱">
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
     </button>
     <div id="qrBox" title="点击放大，扫码连接设备">
       <img id="qr" src="/qr" alt="QR">
     </div>
+    <button id="clearBtn" title="清空全部消息">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+    </button>
   </div>
 </div>
 
@@ -862,6 +850,22 @@ function fmtSize(n){
   const u=['KB','MB','GB']; let i=-1;
   do { n/=1024; i++; } while(n>=1024 && i<u.length-1);
   return n.toFixed(1)+' '+u[i];
+}
+// Video row suffix from the server-probed moov metadata ({dur_ms, w, h}):
+// `500.0 MB · 2:47 · 1920×1080`. Any absent half is hidden, not zeroed —
+// a row with no metadata at all (legacy, unparseable) shows size alone.
+function fmtDur(ms){
+  const s = Math.round(ms/1000);
+  const h = Math.floor(s/3600), m = Math.floor(s%3600/60), sec = s%60;
+  const p = n => String(n).padStart(2,'0');
+  return h > 0 ? h+':'+p(m)+':'+p(sec) : m+':'+p(sec);
+}
+function mediaSuffix(it){
+  if(!it.media) return '';
+  const p = [];
+  if(it.media.dur_ms > 0) p.push(fmtDur(it.media.dur_ms));
+  if(it.media.w > 0 && it.media.h > 0) p.push(it.media.w+'×'+it.media.h);
+  return p.length ? ' · '+p.join(' · ') : '';
 }
 function fmtTime(unix){
   if(!unix) return '';
@@ -1141,7 +1145,8 @@ function pruneTransfers(items){
 function itemSig(it){
   return it.kind === 'text'
     ? ['text', it.from, it.ts, it.text].join('|')
-    : ['file', it.from, it.ts, it.name, it.size, it.pending ? 1 : 0].join('|');
+    : ['file', it.from, it.ts, it.name, it.size, it.pending ? 1 : 0,
+       it.media ? [it.media.dur_ms, it.media.w, it.media.h].join(',') : ''].join('|');
 }
 
 function buildEmpty(){
@@ -1193,9 +1198,10 @@ function buildMsg(it, animate){
       // (Safari loupe + 存储图像) saves img.src, so IMAGE cards pull the
       // ORIGINAL (/view) on both ends — the phone so "Save Image" stores real
       // bytes, the PC because it holds the file on disk and the pull is
-      // loopback. VIDEO cards are exempt (see the isVid branch): pulling
-      // video bytes for a thumbnail can cost hundreds of MB on an unlucky
-      // file, so the timeline tile stays a blank play button until opened.
+      // loopback. VIDEO cards are compact rows (see the isVid branch):
+      // pulling video bytes for a thumbnail can cost hundreds of MB on an
+      // unlucky file, so the row promises no pixels — icon + duration
+      // instead.
       // With the diff-render below a kept card never refetches; only a
       // genuine rebuild does. Undecodable formats (HEIC on old iOS) fail as
       // before: onerror drops the preview, the card falls back to its icon.
@@ -1219,23 +1225,18 @@ function buildMsg(it, animate){
         img.onclick = (e) => { e.stopPropagation(); openPreview(it); };
         card.appendChild(img);
       } else if(isVid){
-        card.classList.add('has-preview');
-        // preload="none" and NO src: a timeline tile must never pull video
-        // bytes (measured: ~1GB card traffic for one 500MB moov-at-end file
-        // per open, zero taps). Bytes flow only on the explicit fullscreen
-        // open, which autoplays. The tile is a fixed-ratio blank box (see
-        // .vc-wrap CSS), so card heights are deterministic from the first
-        // paint and there is no metadata wait at all.
-        const wrap = document.createElement('div');
-        wrap.className = 'vc-wrap';
-        const v = document.createElement('video');
-        v.preload = 'none';
-        wrap.appendChild(v);
-        const play = document.createElement('div');
-        play.className = 'vc-play';
-        play.innerHTML = '<span><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></span>';
-        wrap.appendChild(play);
-        card.appendChild(wrap);
+        // Compact icon row, same shape as non-media (the else branch below):
+        // a timeline tile must never pull video bytes (measured: ~1GB card
+        // traffic for one 500MB file per open, zero taps), so the row
+        // promises no pixels: icon + name + size + duration. The whole row
+        // taps into the fullscreen preview (card.onclick below), the single
+        // place video bytes flow, on explicit user intent — no badge needed:
+        // the 🎬 already says video, and image/doc rows carry no badge
+        // either.
+        const ico = document.createElement('div');
+        ico.className = 'fc-ico';
+        ico.textContent = '🎬';
+        card.appendChild(ico);
       } else {
         card.innerHTML = `<div class="fc-ico">${iconFor(it.name)}</div>`;
       }
@@ -1244,7 +1245,7 @@ function buildMsg(it, animate){
       info.className = 'fc-info';
       info.innerHTML = '<div class="fc-name"></div><div class="fc-size"></div>';
       info.querySelector('.fc-name').textContent = it.name;
-      info.querySelector('.fc-size').textContent = fmtSize(it.size);
+      info.querySelector('.fc-size').textContent = fmtSize(it.size) + mediaSuffix(it);
       if(it.pending){
         // Caption by WHAT IS MOVING, not by sender alone: a pending
         // from="phone" row is bytes crossing Wi-Fi (发送 on the phone, 接收

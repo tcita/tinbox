@@ -13,7 +13,7 @@
 // persistence is enough.
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::media::MediaMeta;use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -51,7 +51,18 @@ impl Source {
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "kind")]
 pub enum MsgBody {
-    File { source: Source, size: u64, name: String },
+    File {
+        source: Source,
+        size: u64,
+        name: String,
+        /// Video duration + dimensions for the timeline's compact row
+        /// (probed from moov, no decoding). None for non-video, unparseable
+        /// files, and rows written before probing existed (reconcile
+        /// backfills those). Skipped in JSON when absent so old rows stay
+        /// byte-identical; missing on read means None either way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media: Option<MediaMeta>,
+    },
     Text { text: String },
 }
 
@@ -80,6 +91,8 @@ pub struct MsgItem {
     pub name: String,
     pub size: u64,
     pub source_kind: String, // "local" | "remote"; empty for text
+    /// Video duration + dimensions ({dur_ms, w, h}), null when absent.
+    pub media: Option<MediaMeta>,
     /// True while this remote file is still being uploaded.
     pub pending: bool,
     // valid for text:
@@ -89,7 +102,12 @@ pub struct MsgItem {
 impl Entry {
     pub fn to_item(&self) -> MsgItem {
         match &self.body {
-            MsgBody::File { source, size, name } => MsgItem {
+            MsgBody::File {
+                source,
+                size,
+                name,
+                media,
+            } => MsgItem {
                 id: self.id.clone(),
                 ts: self.ts.clone(),
                 from: self.from.clone(),
@@ -97,6 +115,7 @@ impl Entry {
                 name: name.clone(),
                 size: *size,
                 source_kind: source.kind_str().to_string(),
+                media: media.clone(),
                 pending: self.pending,
                 text: String::new(),
             },
@@ -108,6 +127,7 @@ impl Entry {
                 name: String::new(),
                 size: 0,
                 source_kind: String::new(),
+                media: None,
                 pending: false,
                 text: text.clone(),
             },
@@ -197,7 +217,12 @@ fn migrate_old_entry(v: &serde_json::Value) -> Option<Entry> {
         id,
         ts,
         from,
-        body: MsgBody::File { source, size, name },
+        body: MsgBody::File {
+            source,
+            size,
+            name,
+            media: None,
+        },
         pending: false,
     })
 }
@@ -353,6 +378,39 @@ pub fn reconcile() {
         });
         dropped = before - v.len();
     }
+    // Backfill video metadata for rows written before probing existed: one
+    // header-only walk per file (seeks, milliseconds), then a single save.
+    // Runs at startup only — never on the hot list/push path.
+    let mut probed = 0usize;
+    {
+        let mut v = cat_lock();
+        for e in v.iter_mut() {
+            if let MsgBody::File {
+                source,
+                name,
+                media: ref mut m,
+                ..
+            } = &mut e.body
+            {
+                if m.is_none() && crate::media::is_bmff_name(name) {
+                    let pth = Path::new(source.path());
+                    if pth.exists() {
+                        *m = crate::media::probe_for(name, pth);
+                        if m.is_some() {
+                            probed += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if probed > 0 {
+        crate::logger::logf(&format!(
+            "catalog: backfilled video metadata for {probed} entr{}",
+            if probed == 1 { "y" } else { "ies" }
+        ));
+        save();
+    }
     if adopted > 0 || dropped > 0 {
         crate::logger::logf(&format!(
             "catalog: reconciled with inbox — {adopted} adopted, {dropped} dangling record(s) dropped"
@@ -404,6 +462,10 @@ pub fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// inbound upload. The row is ready immediately (never pending).
 pub fn add_remote(from: &str, id: &str, inbox_path: &Path, display_name: &str) -> Entry {
     let size = std::fs::metadata(inbox_path).map(|m| m.len()).unwrap_or(0);
+    // Probe once, at rest: the file is complete here (PC add, orphan
+    // adoption), so moov is final. Pending uploads probe at graduation
+    // instead (mark_remote_ready) — a partial moov would misreport.
+    let media = crate::media::probe_for(display_name, inbox_path);
     let entry = Entry {
         id: id.to_string(),
         ts: now_ts(),
@@ -414,6 +476,7 @@ pub fn add_remote(from: &str, id: &str, inbox_path: &Path, display_name: &str) -
             },
             size,
             name: display_name.to_string(),
+            media,
         },
         pending: false,
     };
@@ -441,6 +504,9 @@ pub fn add_remote_pending(from: &str, id: &str, inbox_path: &Path, display_name:
             },
             size,
             name: display_name.to_string(),
+            // No probe while landing: the moov may be incomplete (or, for
+            // moov-at-end files, entirely absent until the last byte).
+            media: None,
         },
         pending: true,
     };
@@ -467,9 +533,18 @@ pub fn mark_remote_ready(id: &str, final_path: &Path) -> bool {
         return false;
     }
     e.pending = false;
-    if let MsgBody::File { source: Source::Remote { path }, size, .. } = &mut e.body {
+    if let MsgBody::File {
+        source: Source::Remote { path },
+        size,
+        name,
+        media,
+    } = &mut e.body
+    {
         *path = final_path.to_string_lossy().to_string();
         *size = std::fs::metadata(final_path).map(|m| m.len()).unwrap_or(*size);
+        // Graduation probe: the bytes are complete and the sentinel is gone,
+        // so this is the first moment moov is trustworthy.
+        *media = crate::media::probe_for(name, final_path);
     }
     drop(v);
     save();

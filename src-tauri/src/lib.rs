@@ -2,6 +2,7 @@ mod catalog;
 mod desktop;
 mod firewall;
 mod logger;
+mod media;
 mod netinfo;
 mod pairing;
 mod presence;
