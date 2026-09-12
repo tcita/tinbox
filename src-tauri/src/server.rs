@@ -110,6 +110,10 @@ pub(crate) fn notifier() -> &'static broadcast::Sender<PushEvent> {
 #[derive(serde::Deserialize)]
 pub(crate) struct IdParam {
     pub id: String,
+    /// Traffic source tag for log attribution only (card = timeline tile,
+    /// full = explicit fullscreen open, nav = phone tap navigation). Never
+    /// affects serving; absent in old/bookmarked URLs.
+    pub ctx: Option<String>,
 }
 
 #[derive(serde::Deserialize)]

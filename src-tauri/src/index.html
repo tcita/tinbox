@@ -1160,7 +1160,7 @@ function buildMsg(it, animate){
         // late height (lazy load + network) doesn't strand the view mid-list.
         img.onload = maybeRepin;
         img.onerror = () => mediaFailed(card, it);
-        img.src = '/view?id=' + encodeURIComponent(it.id);
+        img.src = '/view?id=' + encodeURIComponent(it.id) + '&ctx=card';
         img.alt = it.name;
         img.loading = 'lazy';
         // Preview opens from the media element ITSELF on both ends. The card
@@ -1246,7 +1246,7 @@ function buildMsg(it, animate){
           // ordinary webpage: the browser decides — its inline viewer for
           // PDF/text, its own download flow (with its own progress UI) for
           // anything else. The corner button stays the explicit download.
-          location.href = '/view?id=' + encodeURIComponent(it.id);
+          location.href = '/view?id=' + encodeURIComponent(it.id) + '&ctx=nav';
         };
       }
       // The app's long-press menu is a PC affordance only (right-click). On
@@ -1617,7 +1617,7 @@ function openPreview(it){
   const isVid = isVidName(it.name);
   const ov = document.createElement('div');
   ov.className = 'media-ov';
-  const src = '/view?id='+encodeURIComponent(it.id);
+  const src = '/view?id='+encodeURIComponent(it.id)+'&ctx=full';
   // NOTE: parens are load-bearing — ?: binds looser than +, without them the
   // video branch would swallow the buttons below (overlay with no ✕, then a
   // null.onclick throw before appendChild, i.e. tap does nothing at all).

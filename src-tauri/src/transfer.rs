@@ -654,7 +654,7 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
                 inm.trim() == "*" || inm.split(',').any(|t| t.trim() == etag)
             });
         if fresh {
-            logf(&format!("serve {} -> 304 (revalidated)", p.id));
+            logf(&format!("serve {} ctx={} -> 304 (revalidated)", p.id, p.ctx.as_deref().unwrap_or("-")));
             return (
                 StatusCode::NOT_MODIFIED,
                 [
@@ -670,8 +670,9 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
         .and_then(|v| v.to_str().ok())
         .map_or(true, |ir| ir == etag);
     logf(&format!(
-        "serve {} q={:?} range={:?} if_range_ok={} ua={:?}",
+        "serve {} ctx={} q={:?} range={:?} if_range_ok={} ua={:?}",
         p.id,
+        p.ctx.as_deref().unwrap_or("-"),
         uri.query(),
         headers.get(header::RANGE).and_then(|v| v.to_str().ok()),
         if_range_ok,
