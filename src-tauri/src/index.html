@@ -514,6 +514,33 @@
   }
   .toast.show { opacity: 1; transform: translateX(-50%) translateY(0) scale(1); }
 
+  /* Jump-to-latest: the visible half of "new messages while scrolled up".
+     Appears only when the user sits above the bottom AND genuinely new cards
+     landed below; tap pins to the bottom and dismisses it. */
+  #toBottom {
+    position: fixed; right: 16px; bottom: calc(78px + env(safe-area-inset-bottom, 0px)); z-index: 60;
+    width: 40px; height: 40px; border-radius: 50%;
+    border: 1px solid var(--glass-border);
+    background: var(--glass-bg);
+    backdrop-filter: blur(24px) saturate(180%);
+    -webkit-backdrop-filter: blur(24px) saturate(180%);
+    color: var(--accent); cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+    opacity: 0; transform: translateY(8px) scale(0.9); pointer-events: none;
+    transition: opacity 0.2s var(--ease-out), transform 0.25s var(--ease-spring);
+  }
+  #toBottom.show { opacity: 1; transform: none; pointer-events: auto; }
+  #toBottom:active { transform: scale(0.92); }
+  #toBottomCount {
+    position: absolute; top: -4px; right: -4px;
+    min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+    background: var(--danger); color: #fff;
+    font-size: 11px; font-weight: 600; line-height: 18px; text-align: center;
+    display: none;
+  }
+  #toBottomCount.show { display: block; }
+
 
   /* Connect Gate (PC Wait Screen) */
   #gate {
@@ -745,6 +772,10 @@
 
 <div class="ctx-menu" id="ctxMenu"></div>
 <div class="toast" id="toast"></div>
+<button id="toBottom" aria-label="回到底部">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+  <span id="toBottomCount"></span>
+</button>
 
 <div id="dragOverlay">
   <div class="drag-card">
@@ -1098,10 +1129,14 @@ function buildMsg(it, animate){
       if(isImg){
         card.classList.add('has-preview');
         const img = document.createElement('img');
+        // onload first: a cached image can resolve before the lines below run.
+        // maybeRepin re-pins while the user sits at the bottom, so the card's
+        // late height (lazy load + network) doesn't strand the view mid-list.
+        img.onload = maybeRepin;
+        img.onerror = () => mediaFailed(card, it);
         img.src = '/view?id=' + encodeURIComponent(it.id);
         img.alt = it.name;
         img.loading = 'lazy';
-        img.onerror = () => mediaFailed(card, it);
         // Preview opens from the media element ITSELF on both ends. The card
         // surface stays dead for media, so a long-press that lands on the
         // card's padding (not the image) cannot click-through into the
@@ -1116,7 +1151,8 @@ function buildMsg(it, animate){
         const v = document.createElement('video');
         v.src = '/view?id='+encodeURIComponent(it.id);
         v.muted = true; v.playsInline = true; v.preload = 'metadata';
-        v.onloadedmetadata = () => { try { v.currentTime = 0.01; } catch {} };
+        // Dimensions are known at metadata: same late-height re-pin as images.
+        v.onloadedmetadata = () => { try { v.currentTime = 0.01; } catch {} maybeRepin(); };
         v.onerror = () => mediaFailed(card, it);
         v.onclick = (e) => { e.stopPropagation(); openPreview(it); };
         card.appendChild(v);
@@ -1211,6 +1247,45 @@ function buildMsg(it, animate){
   }
 }
 
+// Stick-to-bottom: a fresh window always opens pinned to the latest message
+// (firstPaint — there is no saved position; the webview is rebuilt on every
+// open) and stays pinned while the user sits at the bottom. The pin must be
+// instant, not smooth: #chat paints scroll-behavior:smooth, so a smooth jump
+// animates toward a target captured before lazy media resolved its height —
+// cards grow mid-animation, scrollHeight outruns the target, and the view
+// strands mid-list at the same files every launch. Media calls maybeRepin on
+// load to finish the trip; a manual scroll-up clears stickBottom so reading
+// history is never yanked.
+let stickBottom = true;
+let firstPaint = true;
+function pinToBottom(){
+  const c = $('chat');
+  try { c.scrollTo({ top: c.scrollHeight, behavior: 'instant' }); }
+  catch { c.scrollTop = c.scrollHeight; }
+}
+function maybeRepin(){ if(stickBottom) pinToBottom(); }
+// Unseen-below counter backing the jump-to-latest button: render() bumps it by
+// the number of genuinely new cards (appends only — in-place rebuilds and
+// deletes don't count), a manual scroll back to the bottom clears it.
+let unseenCount = 0;
+function showToBottom(){
+  const c = $('toBottomCount');
+  c.textContent = unseenCount > 99 ? '99+' : String(unseenCount);
+  c.classList.toggle('show', unseenCount > 0);
+  $('toBottom').classList.add('show');
+}
+function hideToBottom(){
+  unseenCount = 0;
+  $('toBottomCount').classList.remove('show');
+  $('toBottom').classList.remove('show');
+}
+$('toBottom').onclick = () => { pinToBottom(); hideToBottom(); };
+$('chat').addEventListener('scroll', () => {
+  const c = $('chat');
+  stickBottom = c.scrollTop + c.clientHeight >= c.scrollHeight - 32;
+  if(stickBottom) hideToBottom();
+}, { passive: true });
+
 function render(items){
   const chat = $('chat');
   const wasAtBottom = chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 32;
@@ -1229,6 +1304,7 @@ function render(items){
   const kept = new Map();
   for(const el of chat.children) if(el.dataset.id) kept.set(el.dataset.id, el);
 
+  let added = 0;
   for(const it of items){
     const sig = itemSig(it);
     const old = kept.get(it.id);
@@ -1241,6 +1317,7 @@ function render(items){
       old.replaceWith(el);
       if(it.kind !== 'text') paintCorner(it.id);
     } else {
+      added++;
       const el = buildMsg(it, true);
       if(!el) continue;
       el.dataset.sig = sig;
@@ -1250,7 +1327,9 @@ function render(items){
   }
   for(const el of kept.values()) el.remove();
 
-  if(wasAtBottom) chat.scrollTop = chat.scrollHeight;
+  if(firstPaint || wasAtBottom) pinToBottom();
+  else if(added > 0){ unseenCount += added; showToBottom(); }
+  firstPaint = false;
 }
 
 async function openDefault(it){
@@ -1626,14 +1705,23 @@ function reconcileMirrors(snap){
   for(const id of Object.keys(progCache)) if(!known.has(id) && !doneIds[id]) delete progCache[id];
 }
 
+// Double-submit guard: the button used to stay enabled and the input uncleared
+// until the server answered, so a slow response plus a second tap delivered
+// the same text twice — two POSTs from two connections, two ids, and the
+// server cannot tell them apart (every POST is a new message by design). One
+// flight at a time; a failure keeps the text for retry.
+let sending = false;
 function sendText(){
+  if(sending) return;
   const t = $('txt');
   const text = t.value.trim();
   if(!text) return;
+  sending = true; updateSendBtn();
   api('/send-text', { method:'POST', body:{ text } }).then(r => {
+    sending = false;
     if(r.ok){ t.value = ''; autoSize(); updateSendBtn(); }
-    else toast('发送失败');
-  }).catch(() => toast('发送失败'));
+    else { updateSendBtn(); toast('发送失败'); }
+  }).catch(() => { sending = false; updateSendBtn(); toast('发送失败'); });
 }
 
 function autoSize(){
@@ -1642,7 +1730,7 @@ function autoSize(){
   t.style.height = Math.min(t.scrollHeight, 100) + 'px';
 }
 function updateSendBtn(){
-  $('send').disabled = $('txt').value.trim().length === 0;
+  $('send').disabled = sending || $('txt').value.trim().length === 0;
 }
 
 function uploadFiles(files){
