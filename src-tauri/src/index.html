@@ -174,16 +174,17 @@
     margin-top: 10px; font-size: 11px; color: var(--sub); line-height: 1.4;
   }
 
-  /* Chat Area */
+  /* Chat Area: #chat is a dumb scroller; the column lives in #chatInner so a
+     ResizeObserver on the inner sees every content growth (image decode,
+     fonts, anything future) and gravity-pins while parked at the bottom —
+     no window to tune, no cap to outrun. Programmatic pins must be instant,
+     so no scroll-behavior:smooth here. */
   #chat {
     flex: 1; overflow-y: overlay; overflow-x: hidden;
-    padding: 16px 16px 12px;
+  }
+  #chatInner {
     display: flex; flex-direction: column; gap: 14px;
-    /* No scroll-behavior:smooth: the opening jump to the latest message and
-       the settlePin() frames that follow it must be instant. With smooth, a
-       programmatic jump becomes an animation toward a scrollHeight captured
-       before images decoded, so the target goes stale and the view stops
-       short of the bottom. */
+    padding: 16px 16px 12px; min-height: 100%;
   }
   #chat::-webkit-scrollbar { width: 5px; }
   #chat::-webkit-scrollbar-thumb { background: transparent; border-radius: 10px; }
@@ -450,6 +451,15 @@
   }
   .empty .e-title { font-size: 15px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
   .empty .e-desc { font-size: 12.5px; line-height: 1.5; color: var(--sub); }
+  /* Boot spinner: the only thing a fresh window may show before the first
+     list/info lands (see #boot). Deliberately content-free — no title, no
+     icon — so it can never be mistaken for a state. */
+  .boot-spin {
+    width: 26px; height: 26px; border-radius: 50%; margin-bottom: 12px;
+    border: 3px solid var(--line-strong); border-top-color: var(--accent);
+    animation: bootSpin 0.8s linear infinite;
+  }
+  @keyframes bootSpin { to { transform: rotate(360deg); } }
 
   input[type="file"] { display: none; }
 
@@ -711,15 +721,17 @@
   </div>
 </div>
 
-<div id="chat">
-  <div class="empty" id="empty">
-    <div class="e-icon">
-      <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m3 15 4-4 4 4"/><path d="m14 9 4-4 4 4"/><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/></svg>
-    </div>
-    <div class="e-title">准备就绪</div>
-    <div class="e-desc">跨设备互传文字、照片和文件</div>
+<div id="chat"><div id="chatInner">
+  <!-- Boot placeholder: neutral loading, NOT the empty state. "Unknown yet"
+       and "known empty" must never share a face, or every fresh window flashes
+       "ready" before the first list/info lands and the QR gate reads as an
+       error on top of it. render() removes #boot on the first real paint;
+       buildEmpty() owns the true empty state afterwards. -->
+  <div class="empty" id="boot">
+    <div class="boot-spin"></div>
+    <div class="e-desc">加载中…</div>
   </div>
-</div>
+</div></div>
 
 <div class="composer">
   <button class="plus-btn" id="plus" title="选择文件">
@@ -1050,12 +1062,25 @@ document.addEventListener('scroll', hideCtxMenu, true);
 
 let lastList = '';
 let curItems = [];   // latest message list, mirrors what render() is showing
+// Boot gate (PC): the first paint must be atomic — timeline XOR QR gate —
+// never the timeline flashing before the gate. The first list and the first
+// info arrive within ms of each other (the SSE replay is list→info→fw back
+// to back, and the one-shot /list fetch races alongside), so the first PC
+// list is held until the first info lands, then exactly one surface is
+// revealed (see the boot step in applyInfo, 3s fallback below). The phone has
+// no gate decision, so it paints on its first list as before.
+let booted = false;
+let bootList = null;
+function applyList(items){
+  lastServer = items;
+  if(isPC && !booted){ bootList = items; return; }
+  applyListLive(items);
+}
 // Apply a full message list: dedup against what we already rendered, then
 // render + the housekeeping passes. Called from the one-shot refresh() fetch
 // and from each SSE `list` event (which carries the full array, so steady
 // state makes no /list requests at all).
-function applyList(items){
-  lastServer = items;
+function applyListLive(items){
   // A pending from="pc" row is the PC's LOCAL copy into its own inbox — the
   // phone is neither sender nor receiver of those bytes, so showing it as a
   // transfer would lie twice ("发送中/接收中" over a wire that carries
@@ -1306,43 +1331,33 @@ function buildMsg(it, animate){
 // (firstPaint — there is no saved position; the webview is rebuilt on every
 // open), which is exactly what a chat app does: the newest message is what
 // you came back to see. The hard part is late layout — at first paint every
-// media box is 0px tall, then images decode/lazy-load and video metadata
-// arrives, so the timeline keeps growing after the first scrollTop assign and
-// a one-shot jump strands the view mid-list. Two things fix that together:
-// #chat no longer sets scroll-behavior:smooth (see CSS), and settlePin()
-// re-pins on every frame while the content is still changing. Each media
-// element also re-pins on load, so a slow image that lands after settle still
-// finishes the trip. A manual scroll-up clears stickBottom, so reading
-// history is never yanked.
+// media box is 0px tall, then images decode/lazy-load, so the timeline keeps
+// growing after the first scrollTop assign and a one-shot jump strands the
+// view mid-list. The bottom is therefore a resting state held by gravity
+// (innerRO below), not a jump to be timed right. Each media element also
+// re-pins on load as backup. A manual scroll-up clears stickBottom, so
+// reading history is never yanked.
 let stickBottom = true;
 let firstPaint = true;
+// Causal order, no clocks: every pin and every user input takes a number;
+// a non-bottom scroll position disarms only if the user did something AFTER
+// our last pin (inputSeq > pinSeq). A pin's own late echo always loses that
+// comparison, so it can never suicide stickiness no matter how noisy the
+// boot layout is. Any order of echo vs input converges: continuous user
+// input always outnumbers the single echo per pin.
+let seq = 0, pinSeq = 0, inputSeq = 0;
 function pinToBottom(){
-  const c = $('chat');
-  c.scrollTop = c.scrollHeight;
+  pinSeq = ++seq;
+  $('chat').scrollTop = $('chat').scrollHeight;
 }
-function maybeRepin(){ if(stickBottom) pinToBottom(); }
-// Re-pin across late layout: every rAF while scrollHeight keeps changing,
-// stopping once it has held still for ~half a second (or after a 2s cap). A
-// newer call cancels an older loop, so a burst of list events does not stack
-// loops. This is what makes startup land at the bottom even when the last
-// screenful is all images that finish decoding several frames later.
-let settleGen = 0;
-function settlePin(){
-  if(!stickBottom) return;
-  const gen = ++settleGen;
-  const c = $('chat');
-  const start = Date.now();
-  let last = -1, still = 0;
-  const tick = () => {
-    if(gen !== settleGen || !stickBottom) return;
-    const h = c.scrollHeight;
-    if(h !== last){ last = h; still = 0; pinToBottom(); }
-    else if(++still >= 30) return;          // height held still: done
-    if(Date.now() - start > 2000) return;   // hard cap
-    requestAnimationFrame(tick);
-  };
-  requestAnimationFrame(tick);
-}
+// Gravity, not chase: the observer fires after EVERY content growth the inner
+// undergoes — image decode, font swap, anything future — at any time, with no
+// window to tune and no 2s cap to outrun. Pinning only ever sets scrollTop;
+// it never resizes anything, so the loop cannot feed itself. When the user
+// scrolls up, stickBottom is false and growth is correctly ignored, leaving
+// scroll anchoring to hold their reading position.
+const innerRO = new ResizeObserver(() => { if(stickBottom) pinToBottom(); });
+innerRO.observe($('chatInner'));
 // The phone's toolbar collapse changes the viewport height after load; a pin
 // taken against the pre-collapse viewport sits slightly high. Re-pin on any
 // viewport resize while parked at the bottom.
@@ -1364,20 +1379,37 @@ function hideToBottom(){
   $('toBottomCount').classList.remove('show');
   $('toBottom').classList.remove('show');
 }
-$('toBottom').onclick = () => { pinToBottom(); settlePin(); hideToBottom(); };
+$('toBottom').onclick = () => { pinToBottom(); hideToBottom(); };
+// Any user input takes a sequence number (capture: it precedes the scroll it
+// causes). Scrollbar drags, keys and menu clicks all count — direction is
+// irrelevant, because disarming still requires a non-bottom position below.
+['wheel', 'touchmove', 'touchstart', 'keydown', 'mousedown'].forEach(ev =>
+  document.addEventListener(ev, () => { inputSeq = ++seq; }, { passive: true, capture: true }));
 $('chat').addEventListener('scroll', () => {
   const c = $('chat');
-  stickBottom = c.scrollTop + c.clientHeight >= c.scrollHeight - 32;
-  if(stickBottom) hideToBottom();
+  if(c.scrollTop + c.clientHeight >= c.scrollHeight - 32){
+    stickBottom = true; hideToBottom();
+  } else if(inputSeq > pinSeq){
+    stickBottom = false;
+  }
+  // else: off-bottom with no input since our last pin — a layout echo
+  // (growth between the pin and its event), not the user. Ignore it.
 }, { passive: true });
 
 function render(items){
   const chat = $('chat');
+  const inner = $('chatInner');
   const wasAtBottom = chat.scrollTop + chat.clientHeight >= chat.scrollHeight - 32;
 
+  // The boot placeholder (#boot) dies on the first real paint, whichever
+  // branch: it must never survive next to real cards, and the true empty
+  // state below is only ever painted from a confirmed-empty list.
+  const bootEl = document.getElementById('boot');
+  if(bootEl) bootEl.remove();
+
   if(!items.length){
-    chat.replaceChildren();
-    if(!document.getElementById('empty')) chat.appendChild(buildEmpty());
+    inner.replaceChildren();
+    if(!document.getElementById('empty')) inner.appendChild(buildEmpty());
     return;
   }
   const emptyEl = document.getElementById('empty');
@@ -1387,7 +1419,7 @@ function render(items){
   // touched), changed ids are rebuilt in place, new ids are appended, and
   // survivors of the kept map at the end were deleted on the server.
   const kept = new Map();
-  for(const el of chat.children) if(el.dataset.id) kept.set(el.dataset.id, el);
+  for(const el of inner.children) if(el.dataset.id) kept.set(el.dataset.id, el);
 
   let added = 0;
   for(const it of items){
@@ -1406,13 +1438,15 @@ function render(items){
       const el = buildMsg(it, true);
       if(!el) continue;
       el.dataset.sig = sig;
-      chat.appendChild(el);
+      inner.appendChild(el);
       if(it.kind !== 'text') paintCorner(it.id);
     }
   }
   for(const el of kept.values()) el.remove();
 
-  if(firstPaint || wasAtBottom){ pinToBottom(); settlePin(); }
+  // Pin here for the synchronous case; the innerRO gravity below holds it
+  // across every late growth afterwards, so there is no window to tune.
+  if(firstPaint || wasAtBottom) pinToBottom();
   else if(added > 0){ unseenCount += added; showToBottom(); }
   firstPaint = false;
 }
@@ -2095,6 +2129,13 @@ function applyInfo(d){
     $('gateUrl').querySelector('span').textContent = d.url;
     $('qlUrl').textContent = d.url;
   }
+  // First info lands: boot the held list (if any) so the first paint reveals
+  // exactly one surface — the gate toggle above already chose which.
+  if(!booted){
+    booted = true;
+    const l = bootList; bootList = null;
+    if(l) applyListLive(l); else refresh();
+  }
 }
 
 // Single SSE push channel: named events carry the actual state, so the page
@@ -2303,8 +2344,20 @@ if(isPC){
   // back after that. There is NO manual escape: the gate is the pairing
   // screen, and pairing is the only way to the in-app timeline. The Inbox
   // button is a real folder — the transfer landing zone on disk — and
-  // nothing else. The timeout is the fallback for a silent channel.
-  setTimeout(() => { if(!seenInfo) $('gate').classList.add('show'); }, 3000);
+  // nothing else. The first paint is atomic with the timeline (see the boot
+  // gate at applyList): the list waits for this first info, so neither
+  // surface ever flashes before the other. The timeout below is the fallback
+  // for a silent channel.
+  setTimeout(() => {
+    if(seenInfo || booted) return;
+    // Silent channel: boot with whatever list arrived (or none — refresh()
+    // re-fetches inside the boot step) and fall back to the gate, the same
+    // surface a failed info would have chosen.
+    booted = true;
+    $('gate').classList.add('show');
+    const l = bootList; bootList = null;
+    if(l) applyListLive(l); else refresh();
+  }, 3000);
 }
 
 // Report client-side exceptions into the server log, so a failure on the phone
