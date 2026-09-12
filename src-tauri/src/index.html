@@ -1755,14 +1755,23 @@ function updateSendBtn(){
   $('send').disabled = sending || $('txt').value.trim().length === 0;
 }
 
-function uploadFiles(files){
+async function uploadFiles(files){
   if(!files.length) return;
-  // One request per file: each gets its own ?size= (the per-request total the
-  // server declares on the pending row, so the PC ring's percent is right),
-  // its own optimistic card, and its own in-flight entry — parallel uploads
-  // are independent end to end instead of sharing one request and one slot.
-  for(const f of files) startUpload(f);
+  // Serial, smallest-first: on a LAN one stream already saturates the link,
+  // so parallel streams only split the same pipe while contending radio/CPU
+  // and risking a starved stream tripping the server's 5s silence kill.
+  // Smallest-first keeps parallel's one real win (photos land before a 2GB
+  // video) with none of its costs. One request per file still: each gets its
+  // own ?size= (the per-request total the server declares on the pending row,
+  // so the PC ring's percent is right), its own optimistic card, and its own
+  // in-flight entry. A failure skips to the next file, never aborts the
+  // queue; one summary toast covers the whole batch.
+  const queue = [...files].sort((a, b) => (a.size || 0) - (b.size || 0));
+  let ok = 0;
+  for(const f of queue) if(await startUpload(f)) ok++;
   reapply();
+  if(queue.length === 1) toast(ok ? '发送成功' : '传输失败');
+  else toast(ok === queue.length ? `发送成功 ${ok}/${queue.length}` : `已发送 ${ok}/${queue.length}`);
 }
 // MIME-derived fallback for nameless uploads (see startUpload): keeps the
 // server's filename, so cache keys and inbox names stay meaningful.
@@ -1789,25 +1798,27 @@ async function startUpload(f){
   const ac = new AbortController();
   const up = { ac, name: f.name, size: f.size || 0, seen: false };
   inFlightUploads.push(up);
-  const finish = (msg) => {
+  const finish = () => {
     const i = inFlightUploads.indexOf(up);
     if(i >= 0) inFlightUploads.splice(i, 1);
     const j = optUploads.indexOf(opt);
     if(j >= 0) optUploads.splice(j, 1);
     reapply();
-    if(msg) toast(msg);
   };
-  // One failure message for every cause: a receiver-side refusal tears the
-  // socket down before the row-vanish list event can arrive, so the client
-  // genuinely cannot tell a refused push from a WiFi drop — over-precise
-  // toasts only mislead (a refusal used to read "Network error"). The abort
-  // rejection and a hard network error both land in the same catch, so the
-  // old load/error/abort trio collapses into just success vs failure.
+  // One boolean for every cause: a receiver-side refusal tears the socket
+  // down before the row-vanish list event can arrive, so the client genuinely
+  // cannot tell a refused push from a WiFi drop — over-precise toasts only
+  // mislead (a refusal used to read "Network error"). The abort rejection and
+  // a hard network error both land in the same catch, so the old
+  // load/error/abort trio collapses into just success vs failure, and the
+  // batch summary toast lives in uploadFiles.
   try {
     const r = await api('/upload', { method:'POST', body: fd, query:{ size: f.size || 0 } });
-    finish(r.ok ? '发送成功' : '传输失败');
+    finish();
+    return r.ok;
   } catch {
-    finish('传输失败');
+    finish();
+    return false;
   }
 }
 
