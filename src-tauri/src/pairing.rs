@@ -186,7 +186,9 @@ pub(crate) async fn require_token(
         StatusCode::FORBIDDEN,
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
-            (header::CACHE_CONTROL, "no-cache".to_string()),
+            // no-store, not no-cache: a refusal must never populate any cache —
+            // error pages share their URL with the real bytes (/view?id=…).
+            (header::CACHE_CONTROL, "no-store".to_string()),
         ],
         unpaired_page(glyph, title, heading, body),
     )

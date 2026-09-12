@@ -571,16 +571,34 @@ impl Drop for StreamCutGuard {
 async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: Uri) -> impl IntoResponse {
     let Some(entry) = catalog::find(&p.id) else {
         logw(&format!("serve: id {} not found", p.id));
-        return (StatusCode::NOT_FOUND, "not found").into_response();
+        // no-store on every error arm: a 404 is heuristically cacheable, and
+        // a cached miss (deleted, or "still uploading" that later completes)
+        // must never outlive the state it reported.
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CACHE_CONTROL, "no-store".to_string())],
+            "not found",
+        )
+            .into_response();
     };
     // A file still being uploaded has nothing to serve yet (partial on disk).
     if entry.pending {
-        return (StatusCode::NOT_FOUND, "still uploading").into_response();
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CACHE_CONTROL, "no-store".to_string())],
+            "still uploading",
+        )
+            .into_response();
     }
     let (path, name) = match &entry.body {
         catalog::MsgBody::File { source, name, .. } => (source.path(), name.as_str()),
         catalog::MsgBody::Text { .. } => {
-            return (StatusCode::BAD_REQUEST, "not a file").into_response();
+            return (
+                StatusCode::BAD_REQUEST,
+                [(header::CACHE_CONTROL, "no-store".to_string())],
+                "not a file",
+            )
+                .into_response();
         }
     };
     let mut file = match tokio::fs::File::open(path).await {
@@ -589,7 +607,12 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
         // legacy Local original was moved/deleted -> friendly message.
         Err(_) => {
             logw(&format!("serve: file not on disk {} ({})", name, path));
-            return (StatusCode::NOT_FOUND, "file missing").into_response();
+            return (
+                StatusCode::NOT_FOUND,
+                [(header::CACHE_CONTROL, "no-store".to_string())],
+                "file missing",
+            )
+                .into_response();
         }
     };
     // Read the file size to set Content-Length so the frontend can show a
@@ -606,6 +629,42 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
     // to a full 200 body. Malformed / multi-range headers also fall through
     // to a full 200 body.
     let etag = format!("\"{}\"", p.id);
+    // Cache policy splits by dispatch: previews ride the browser cache
+    // (`private, no-cache` + this strong id ETag) — bytes are kept locally
+    // but every reuse revalidates, so a deleted message 404s instead of
+    // serving stale. Retention matches no-store to within one validation
+    // roundtrip, while a reopen costs N 304s instead of N full downloads.
+    // `private` (never shared) because every response is per-pairing LAN
+    // bytes with no shared cache in the path anyway. Downloads stay
+    // `no-store`: an explicit pull owns its bytes via the download manager,
+    // nothing should linger past it.
+    let cc: &str = if inline { "private, no-cache" } else { "no-store" };
+    // Conditional reuse, previews only: a client holding cached bytes sends
+    // If-None-Match (`*` or the echoed ETag) and gets an empty 304 instead of
+    // megabytes re-read and re-sent. Placement is load-bearing: this sits
+    // AFTER the existence checks above, so a deleted message 404s and the
+    // client's entry is purged on its next view attempt. Downloads never 304:
+    // their responses are no-store, so no validator exists to send, and a
+    // bodiless answer to an explicit pull would read as a broken download.
+    if inline {
+        let fresh = headers
+            .get(header::IF_NONE_MATCH)
+            .and_then(|v| v.to_str().ok())
+            .map_or(false, |inm| {
+                inm.trim() == "*" || inm.split(',').any(|t| t.trim() == etag)
+            });
+        if fresh {
+            logf(&format!("serve {} -> 304 (revalidated)", p.id));
+            return (
+                StatusCode::NOT_MODIFIED,
+                [
+                    (header::ETAG, etag),
+                    (header::CACHE_CONTROL, cc.to_string()),
+                ],
+            )
+                .into_response();
+        }
+    }
     let if_range_ok = headers
         .get(header::IF_RANGE)
         .and_then(|v| v.to_str().ok())
@@ -629,7 +688,10 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
         Some(Err(())) => {
             return (
                 StatusCode::RANGE_NOT_SATISFIABLE,
-                [(header::CONTENT_RANGE, format!("bytes */{len}"))],
+                [
+                    (header::CONTENT_RANGE, format!("bytes */{len}")),
+                    (header::CACHE_CONTROL, "no-store".to_string()),
+                ],
             )
                 .into_response();
         }
@@ -640,7 +702,12 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
     if start > 0 {
         if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
             logw(&format!("serve: seek failed {}: {}", path, e));
-            return (StatusCode::INTERNAL_SERVER_ERROR, "seek failed").into_response();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [(header::CACHE_CONTROL, "no-store".to_string())],
+                "seek failed",
+            )
+                .into_response();
         }
     }
     // Progress tracking: real downloads (not inline previews) register a
@@ -783,12 +850,6 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
     };
     let disp = if inline { "inline" } else { "attachment" };
     let cd = format!("{}; filename=\"{}\"", disp, name);
-    // Inline previews are zero-cache: card previews and fullscreen views both
-    // ride /view, refetched on re-render. Nothing here intends to live in a
-    // browser cache after the session — a deleted message should leave
-    // nothing retrievable on the phone. The id never changes content, but
-    // retention is the phone's, not the app's, problem.
-    let cc = "no-store";
     let mut resp = (
         StatusCode::OK,
         [
