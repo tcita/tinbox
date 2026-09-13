@@ -1381,8 +1381,16 @@ $('toBottom').onclick = () => { pinToBottom(); hideToBottom(); };
 // Any user input takes a sequence number (capture: it precedes the scroll it
 // causes). Scrollbar drags, keys and menu clicks all count — direction is
 // irrelevant, because disarming still requires a non-bottom position below.
+// The composer is excluded: typing (and the tap that focuses it) is not
+// "reading history", and on the phone the keyboard opening clamps #chat and
+// fires an off-bottom scroll event — counting composer input would pair that
+// clamp with a fresh inputSeq and disarm gravity exactly while typing.
+const composerEl = document.querySelector('.composer');
 ['wheel', 'touchmove', 'touchstart', 'keydown', 'mousedown'].forEach(ev =>
-  document.addEventListener(ev, () => { inputSeq = ++seq; }, { passive: true, capture: true }));
+  document.addEventListener(ev, (e) => {
+    if(composerEl && e.target && composerEl.contains(e.target)) return;
+    inputSeq = ++seq;
+  }, { passive: true, capture: true }));
 $('chat').addEventListener('scroll', () => {
   const c = $('chat');
   if(c.scrollTop + c.clientHeight >= c.scrollHeight - 32){
@@ -1934,6 +1942,14 @@ $('txt').addEventListener('paste', e => {
   if(files.length){ e.preventDefault(); uploadFiles(files); }
 });
 $('txt').addEventListener('keydown', e => {
+  // IME guard (non-negotiable for lang=zh-CN): while a pinyin candidate
+  // window is open the keystrokes are composition, not intent — Enter there
+  // means "commit 你好 into the box", not "send". isComposing covers modern
+  // browsers; keyCode 229 is the legacy tell for the same state.
+  if(e.isComposing || e.keyCode === 229) return;
+  // Enter sends on every end (WeChat-style: no newline entry on mobile;
+  // PC keeps Shift+Enter for one). The send button stays the discoverable
+  // path; Enter is the fast path.
   if(e.key === 'Enter' && !e.shiftKey){ e.preventDefault(); sendText(); }
 });
 $('send').onclick = sendText;
