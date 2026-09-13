@@ -1048,8 +1048,8 @@ async function copyFile(it){
 // context-menu action; the toast reports the outcome.
 async function delItem(it){
   const res = await api('/rm', { method:'POST', query:{ id: it.id } });
-  if(res.ok) toast('已删除');
-  else toast('删除失败');
+  // Failure-only like sends: the vanishing card confirms success.
+  if(!res.ok) toast('删除失败');
   refresh();
 }
 async function revealItem(it){
@@ -1873,8 +1873,10 @@ async function uploadFiles(files){
   let ok = 0;
   for(const f of queue) if(await startUpload(f)) ok++;
   reapply();
-  if(queue.length === 1) toast(ok ? '发送成功' : '传输失败');
-  else toast(ok === queue.length ? `发送成功 ${ok}/${queue.length}` : `已发送 ${ok}/${queue.length}`);
+  // Failure-only toasts: the new card in the timeline IS the success
+  // confirmation (plus the ring closing). A toast only when something
+  // did not land — full success stays silent.
+  if(ok < queue.length) toast(ok === 0 ? '传输失败' : `已发送 ${ok}/${queue.length}`);
 }
 // MIME-derived fallback for nameless uploads (see startUpload): keeps the
 // server's filename, so cache keys and inbox names stay meaningful.
@@ -2034,7 +2036,8 @@ async function addLocalPaths(paths){
     const m = /added:\s*(\d+)/.exec(await r.text());
     if(m) n = parseInt(m[1], 10);
   } catch {}
-  toast(n >= fresh.length ? `导入成功 ${n} 个文件` : `导入成功 ${n}/${fresh.length} 个文件`);
+  // Failure-only: landed cards confirm success; toast only the shortfall.
+  if(n < fresh.length) toast(`导入成功 ${n}/${fresh.length} 个文件`);
 }
 // Tauri fires tauri://drag-drop with the real paths in parallel with the HTML5
 // drop. Listening to it covers platforms where the File.path injection is

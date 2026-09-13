@@ -236,9 +236,15 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
             let exe = std::env::current_exe()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_else(|_| "<unknown>".to_string());
+            // Session banner, two jobs: the dash line delimits runs in a
+            // shared file, and the profile names which build wrote it —
+            // debug and release share one log, and only the profile tells
+            // them apart at a glance (the exe path says it too, buried).
+            logf("------------------------------------------------------------");
             logf(&format!(
-                "tinbox v{} starting; exe={}; data at {}",
+                "tinbox v{} ({}) starting; exe={}; data at {}",
                 env!("CARGO_PKG_VERSION"),
+                if cfg!(debug_assertions) { "debug" } else { "release" },
                 exe,
                 crate::logger::data_root().display()
             ));
