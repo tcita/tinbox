@@ -13,7 +13,8 @@
 // persistence is enough.
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use crate::media::MediaMeta;use std::sync::atomic::{AtomicUsize, Ordering};
+use crate::media::MediaMeta;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -62,6 +63,11 @@ pub enum MsgBody {
         /// byte-identical; missing on read means None either way.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         media: Option<MediaMeta>,
+        /// True once a Shell-extracted JPEG lives at posters/{id}.jpg.
+        /// Presence of the file is the disk truth; this flag is its index
+        /// so the frontend can pick brick vs compact row without a 404.
+        #[serde(default, skip_serializing_if = "is_false")]
+        poster: bool,
     },
     Text { text: String },
 }
@@ -93,6 +99,8 @@ pub struct MsgItem {
     pub source_kind: String, // "local" | "remote"; empty for text
     /// Video duration + dimensions ({dur_ms, w, h}), null when absent.
     pub media: Option<MediaMeta>,
+    /// True when a JPEG poster is ready at /poster?id=.
+    pub poster: bool,
     /// True while this remote file is still being uploaded.
     pub pending: bool,
     // valid for text:
@@ -107,6 +115,7 @@ impl Entry {
                 size,
                 name,
                 media,
+                poster,
             } => MsgItem {
                 id: self.id.clone(),
                 ts: self.ts.clone(),
@@ -116,6 +125,7 @@ impl Entry {
                 size: *size,
                 source_kind: source.kind_str().to_string(),
                 media: media.clone(),
+                poster: *poster,
                 pending: self.pending,
                 text: String::new(),
             },
@@ -128,6 +138,7 @@ impl Entry {
                 size: 0,
                 source_kind: String::new(),
                 media: None,
+                poster: false,
                 pending: false,
                 text: text.clone(),
             },
@@ -222,9 +233,14 @@ fn migrate_old_entry(v: &serde_json::Value) -> Option<Entry> {
             size,
             name,
             media: None,
+            poster: false,
         },
         pending: false,
     })
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 pub fn load() {
@@ -477,6 +493,7 @@ pub fn add_remote(from: &str, id: &str, inbox_path: &Path, display_name: &str) -
             size,
             name: display_name.to_string(),
             media,
+            poster: false,
         },
         pending: false,
     };
@@ -507,6 +524,7 @@ pub fn add_remote_pending(from: &str, id: &str, inbox_path: &Path, display_name:
             // No probe while landing: the moov may be incomplete (or, for
             // moov-at-end files, entirely absent until the last byte).
             media: None,
+            poster: false,
         },
         pending: true,
     };
@@ -538,6 +556,7 @@ pub fn mark_remote_ready(id: &str, final_path: &Path) -> bool {
         size,
         name,
         media,
+        poster: _,
     } = &mut e.body
     {
         *path = final_path.to_string_lossy().to_string();
@@ -625,6 +644,29 @@ pub fn take_all() -> Vec<Entry> {
     drop(v);
     save();
     all
+}
+
+/// Flip the poster flag after a sidecar lands (or is lost). Returns true when
+/// the stored value actually changed, so the caller can skip a redundant save
+/// and List push.
+pub fn set_poster(id: &str, yes: bool) -> bool {
+    let mut v = cat_lock();
+    let Some(e) = v.iter_mut().find(|e| e.id == id) else {
+        return false;
+    };
+    let Some(flag) = (match &mut e.body {
+        MsgBody::File { poster, .. } => Some(poster),
+        MsgBody::Text { .. } => None,
+    }) else {
+        return false;
+    };
+    if *flag == yes {
+        return false;
+    }
+    *flag = yes;
+    drop(v);
+    save();
+    true
 }
 
 /// Message list sorted by ts ascending (timeline order).

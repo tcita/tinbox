@@ -24,15 +24,25 @@ pub struct MediaMeta {
     pub h: u32,
 }
 
-/// Extensions we even attempt to parse (ISO BMFF only — avi/mkv/webm need
-/// different demuxers and stay suffix-less).
-pub fn is_bmff_name(name: &str) -> bool {
-    let ext = Path::new(name)
+fn ext_of(name: &str) -> String {
+    Path::new(name)
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
-        .to_lowercase();
-    matches!(ext.as_str(), "mp4" | "mov" | "m4v")
+        .to_lowercase()
+}
+
+/// Extensions we even attempt to parse (ISO BMFF only — avi/mkv/webm need
+/// different demuxers and stay suffix-less).
+pub fn is_bmff_name(name: &str) -> bool {
+    matches!(ext_of(name).as_str(), "mp4" | "mov" | "m4v")
+}
+
+/// Timeline-video names: Shell poster extraction and the frontend VID_EXTS
+/// table stay in lockstep. Broader than is_bmff_name — avi/mkv/webm still
+/// get a poster try even though they have no moov suffix.
+pub fn is_video_name(name: &str) -> bool {
+    matches!(ext_of(name).as_str(), "mp4" | "mov" | "m4v" | "avi" | "mkv" | "webm")
 }
 
 /// Parse if applicable, else None. Never panics, never reads box payloads

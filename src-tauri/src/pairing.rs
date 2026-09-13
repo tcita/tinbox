@@ -167,7 +167,10 @@ pub(crate) async fn require_token(
     // SVG illustration instead of the 📷 emoji, which never had a dedicated
     // QR-scan codepoint and read as "camera" rather than "scan".
     let path = req.uri().path();
-    let (glyph, title, heading, body) = if path.starts_with("/view") || path.starts_with("/dl") {
+    let (glyph, title, heading, body) = if path.starts_with("/view")
+        || path.starts_with("/dl")
+        || path.starts_with("/poster")
+    {
         (
             "⛓️‍💥",
             "tinbox — 无效的分享链接",

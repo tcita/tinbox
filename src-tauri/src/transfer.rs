@@ -308,6 +308,7 @@ pub(crate) async fn upload(
         match write_result {
             Ok(()) => {
                 catalog::mark_remote_ready(&id, &final_path);
+                crate::poster::request(&id, &final_path, &filename);
                 logf(&format!("upload done: {} ({} bytes) -> inbox", filename, total));
                 if total >= 4 * 1024 * 1024 {
                     let secs = t0.elapsed().as_secs_f64();
@@ -463,6 +464,7 @@ pub(crate) async fn copy_into_inbox(src: &Path) -> std::io::Result<(String, Path
         return Err(e);
     }
     catalog::mark_remote_ready(&id, &final_path);
+    crate::poster::request(&id, &final_path, &safe);
     {
         // Final tick (sent == total) closes the ring immediately, unthrottled.
         let mut map = dl_lock();
@@ -926,6 +928,81 @@ pub(crate) async fn view(q: Query<IdParam>, headers: HeaderMap, uri: Uri) -> imp
     serve(q, true, headers, uri).await
 }
 
+/// Small JPEG sidecar for a video card. Same cache posture as /view
+/// (private, no-cache + id ETag): a deleted message 404s on the next
+/// revalidate instead of serving a stale brick. No Range — the file is
+/// tens of KB. 404/pending/missing all no-store.
+pub(crate) async fn serve_poster(
+    Query(p): Query<IdParam>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let not_found = || {
+        (
+            StatusCode::NOT_FOUND,
+            [(header::CACHE_CONTROL, "no-store".to_string())],
+            "not found",
+        )
+            .into_response()
+    };
+    let Some(entry) = catalog::find(&p.id) else {
+        return not_found();
+    };
+    if entry.pending {
+        return not_found();
+    }
+    let has = match &entry.body {
+        catalog::MsgBody::File { poster, .. } => *poster,
+        catalog::MsgBody::Text { .. } => false,
+    };
+    if !has {
+        return not_found();
+    }
+    let path = crate::poster::path_for(&entry.id);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => b,
+        Err(_) => return not_found(),
+    };
+    let etag = format!("\"{}\"", entry.id);
+    let fresh = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        .map_or(false, |inm| {
+            inm.trim() == "*" || inm.split(',').any(|t| t.trim() == etag)
+        });
+    if fresh {
+        logf(&format!(
+            "poster {} ctx={} -> 304 (revalidated)",
+            entry.id,
+            p.ctx.as_deref().unwrap_or("-")
+        ));
+        return (
+            StatusCode::NOT_MODIFIED,
+            [
+                (header::ETAG, etag),
+                (header::CACHE_CONTROL, "private, no-cache".to_string()),
+            ],
+        )
+            .into_response();
+    }
+    logf(&format!(
+        "poster {} ctx={} -> 200 ({} KB)",
+        entry.id,
+        p.ctx.as_deref().unwrap_or("-"),
+        bytes.len() / 1024
+    ));
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "image/jpeg".to_string()),
+            (header::CONTENT_LENGTH, bytes.len().to_string()),
+            (header::ETAG, etag),
+            (header::CACHE_CONTROL, "private, no-cache".to_string()),
+        ],
+        bytes,
+    )
+        .into_response()
+}
+
 /// Live transfer progress snapshot: every download the server is currently
 /// serving (or recently finished — the monitor prunes finished entries after
 /// 15s). Now only hit once on SSE connect (and on a one-shot resync after a
@@ -959,6 +1036,7 @@ pub(crate) async fn cancel(
     // still holds the handle open (Windows), it deletes the file itself when
     // it wakes on the cancel flag.
     if let Some(e) = catalog::remove(&p.id) {
+        crate::poster::unlink(&e.id);
         if let catalog::MsgBody::File {
             source: catalog::Source::Remote { path },
             ..
@@ -1025,6 +1103,7 @@ pub(crate) async fn remove(
         cancel_lock().insert(entry.id.clone());
     }
     catalog::remove(&entry.id);
+    crate::poster::unlink(&entry.id);
     // Drop its progress entry so no further `progress` events advertise a
     // deleted file to whichever side is still downloading it.
     dl_lock().remove(&entry.id);
@@ -1068,6 +1147,7 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
             catalog::MsgBody::Text { .. } => texts += 1,
         }
     }
+    crate::poster::clear_all();
     let _ = notifier().send(PushEvent::List(catalog::all_items()));
     logf(&format!(
         "remove-all: cleared {} entries ({} files, {} texts)",

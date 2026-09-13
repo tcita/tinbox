@@ -28,9 +28,16 @@ qrcode = "0.14"
 # CF_HDROP file copies for the PC's right-click Copy (the web Clipboard API
 # cannot carry files).
 clipboard-win = "5"
-# The QR-code PNG encoder is image's only remaining user (the /thumb preview
-# layer was retired — both ends pull /view originals).
-image = { version = "0.25", default-features = false, features = ["png"] }
+# PNG for the QR-code encoder; JPEG for Shell-extracted video posters.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 # Compile optimizations + small binary, for portable long-running use.

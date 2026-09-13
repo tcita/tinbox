@@ -3,6 +3,7 @@ mod desktop;
 mod firewall;
 mod logger;
 mod media;
+mod poster;
 mod netinfo;
 mod pairing;
 mod presence;

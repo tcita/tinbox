@@ -911,7 +911,7 @@ function mediaFailed(card, it){
 // about a file name. Kept ahead of their users (function declarations, so
 // hoisting would also work, but one table reads better than three literals).
 const IMG_EXTS = ['jpg','jpeg','png','gif','webp','heic','bmp','svg'];
-const VID_EXTS = ['mp4','mov','avi','mkv','webm'];
+const VID_EXTS = ['mp4','mov','m4v','avi','mkv','webm'];
 const isImgName = n => IMG_EXTS.includes((n.split('.').pop()||'').toLowerCase());
 const isVidName = n => VID_EXTS.includes((n.split('.').pop()||'').toLowerCase());
 // Every HTTP call to the local server goes through api(): the method, query
@@ -1145,8 +1145,9 @@ function pruneTransfers(items){
 function itemSig(it){
   return it.kind === 'text'
     ? ['text', it.from, it.ts, it.text].join('|')
-    : ['file', it.from, it.ts, it.name, it.size, it.pending ? 1 : 0,
-       it.media ? [it.media.dur_ms, it.media.w, it.media.h].join(',') : ''].join('|');
+     : ['file', it.from, it.ts, it.name, it.size, it.pending ? 1 : 0,
+        it.poster ? 1 : 0,
+        it.media ? [it.media.dur_ms, it.media.w, it.media.h].join(',') : ''].join('|');
 }
 
 function buildEmpty(){
@@ -1198,21 +1199,25 @@ function buildMsg(it, animate){
       // (Safari loupe + 存储图像) saves img.src, so IMAGE cards pull the
       // ORIGINAL (/view) on both ends — the phone so "Save Image" stores real
       // bytes, the PC because it holds the file on disk and the pull is
-      // loopback. VIDEO cards are compact rows (see the isVid branch):
-      // pulling video bytes for a thumbnail can cost hundreds of MB on an
-      // unlucky file, so the row promises no pixels — icon + duration
-      // instead.
+      // loopback. VIDEO cards never pull video bytes for a tile (measured:
+      // ~1GB card traffic for one 500MB file per open, zero taps). When the
+      // server has a Shell-extracted JPEG they paint that via /poster; until
+      // then (or if extract failed) they stay a compact icon row. Either
+      // shape taps into the fullscreen preview, the single place video bytes
+      // flow, on explicit user intent.
       // With the diff-render below a kept card never refetches; only a
       // genuine rebuild does. Undecodable formats (HEIC on old iOS) fail as
       // before: onerror drops the preview, the card falls back to its icon.
-      if(isImg){
+      if(isImg || (isVid && it.poster)){
         card.classList.add('has-preview');
         const img = document.createElement('img');
         // No onload hook: the innerRO gravity already re-pins on every image
         // growth, and one pinning path beats two. onerror stays — a broken
         // image still falls back to its icon card.
         img.onerror = () => mediaFailed(card, it);
-        img.src = '/view?id=' + encodeURIComponent(it.id) + '&ctx=card';
+        img.src = isVid
+          ? '/poster?id=' + encodeURIComponent(it.id) + '&ctx=card'
+          : '/view?id=' + encodeURIComponent(it.id) + '&ctx=card';
         img.alt = it.name;
         img.loading = 'lazy';
         // Preview opens from the media element ITSELF on both ends. The card
@@ -1225,14 +1230,6 @@ function buildMsg(it, animate){
         img.onclick = (e) => { e.stopPropagation(); openPreview(it); };
         card.appendChild(img);
       } else if(isVid){
-        // Compact icon row, same shape as non-media (the else branch below):
-        // a timeline tile must never pull video bytes (measured: ~1GB card
-        // traffic for one 500MB file per open, zero taps), so the row
-        // promises no pixels: icon + name + size + duration. The whole row
-        // taps into the fullscreen preview (card.onclick below), the single
-        // place video bytes flow, on explicit user intent — no badge needed:
-        // the 🎬 already says video, and image/doc rows carry no badge
-        // either.
         const ico = document.createElement('div');
         ico.className = 'fc-ico';
         ico.textContent = '🎬';
