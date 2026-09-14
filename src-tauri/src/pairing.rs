@@ -10,6 +10,7 @@ use axum::{
 };
 use std::net::SocketAddr;
 use std::sync::OnceLock;
+use crate::server::{notifier, PushEvent};
 // ── Pairing token ─────────────────────────────────────────────────────────
 // The QR code encodes http://IP:PORT/?t=<token>; a phone's first visit with the
 // correct ?t= is handed a cookie and needs no further interaction. The PC's own
@@ -132,7 +133,9 @@ pub(crate) const UNPAIRED_MARKER: HeaderName = HeaderName::from_static("x-tinbox
 /// `?t=<token>` query (the QR payload / hand-typed URL) passes once and sets
 /// the long-lived cookie, so afterwards the pairing rides the browser jar with
 /// no URL decoration — the /view URLs the immutable cache keys on stay stable
-/// across restarts.
+/// across restarts. The `?t=` pass also broadcasts `PushEvent::Paired`, the
+/// exact pairing moment already-connected pages toast on — and it is checked
+/// before the cookie, so a re-scan while paired still counts as a scan.
 pub(crate) async fn require_token(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req: Request,
@@ -142,9 +145,11 @@ pub(crate) async fn require_token(
         return next.run(req).await;
     }
     let tok = request_token().clone();
-    if cookie_carries_token(req.headers(), &tok) {
-        return next.run(req).await;
-    }
+    // ?t= first: a scan is a pairing gesture even when the jar already holds
+    // a valid cookie (re-scan while paired) — checking the cookie first made
+    // re-scans silent: no Paired broadcast, no toast, lightbox stays. Cookie-
+    // only requests (reloads, subresource fetches never carry the query) fall
+    // through to the silent branch below.
     if query_has_token(req.uri().query(), &tok) {
         let mut resp = next.run(req).await;
         // 30-day browser-side life; server restart is the real expiry.
@@ -154,7 +159,15 @@ pub(crate) async fn require_token(
         if let Ok(v) = HeaderValue::from_str(&cookie) {
             resp.headers_mut().append(header::SET_COOKIE, v);
         }
+        // A fresh credential just crossed the gate — QR scan or hand-typed
+        // URL, cookie issued now. Broadcast so already-connected pages react
+        // at the moment of the scan (PC toast + QR lightbox dismiss); the
+        // scanning page itself hasn't opened its SSE stream yet.
+        let _ = notifier().send(PushEvent::Paired);
         return resp;
+    }
+    if cookie_carries_token(req.headers(), &tok) {
+        return next.run(req).await;
     }
     // Refused: pick the copy AND the glyph by path. The glyph sits in the
     // status-icon slot, so it must read as status, not brand: 📦 (the tinbox

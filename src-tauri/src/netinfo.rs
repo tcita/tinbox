@@ -83,7 +83,12 @@ pub(crate) async fn qr() -> impl IntoResponse {
     }
     (
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "image/png")],
+        [
+            (header::CONTENT_TYPE, "image/png"),
+            // Never cached: the payload carries the per-process pairing token,
+            // so a cached copy scanned after a restart 403s forever.
+            (header::CACHE_CONTROL, "no-store"),
+        ],
         buf.into_inner(),
     )
         .into_response()

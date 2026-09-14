@@ -116,25 +116,33 @@
   #clearBtn:hover { border-color: var(--danger); color: var(--danger); transform: translateY(-1px); }
   #inboxBtn:active, #clearBtn:active { transform: scale(0.95); }
 
-  #qrBox {
-    display: flex; align-items: center;
-    background: var(--card); border: 1px solid var(--line);
-    padding: 3px; border-radius: 10px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.03);
-    transition: all 0.2s var(--ease-out);
+  /* Primary connect entry (PC): a labeled pill, not a bare QR tile — a 28px
+     code is unscannable anyway, its only job was click-to-enlarge, and an
+     unlabeled glyph teaches nothing. Text states the action; the lightbox
+     stays the scan surface. Quiet by default (neutral card, accent only on
+     the glyph), inviting on hover — the same micro-language as the tool
+     buttons beside it (lift on hover, squash on press). A real <button>, so
+     it tabs like everything else the div never did. */
+  #connectBtn {
+    display: flex; align-items: center; gap: 7px;
+    height: 32px; padding: 0 13px 0 11px; border-radius: 10px;
+    border: 1px solid var(--line); background: var(--card); color: var(--text);
+    font-family: inherit; font-size: 13px; font-weight: 600; letter-spacing: 0.1px;
+    cursor: pointer; transition: all 0.2s var(--ease-out);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
   }
-  #qrBox:hover { border-color: var(--accent); cursor: pointer; }
-  #qrBox:active { transform: scale(0.95); }
-  #qr {
-    width: 28px; height: 28px; border-radius: 6px; background: #fff;
-    padding: 2px; display: block; cursor: pointer;
-  }
+  #connectBtn svg { color: var(--accent); flex: none; }
+  #connectBtn:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
+  #connectBtn:active { transform: scale(0.95); }
+  /* Group divider: the connect entry is pairing, the rest are tools — the
+     line says so without spending a label. */
+  .head-sep { width: 1px; height: 20px; background: var(--line); margin: 0 1px; flex: none; }
   /* Phone (coarse pointer): the header holds nothing the phone needs
-     (brand only — inbox/QR tiles are PC tools), so hide the whole bar and
+     (brand only — inbox/connect buttons are PC tools), so hide the whole bar and
      give the rows back to the chat. */
   @media (pointer: coarse) { .head { display: none; } }
 
-  /* QR lightbox: click the small header QR to enlarge it for scanning */
+  /* QR lightbox: the header connect button opens the large scan surface */
   #qrLightbox {
     position: fixed; inset: 0; z-index: 700;
     background: rgba(0,0,0,0.5);
@@ -563,12 +571,9 @@
   #toBottomCount.show { display: block; }
 
 
-  /* Connect Gate (PC Wait Screen) */
-  #gate {
-    position: fixed; inset: 0; z-index: 80; background: var(--bg);
-    display: none; align-items: center; justify-content: center; padding: 20px;
-  }
-  #gate.show { display: flex; }
+  /* Shared card for the status gates below (web-app gate); the PC connect
+     gate was removed — pairing needs no fullscreen wait, the header QR is
+     the scan entry. */
   .g-card {
     text-align: center; padding: 36px 32px 30px; max-width: 380px; width: 100%;
     background: var(--card); border-radius: 28px;
@@ -588,35 +593,6 @@
   .g-title { font-size: 20px; font-weight: 700; margin: 0 0 6px; letter-spacing: -0.4px; }
   .g-desc { font-size: 13px; color: var(--sub); line-height: 1.5; margin: 0 0 20px; }
   
-  .qr-frame {
-    background: #ffffff; padding: 12px; border-radius: 18px; display: inline-block;
-    box-shadow: 0 4px 20px rgba(0,0,0,0.06); border: 1px solid rgba(0,0,0,0.04);
-  }
-  #gateQr { width: 200px; height: 200px; display: block; border-radius: 8px; }
-
-  #gateUrl {
-    margin-top: 18px; font-size: 12.5px; font-weight: 600; color: var(--accent);
-    background: var(--accent-bg); border: none; border-radius: 10px;
-    padding: 8px 16px; max-width: 100%;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-    display: inline-flex; align-items: center;
-    cursor: text; user-select: text; -webkit-user-select: text;
-  }
-  #gateUrl span { cursor: text; user-select: text; -webkit-user-select: text; }
-  /* Waiting indicator: the gate's only "live" element — a breathing dot that
-     says the server is up and listening. Dies with the gate on first connect
-     (everConnected), so no state to manage. */
-  .g-wait {
-    margin-top: 16px; display: flex; align-items: center; justify-content: center;
-    gap: 7px; font-size: 12px; color: var(--sub);
-  }
-  .g-dot {
-    width: 7px; height: 7px; border-radius: 50%; background: var(--accent);
-    animation: gPulse 1.6s ease-in-out infinite;
-  }
-  @keyframes gPulse { 0%, 100% { opacity: .35; transform: scale(.85); } 50% { opacity: 1; transform: scale(1); } }
-  @media (pointer: coarse) { #gate { display: none !important; } }
-
   /* Modals (Firewall & Superseded) */
   .fw-overlay {
     position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45);
@@ -697,12 +673,14 @@
     <span>tinbox</span>
   </div>
   <div class="head-actions">
+    <button id="connectBtn" title="扫码连接设备">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg>
+      <span>连接手机</span>
+    </button>
+    <span class="head-sep"></span>
     <button id="inboxBtn" title="打开收件箱">
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
     </button>
-    <div id="qrBox" title="点击放大，扫码连接设备">
-      <img id="qr" src="/qr" alt="QR">
-    </div>
     <button id="clearBtn" title="清空全部消息">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
     </button>
@@ -712,9 +690,8 @@
 <div id="chat"><div id="chatInner">
   <!-- Boot placeholder: neutral loading, NOT the empty state. "Unknown yet"
        and "known empty" must never share a face, or every fresh window flashes
-       "ready" before the first list/info lands and the QR gate reads as an
-       error on top of it. render() removes #boot on the first real paint;
-       buildEmpty() owns the true empty state afterwards. -->
+       "ready" before the first list lands. render() removes #boot on the
+       first real paint; buildEmpty() owns the true empty state afterwards. -->
   <div class="empty" id="boot">
     <div class="boot-spin"></div>
     <div class="e-desc">加载中…</div>
@@ -733,21 +710,6 @@
   </div>
 </div>
 <input type="file" id="fileInput" multiple>
-
-<!-- Connect Gate (PC Only) -->
-<div id="gate">
-  <div class="g-card">
-    <div class="g-title" id="gateTitle">扫码连接</div>
-    <div class="g-desc" id="gateDesc">请保持手机与电脑在同一 Wi-Fi</div>
-    <div class="qr-frame">
-      <img id="gateQr" src="/qr" alt="QR code">
-    </div>
-    <div>
-      <div id="gateUrl"><span>…</span></div>
-    </div>
-    <div class="g-wait"><span class="g-dot"></span>等待手机扫码连接…</div>
-  </div>
-</div>
 
 <!-- Firewall Overlay -->
 <div class="fw-overlay" id="fwOverlay">
@@ -811,7 +773,7 @@
     <div class="ql-title">扫码连接设备</div>
     <img class="ql-qr" src="/qr" alt="QR code">
     <div><div class="ql-url" id="qlUrl">…</div></div>
-    <div class="ql-hint">tinbox 重启后,手机需重新扫码</div>
+    <div class="ql-hint">请保持手机与电脑在同一 Wi-Fi</div>
   </div>
 </div>
 
@@ -1066,18 +1028,8 @@ document.addEventListener('scroll', hideCtxMenu, true);
 
 let lastList = '';
 let curItems = [];   // latest message list, mirrors what render() is showing
-// Boot gate (PC): the first paint must be atomic — timeline XOR QR gate —
-// never the timeline flashing before the gate. The first list and the first
-// info arrive within ms of each other (the SSE replay is list→info→fw back
-// to back, and the one-shot /list fetch races alongside), so the first PC
-// list is held until the first info lands, then exactly one surface is
-// revealed (see the boot step in applyInfo, 3s fallback below). The phone has
-// no gate decision, so it paints on its first list as before.
-let booted = false;
-let bootList = null;
 function applyList(items){
   lastServer = items;
-  if(isPC && !booted){ bootList = items; return; }
   applyListLive(items);
 }
 // Apply a full message list: dedup against what we already rendered, then
@@ -2123,10 +2075,10 @@ window.addEventListener('drop', e => {
   uploadFiles(files);
 });
 
-// PC scan gate: shows full-screen until the FIRST LAN device connects this
-// session (`everConnected` latches on the first `info` online and never
-// resets), so it appears only before the first device — adding a later device
-// is the header QR's job, not a re-shown gate.
+// Pairing arrival toast (PC): `everOnline` latches on the first `info`
+// online and never resets, so the toast fires only for a device arriving
+// under a live page — adding a later device is the header QR's job, not a
+// re-shown gate (there is none: the timeline paints paired or not).
 //
 // There is deliberately NO ambient link/connection light on either side. A
 // status derived from heartbeat absence always lags reality by its detection
@@ -2135,32 +2087,20 @@ window.addEventListener('drop', e => {
 // therefore action-coupled: a send/download either succeeds or fails loudly in
 // the moment. The SSE channel below still reconnects + replays state
 // invisibly; it just never paints.
-let everConnected = false;
-// The first `info` is a replayed snapshot, not a transition: it latches the
-// gate either way but never toasts. Only a later false->true flip (a device
+let everOnline = false;
+// The first `info` is a replayed snapshot, not a transition: it latches
+// either way but never toasts. Only a later false->true flip (a device
 // arriving under a live page) is a "newly paired" worth announcing — without
 // this, every rebuilt window re-toasts for a phone that never left.
 let seenInfo = false;
 function applyInfo(d){
   if(!isPC || !d) return;
   const online = !!d.mobileConnected;
-  if(seenInfo && online && !everConnected) toast('已配对,可以传输了');
+  if(seenInfo && online && !everOnline){ toast('已配对,可以传输了'); $('qrLightbox').classList.remove('show'); }
   seenInfo = true;
-  if(online) everConnected = true;
-  // The gate is a pairing screen, not a splash: it never goes away by click.
-  // The first LAN device arriving is the only thing that lifts it — which is
-  // exactly the reported question "已连接了吗？" answered in one gesture.
-  $('gate').classList.toggle('show', !everConnected);
+  if(online) everOnline = true;
   if(d.url){
-    $('gateUrl').querySelector('span').textContent = d.url;
     $('qlUrl').textContent = d.url;
-  }
-  // First info lands: boot the held list (if any) so the first paint reveals
-  // exactly one surface — the gate toggle above already chose which.
-  if(!booted){
-    booted = true;
-    const l = bootList; bootList = null;
-    if(l) applyListLive(l); else refresh();
   }
 }
 
@@ -2169,7 +2109,7 @@ function applyInfo(d){
 // carrying a 1s retry hint) and we additionally pull /list and /dl-status once
 // to cover the replay race. This channel is pure transport maintenance: it
 // reconnects, replays state and reconciles, but never paints any link UI (see
-// the scan-gate comment above) — connectivity is judged by actions.
+// the arrival-toast comment above) — connectivity is judged by actions.
 let es;
 // Last time ANY SSE event arrived, heartbeats included. EventSource has no
 // read timeout, so a server that dies without a FIN (PC asleep, hard crash)
@@ -2210,6 +2150,12 @@ function connect(){
   es.addEventListener('resync', () => { lastSeen = Date.now(); reconcile(); });
   es.addEventListener('fw', e => { lastSeen = Date.now(); applyFw(JSON.parse(e.data).needRepair); });
   es.addEventListener('info', e => { lastSeen = Date.now(); applyInfo(JSON.parse(e.data)); });
+  // Fresh pairing (QR scan / hand-typed URL): the one exact pairing moment —
+  // unlike `info`, which is a sampled presence bit. Toast every time, even if
+  // the phone never left (a scan is always worth confirming), and dismiss the
+  // QR lightbox — its job is done, no ✕ click needed. Latch everOnline so the
+  // presence flip that follows the scan doesn't double-toast.
+  es.addEventListener('paired', () => { lastSeen = Date.now(); everOnline = true; toast('已配对,可以传输了'); $('qrLightbox').classList.remove('show'); });
 }
 // Home-screen web app contexts refuse service: since iOS 26 the add-to-Home-
 // Screen flow installs every site as a web app by default (the "Open as Web
@@ -2350,7 +2296,7 @@ $('fwQuit').onclick = () => { api('/quit', {method:'POST'}).catch(()=>{}); };
 // beside the card).
 function openQrLightbox(){ $('qrLightbox').classList.add('show'); }
 function closeQrLightbox(){ $('qrLightbox').classList.remove('show'); }
-$('qrBox').onclick = openQrLightbox;
+$('connectBtn').onclick = openQrLightbox;
 $('qlClose').onclick = closeQrLightbox;
 document.addEventListener('keydown', e => {
   if(e.key === 'Escape'){ closeQrLightbox(); $('clearOverlay').classList.remove('show'); }
@@ -2363,27 +2309,11 @@ if(isPC){
   // a page almost no identity chrome of its own, so the header logo is the
   // only branding surface there.
   document.querySelector('.brand').style.display = 'none';
-  // The gate is driven by the first `info` event (a replayed snapshot), never
-  // shown by default: a rebuilt window with a live phone must land straight
-  // on the timeline instead of flashing the QR gate. It hides once the first
-  // device connects (everConnected latches inside applyInfo) and never comes
-  // back after that. There is NO manual escape: the gate is the pairing
-  // screen, and pairing is the only way to the in-app timeline. The Inbox
-  // button is a real folder — the transfer landing zone on disk — and
-  // nothing else. The first paint is atomic with the timeline (see the boot
-  // gate at applyList): the list waits for this first info, so neither
-  // surface ever flashes before the other. The timeout below is the fallback
-  // for a silent channel.
-  setTimeout(() => {
-    if(seenInfo || booted) return;
-    // Silent channel: boot with whatever list arrived (or none — refresh()
-    // re-fetches inside the boot step) and fall back to the gate, the same
-    // surface a failed info would have chosen.
-    booted = true;
-    $('gate').classList.add('show');
-    const l = bootList; bootList = null;
-    if(l) applyListLive(l); else refresh();
-  }, 3000);
+  // No connect gate: the timeline paints on the first list, paired or not.
+  // Pairing is enforced per request by the server's token middleware, so the
+  // page never needs to wait for (or block on) a device. The header QR stays
+  // the scan entry; the Inbox button is a real folder — the transfer landing
+  // zone on disk — and nothing else.
 }
 
 // Report client-side exceptions into the server log, so a failure on the phone
@@ -2410,6 +2340,18 @@ window.addEventListener('unhandledrejection', e => {
   const msg = (r && (r.message || r.toString())) || String(r);
   reportClientError('unhandledrejection: ' + msg);
 });
+
+// A fresh ?t= served its one purpose the moment this response set the cookie:
+// drop it from the address bar so later reloads authenticate by cookie and
+// never re-fire the server's paired broadcast. Server-side ?t= then means
+// exactly "a scan just happened" — reloads stay silent, scans always toast.
+// Only `t` goes; /view?id= and friends keep their params.
+if(new URLSearchParams(location.search).has('t')){
+  const u = new URL(location.href);
+  u.searchParams.delete('t');
+  const q = u.searchParams.toString();
+  history.replaceState(null, '', u.pathname + (q ? '?' + q : '') + u.hash);
+}
 
 refresh();
 </script>

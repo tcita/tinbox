@@ -11,16 +11,16 @@ use std::sync::OnceLock;
 use std::time::Duration;
 /// Monotonic seconds since start of the most recent request from a **paired**
 /// LAN device — stamped only for responses the pairing middleware let
-/// through. Presence (the QR gate latch, the device transitions the monitor
+/// through. Presence (the arrival toast, the device transitions the monitor
 /// announces) must mean "a paired device is alive", so an expired or
-/// never-paired web page — which gets 403s for everything — cannot lift the
-/// PC's gate into "connected" by merely refetching.
+/// never-paired web page — which gets 403s for everything — cannot fake
+/// "connected" by merely refetching.
 pub(crate) static LAST_PAIRED_ACT: AtomicU64 = AtomicU64::new(0);
 
 /// A LAN device is online while it holds an open /events stream or made a
 /// paired request recently. Evidence writers (the only two):
 /// events()/PresenceGuard -> LAN_EVENTS_OPEN (paired only: /events itself is
-/// behind the gate), and log_requests, which stamps LAST_PAIRED_ACT for every
+/// behind the pairing gate), and log_requests, which stamps LAST_PAIRED_ACT for every
 /// response the pairing middleware did not refuse. Transfer bytes are not
 /// presence evidence either — byte stamps serve only the ledger prune.
 
@@ -29,8 +29,7 @@ pub(crate) static LAST_PAIRED_ACT: AtomicU64 = AtomicU64::new(0);
 /// serve as the permanent "never" sentinel for stamped values (LAST_PAIRED_ACT,
 /// DlProg::last_ts). With a 0-based clock, `now - 0` = uptime, which made a
 /// freshly started process read as "a device was seen PRESENCE_ACT_SECS ago":
-/// a phantom `device present` that latched the PC scan gate away before any
-/// phone ever connected (historically this also faked inbound-proof for the
+/// a phantom `device present` before any phone ever connected (historically this also faked inbound-proof for the
 /// firewall veto; that veto is removed — the flag is worker-verdict only). Every
 /// liveness stamp in the pipeline is only ever compared against a later
 /// `now_mono()`, so wall-clock jumps (NTP correction, manual clock change)
@@ -57,8 +56,8 @@ pub(crate) fn now_mono() -> u64 {
 ///                 PC scan gate), `events`/PresenceGuard -> LAN_EVENTS_OPEN
 ///                 (itself behind the pairing gate). The monitor is the
 ///                 single announcer of transitions.
-///                 Consumers are the PC scan gate's first-connect latch and
-///                 the transition logs — no UI light. Byte-flow evidence is
+///                 Consumers are the arrival toast and the transition logs —
+///                 no UI light. Byte-flow evidence is
 ///                 deliberately not folded in: byte stamps serve only the
 ///                 ledger prune, and the firewall flag is worker-verdict
 ///                 only.
@@ -109,8 +108,8 @@ pub(crate) static LAN_EVENTS_OPEN: AtomicU64 = AtomicU64::new(0);
 /// made a paired request within the last few seconds. "The phone can reach the
 /// server" is the question those two answers. Byte flow is not evidence: after
 /// the firewall's traffic veto was removed, nothing consumes byte stamps
-/// beyond the ledger prune. After the scan gate's first-connect latch fires,
-/// nothing consumes this bit behaviorally. See the KNOWN LIMITS in the
+/// beyond the ledger prune. After the first arrival toast, nothing consumes
+/// this bit behaviorally except the transition logs. See the KNOWN LIMITS in the
 /// LIVENESS block: optimistic under no-FIN death, and global rather than
 /// per-device.
 pub(crate) fn lan_peer_connected() -> bool {
@@ -120,8 +119,8 @@ pub(crate) fn lan_peer_connected() -> bool {
 
 /// Recent activity from a PAIRED LAN device: reads LAST_PAIRED_ACT, stamped
 /// only after the pairing gate let the request through. This is the stamp
-/// presence and the PC gate latch run on; unpaired 403 traffic must not lift
-/// the gate.
+/// presence and the arrival toast run on; unpaired 403 traffic must not fake
+/// an arrival.
 fn lan_paired_recently(secs: u64) -> bool {
     let last = LAST_PAIRED_ACT.load(Ordering::Relaxed);
     last != 0 && now_mono().saturating_sub(last) < secs

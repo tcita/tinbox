@@ -68,12 +68,21 @@ pub(crate) enum PushEvent {
     /// Firewall repair flag changed.
     Fw(bool),
     /// A LAN device connected/disconnected, or the server address changed.
-    /// Consumers: the PC scan gate's first-connect latch + URL display, and
+    /// Consumers: the PC arrival toast + URL display, and
     /// the presence logs. There is no ambient online/offline UI on either end
-    /// anymore (see the LIVENESS block — connectivity feedback is action-
+    /// (see the LIVENESS block — connectivity feedback is action-
     /// coupled), so a later `info` transition past the first connect only
     /// refreshes the shown address.
     Info { mobile_connected: bool, url: String },
+    /// A device just paired with a fresh `?t=` credential (QR scan or
+    /// hand-typed URL) and was issued the cookie. Fires exactly on the
+    /// pairing gesture — unlike `Info`, which is a sampled presence bit — so
+    /// already-connected pages can react at the moment of the scan (PC toast
+    /// + QR lightbox dismiss). The scanning page itself hasn't opened its SSE
+    /// stream yet, so it never sees its own event. Cookie replays take the
+    /// silent branch, and pages strip `?t=` once the cookie lands, so reloads
+    /// never re-fire either — server-side `?t=` means exactly one thing: a scan.
+    Paired,
     /// [LIVENESS/reconcile] The one catch-up event: "you may have missed
     /// pushes — re-fetch /dl-status and reconcile your mirror, so no corner
     /// freezes on a stale percent". The complete server trigger list:
@@ -152,7 +161,7 @@ async fn log_requests(
     if is_lan {
         // Stamped only when the pairing gate let the request through (a
         // refusal carries the marker and never reaches here). Presence and
-        // the PC gate latch must mean "a PAIRED device is alive": previously
+        // the arrival signal must mean "a PAIRED device is alive": previously
         // ONE stamp fed presence, and an expired tab (403 for everything)
         // visibly lifted the PC's QR gate into "Paired" by merely refetching
         // — the report that produced the paired-only stamp.
@@ -719,11 +728,12 @@ fn push_event_to_sse(ev: PushEvent) -> Event {
             }))
             .unwrap(),
         PushEvent::Resync => Event::default().event("resync").data("1"),
+        PushEvent::Paired => Event::default().event("paired").data("1"),
     }
 }
 
 /// The full pairing URL (best LAN IP + bound port + token): shown on the PC
-/// (header, gate, lightbox) and pushed in `info` events. The URL carries the
+/// (header, lightbox) and pushed in `info` events. The URL carries the
 /// pairing token, so scanning the QR and copy-pasting the address elsewhere
 /// are one and the same gesture. This is the ONE place the URL is assembled —
 /// netinfo's /qr route reuses it so the QR and the displayed address can never
@@ -737,7 +747,7 @@ pub(crate) fn current_url() -> String {
     format!("http://{}:{}/?t={}", ip, port, request_token())
 }
 
-/// Return the embedded app logo (header brand, connect gate emblem and
+/// Return the embedded app logo (header brand and
 /// favicon). Served as SVG, which stays crisp at any size.
 async fn logo() -> impl IntoResponse {
     (
