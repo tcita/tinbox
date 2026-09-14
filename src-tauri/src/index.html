@@ -340,6 +340,13 @@
   .msg.me .fc-ico {
     background: rgba(255, 255, 255, 0.2); color: #fff;
   }
+  /* Tombstone tile: the WHOLE icon block flips to danger, not just the caption —
+     caption color alone doesn't survive a glance (reported: tombstone reads
+     identical to a normal card). Same geometry, so list rhythm is untouched.
+     The .me override is required: tombstones are always own-side. */
+  .fc-ico.fail-ico { background: var(--danger-bg); color: var(--danger); }
+  .msg.me .fc-ico.fail-ico { background: var(--danger-bg); color: var(--danger); }
+  .fc-ico.fail-ico svg { width: 22px; height: 22px; display: block; }
   .fc-info { min-width: 0; flex: 1; }
   /* Icon rows (documents, video) carry an OVERLAID corner button
      (dlcardbtn / cardring, absolute top-right of the card), so the name line
@@ -393,6 +400,15 @@
   /* A file that is still uploading pulses gently (no numeric progress). */
   .file-card.pending { animation: pendingPulse 1.6s ease-in-out infinite; }
   @keyframes pendingPulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
+  /* Failure tombstone: a transfer the server never registered (client-side
+     only — nothing to sync). No pulse (nothing is moving), red caption, and
+     the corner slot becomes the dismiss ✕. The card is evidence, not a file:
+     pending guards already block preview/download/menu, so it cannot invite
+     a tap. Dismissed by the user, never auto-removed — a toast is transient
+     evidence, this is the persistent one. */
+  .file-card.pending.failed { animation: none; }
+  .fail-tag { color: var(--danger); font-weight: 700; }
+  .dlcardbtn.dismiss { font-size: 15px; }
 
   /* A file being pulled away (PC sender side) pulses the same way: the
      symmetric counterpart of the phone's own "uploading" pulse. It is not a
@@ -1144,6 +1160,7 @@ function buildMsg(it, animate){
       const card = document.createElement('div');
       card.className = 'file-card';
       if(it.pending){ card.dataset.pending = '1'; card.classList.add('pending'); }
+      if(it.failed) card.classList.add('failed');
       const isImg = !it.pending && isImgName(it.name);
       const isVid = !it.pending && isVidName(it.name);
 
@@ -1160,7 +1177,9 @@ function buildMsg(it, animate){
       // With the diff-render below a kept card never refetches; only a
       // genuine rebuild does. Undecodable formats (HEIC on old iOS) fail as
       // before: onerror drops the preview, the card falls back to its icon.
-      if(isImg || (isVid && it.poster)){
+      if(it.failed){
+        card.innerHTML = `<div class="fc-ico fail-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div>`;
+      } else if(isImg || (isVid && it.poster)){
         card.classList.add('has-preview');
         const img = document.createElement('img');
         // No onload hook: the innerRO gravity already re-pins on every image
@@ -1195,7 +1214,13 @@ function buildMsg(it, animate){
       info.innerHTML = '<div class="fc-name"></div><div class="fc-size"></div>';
       info.querySelector('.fc-name').textContent = it.name;
       info.querySelector('.fc-size').textContent = fmtSize(it.size) + mediaSuffix(it);
-      if(it.pending){
+      if(it.failed){
+        // Tombstone caption: red, terminal, side-specific. The card is evidence,
+        // not a file — the pending guards on every action below already strip
+        // preview/download/menu, so this branch only paints the words.
+        info.querySelector('.fc-size').innerHTML +=
+          ' · <span class="fail-tag">' + (it.from === 'pc' ? '导入失败' : '发送失败') + '</span>';
+      } else if(it.pending){
         // Caption by WHAT IS MOVING, not by sender alone: a pending
         // from="phone" row is bytes crossing Wi-Fi (发送 on the phone, 接收
         // on the PC); a pending from="pc" row is a LOCAL copy into the inbox
@@ -1215,7 +1240,31 @@ function buildMsg(it, animate){
       const btn = document.createElement('button');
       btn.className = 'dlcardbtn hidden';
       btn.type = 'button';
-      btn.onclick = (e) => { e.stopPropagation(); transferClick(it); };
+      if(it.failed){
+        // Tombstone dismiss: the corner slot becomes the ✕. Lifecycle is the
+        // user's — never auto-removed, and transferClick below would no-op on
+        // it anyway (pending guard), so bind dismiss directly.
+        btn.classList.remove('hidden');
+        btn.classList.add('dismiss');
+        btn.textContent = '✕';
+        btn.title = '关闭';
+        btn.onclick = (e) => {
+          e.stopPropagation();
+          const i = optUploads.findIndex(o => o.id === it.id);
+          if(i >= 0){
+            // Keep covering the dying server rows this tombstone was hiding,
+            // or they pop back as "发送中…" until the prune. Ids, not keys.
+            const o = optUploads[i];
+            for(const s of lastServer){
+              if(s.pending && tombKey(s.from, s.name, s.size) === tombKey(o.from, o.name, o.size)) dismissedIds.add(s.id);
+            }
+            optUploads.splice(i, 1);
+          }
+          reapply();
+        };
+      } else {
+        btn.onclick = (e) => { e.stopPropagation(); transferClick(it); };
+      }
       card.appendChild(btn);
       const ring = document.createElement('div');
       ring.className = 'cardring';
@@ -1423,27 +1472,72 @@ async function openDefault(it){
 // tools do not badge the sender's file with "downloaded at HH:MM" either —
 // receipt is the receiver's own UI to confirm. The download-done fact lives
 // in the server log only.
-// Optimistic upload cards: when the phone picks a file it appears immediately on
-// its own timeline as "Uploading…" before the server's pending row lands.
+// Optimistic cards with in-place death morph (client-side only — the server
+// has no rows for either state). A picked file paints immediately
+// ("Uploading…" on the phone, "复制中…" on the PC) before the server
+// round-trips; each real pending row covers exactly one card, counted per
+// name|size — the same file picked twice keeps its twin until the second row
+// lands. PC entries match by name only: an add-local path carries no size
+// until the server stats it. Death flags the card in place — same id, same
+// slot, no remove+add flicker — and the tombstone covers its dying server
+// row first (same count rule), so the dead row and the tombstone never stand
+// side by side. Both merge only on their own side.
 const optUploads = [];
 let optSeq = 0;
+// Match key shared by cover, coverage and dismiss (module scope so the dismiss
+// handler can find the same rows the merge hides).
+const tombKey = (from, name, size) => from + '|' + name + '|' + (from === 'pc' ? '' : size);
+// Dismissed tombstones keep covering by server row id: dismissing uncovers the
+// dying row the tombstone was hiding, and it would pop back as "发送中…" until
+// the 5s prune. By id, not by key — a future upload of the same file gets a
+// new id and must never be hidden. Self-cleaning: ids the server no longer
+// reports (pruned) or that graduated (pending false) are dropped on sight.
+const dismissedIds = new Set();
 function withOptimistic(serverItems){
-  if(isPC || !optUploads.length) return serverItems;
-  // Count real rows per name|size instead of a boolean: the same file can be
-  // picked twice in parallel, and each real pending row covers exactly one
-  // optimistic card — a boolean map would drop the twin's card the moment the
-  // first row lands.
-  const counts = {};
-  for(const it of serverItems) if(it.from === 'phone'){
-    const k = it.name + '|' + it.size;
-    counts[k] = (counts[k] || 0) + 1;
-  }
-  const out = serverItems.slice();
+  // Tombstone cover counts run first: a POST that died after its first bytes
+  // registered a pending row leaves it orphaned until the 5s prune. Consumed
+  // by count, so a live twin's row survives. Pending rows only: a graduated
+  // row always shows.
+  // Safe to do here: checkUploadGone/pruneTransfers below run on the raw
+  // server array, so hiding a row only changes paint, never refusal-abort or
+  // ledger mirrors.
+  const tombCover = {};
   for(const o of optUploads){
-    const k = o.name + '|' + o.size;
-    if(counts[k] > 0){ counts[k]--; continue; }   // a real row already covers it
-    out.push({ id: o.id, ts: String((o.at / 1000) | 0), from: 'phone', kind: 'file',
-      name: o.name, size: o.size, source_kind: 'remote', pending: true, text: '' });
+    if((o.from === 'pc') !== isPC || !o.failed) continue;
+    const k = tombKey(o.from, o.name, o.size);
+    tombCover[k] = (tombCover[k] || 0) + 1;
+  }
+  const serverIds = new Set(serverItems.map(it => it.id));
+  for(const id of dismissedIds) if(!serverIds.has(id)) dismissedIds.delete(id);
+  const live = serverItems.filter(it => {
+    if(!it.pending){ dismissedIds.delete(it.id); return true; }
+    if(dismissedIds.has(it.id)) return false;
+    const k = tombKey(it.from, it.name, it.size);
+    if(tombCover[k] > 0){ tombCover[k]--; return false; }
+    return true;
+  });
+  const out = live.slice();
+  if(optUploads.length){
+    const counts = {};
+    for(const it of live){
+      if(!it.pending) continue;
+      const k = tombKey(it.from, it.name, it.size);
+      counts[k] = (counts[k] || 0) + 1;
+    }
+    for(const o of optUploads){
+      if((o.from === 'pc') !== isPC) continue;
+      if(o.failed){
+        // Death morphed in place: same id the optimistic card had, so the
+        // diff-render keeps the node and only repaints it — a true morph.
+        out.push({ id: o.id, ts: String((o.at / 1000) | 0), from: o.from, kind: 'file',
+          name: o.name, size: o.size, source_kind: 'remote', pending: true, failed: true, text: '' });
+        continue;
+      }
+      const k = tombKey(o.from, o.name, o.size);
+      if(counts[k] > 0){ counts[k]--; continue; }   // a real row already covers it
+      out.push({ id: o.id, ts: String((o.at / 1000) | 0), from: o.from, kind: 'file',
+        name: o.name, size: o.size, source_kind: 'remote', pending: true, text: '' });
+    }
   }
   return out;
 }
@@ -1505,6 +1599,10 @@ function paintCorner(id){
   const ring = card.querySelector('.cardring');
   const btn = card.querySelector('.dlcardbtn');
   if(!ring || !btn) return;
+  // Tombstone owns its corner (dismiss ✕ bound at build): repaints must
+  // neither hide it nor paint transfer state over it.
+  const it0 = itemById(id);
+  if(it0 && it0.failed) return;
   let st = cornerState(id);
   // A completion that was already flashed is idle now, not a ring to re-show.
   if(st && st.done && doneIds[id]) st = null;
@@ -1837,7 +1935,7 @@ function fallbackName(f){
   return 'pasted-image.' + (m ? m[1].toLowerCase() : 'bin');
 }
 async function startUpload(f){
-  const opt = { id: 'opt-' + (++optSeq), name: f.name, size: f.size || 0, at: Date.now() };
+  const opt = { id: 'opt-' + (++optSeq), name: f.name || fallbackName(f), size: f.size || 0, from: isPC ? 'pc' : 'phone', at: Date.now() };
   // Draw the sending side's card immediately ("Uploading…") before the server
   // round-trips; withOptimistic() replaces it with the server's pending row as
   // soon as that arrives.
@@ -1855,28 +1953,66 @@ async function startUpload(f){
   const ac = new AbortController();
   const up = { ac, name: f.name, size: f.size || 0, seen: false };
   inFlightUploads.push(up);
-  const finish = () => {
+  // Death morphs the optimistic card in place (same id, same slot): success
+  // removes it, failure flags it into a tombstone. No remove+add flicker.
+  const finish = (ok) => {
     const i = inFlightUploads.indexOf(up);
     if(i >= 0) inFlightUploads.splice(i, 1);
-    const j = optUploads.indexOf(opt);
-    if(j >= 0) optUploads.splice(j, 1);
+    if(ok){
+      const j = optUploads.indexOf(opt);
+      if(j >= 0) optUploads.splice(j, 1);
+    } else {
+      opt.failed = true;
+    }
     reapply();
   };
   // One boolean for every cause: a receiver-side refusal tears the socket
   // down before the row-vanish list event can arrive, so the client genuinely
   // cannot tell a refused push from a WiFi drop — over-precise toasts only
-  // mislead (a refusal used to read "Network error"). The abort rejection and
-  // a hard network error both land in the same catch, so the old
-  // load/error/abort trio collapses into just success vs failure, and the
-  // batch summary toast lives in uploadFiles.
-  try {
-    const r = await api('/upload', { method:'POST', body: fd, query:{ size: f.size || 0 } });
-    finish();
-    return r.ok;
-  } catch {
-    finish();
-    return false;
-  }
+  // mislead (a refusal used to read "Network error"). Every ending collapses
+  // into just success vs failure, and the batch summary toast lives in
+  // uploadFiles.
+  // Transport is XHR, not fetch: fetch never settles on a half-open socket
+  // (WiFi dropped mid-POST — neither side errors), leaving the optimistic
+  // card pulsing forever. XHR upload progress resets an idle timer; silence
+  // past it aborts into the same failure path as everything else. Absolute
+  // timeouts would murder slow-but-healthy uploads, so only IDLENESS kills:
+  // bytes moving slowly still reset the clock. 30s: the server pruned at 5s
+  // of its own silence long ago — nothing recoverable is still alive over
+  // there; an elevator ride longer than this re-sends on return.
+  const ok = await new Promise((resolve) => {
+    let done = false;
+    let idleT = 0, respT = 0;
+    const settle = (v) => { if(!done){ done = true; clearTimeout(idleT); clearTimeout(respT); resolve(v); } };
+    const xhr = new XMLHttpRequest();
+    // Receiver-side refusal (checkUploadGone) rides the same abort handle.
+    ac.signal.addEventListener('abort', () => { try { xhr.abort(); } catch {} }, { once: true });
+    const armIdle = () => {
+      clearTimeout(idleT);
+      idleT = setTimeout(() => { try { xhr.abort(); } catch {} }, 30000);
+    };
+    armIdle();
+    xhr.upload.onprogress = () => armIdle();
+    xhr.upload.onload = () => {
+      // Body fully sent; the server answers immediately after receipt, so the
+      // wait from here is bounded — 30s without a status is death, not slowness.
+      clearTimeout(idleT);
+      respT = setTimeout(() => { try { xhr.abort(); } catch {} }, 30000);
+    };
+    xhr.onload = () => {
+      if(xhr.status === 403) pairExpiredNow();
+      settle(xhr.status >= 200 && xhr.status < 300);
+    };
+    xhr.onerror = () => settle(false);
+    xhr.onabort = () => settle(false);
+    xhr.ontimeout = () => settle(false);
+    xhr.open('POST', '/upload' + qs({ size: f.size || 0 }));
+    try { xhr.send(fd); } catch { settle(false); }
+  });
+  // Failure is judged here, all causes alike — network death, idle-timeout
+  // abort, refusal abort, HTTP error statuses. finish() morphs the card.
+  finish(ok);
+  return ok;
 }
 
 $('txt').addEventListener('input', () => { autoSize(); updateSendBtn(); });
@@ -1958,6 +2094,29 @@ async function addLocalPaths(paths){
     return !t || now - t > 5000;
   });
   if(!fresh.length) return;
+  // Optimistic "复制中…" cards, one per path: a big-file copy can take seconds
+  // and the timeline must not sit dead. Removed as one batch when this single
+  // round-trip resolves; name-based coverage graduates early arrivals with no
+  // flicker when the list push wins the race. Basename only: the size is
+  // unknowable on this side until the server stats it.
+  const base = p => p.split(/[\\/]/).pop() || p;
+  const batch = 'b' + (++optSeq);
+  for(const p of fresh) optUploads.push({ id: 'opt-' + (++optSeq), name: base(p), size: 0, from: 'pc', at: Date.now(), batch });
+  reapply();
+  const dropBatch = () => {
+    for(let i = optUploads.length - 1; i >= 0; i--) if(optUploads[i].batch === batch) optUploads.splice(i, 1);
+  };
+  // Request death (both attempts threw, or !ok): drop the batch, toast stays
+  // the signal. No tombstones on this side, deliberately: an import failure is
+  // either impossible (loopback POST cannot die while this page lives) or
+  // unattributable (the server never says WHICH sibling was skipped — and
+  // "added: 0" also means benign things like re-dragging an in-inbox file, so
+  // red would fire on non-failures). Toasts stay honest; tombstones stay on
+  // the phone, where one POST is one file and every failure attributes exactly.
+  const failBatch = () => {
+    dropBatch();
+    reapply();
+  };
   // The webview's fetch reuses pooled keep-alive sockets; after a long idle
   // the first POST can land in a socket the OS already dropped — "Failed to
   // fetch" with the request never reaching the server (the log proves it:
@@ -1975,11 +2134,13 @@ async function addLocalPaths(paths){
     try {
       r = await api('/add-local', { method:'POST', body:{ paths: fresh } });
     } catch {
+      failBatch();
       toast('添加失败');
       return;
     }
   }
-  if(!r.ok){ toast('添加失败'); return; }
+  if(!r.ok){ failBatch(); toast('添加失败'); return; }
+  dropBatch(); reapply();
   // Success reports its count: the server answers "added: N" (partial success
   // is normal — a locked/OneDrive-placeholder/missing source is skipped while
   // its siblings land, so N can be smaller than what was picked).
@@ -1988,8 +2149,14 @@ async function addLocalPaths(paths){
     const m = /added:\s*(\d+)/.exec(await r.text());
     if(m) n = parseInt(m[1], 10);
   } catch {}
-  // Failure-only: landed cards confirm success; toast only the shortfall.
-  if(n < fresh.length) toast(`导入成功 ${n}/${fresh.length} 个文件`);
+  if(fresh.length === 1 && n === 0){
+    // Single file, skipped: toast-only, never a tombstone — added:0 conflates
+    // genuine failure with benign skips (already-in-inbox re-drag most notably).
+    toast('添加失败');
+  } else if(n < fresh.length){
+    // Failure-only: landed cards confirm success; toast only the shortfall.
+    toast(`导入成功 ${n}/${fresh.length} 个文件`);
+  }
 }
 // Tauri fires tauri://drag-drop with the real paths in parallel with the HTML5
 // drop. Listening to it covers platforms where the File.path injection is

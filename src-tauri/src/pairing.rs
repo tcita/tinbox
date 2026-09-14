@@ -195,7 +195,7 @@ pub(crate) async fn require_token(
             SCAN_GLYPH,
             "tinbox — 请重新扫码连接",
             "请重新扫码连接",
-            "tinbox 每次启动配对都会更新，请重扫电脑上的二维码重新连接。",
+            "tinbox 每次启动配对都会更新,请点击电脑上的「连接手机」调出二维码,重新扫码连接。",
         )
     };
     let mut resp = (
