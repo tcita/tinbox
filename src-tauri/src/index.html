@@ -1977,7 +1977,7 @@ async function startUpload(f){
   // card pulsing forever. XHR upload progress resets an idle timer; silence
   // past it aborts into the same failure path as everything else. Absolute
   // timeouts would murder slow-but-healthy uploads, so only IDLENESS kills:
-  // bytes moving slowly still reset the clock. 30s: the server pruned at 5s
+  // bytes moving slowly still reset the clock. 15s: the server pruned at 5s
   // of its own silence long ago — nothing recoverable is still alive over
   // there; an elevator ride longer than this re-sends on return.
   const ok = await new Promise((resolve) => {
@@ -1989,15 +1989,15 @@ async function startUpload(f){
     ac.signal.addEventListener('abort', () => { try { xhr.abort(); } catch {} }, { once: true });
     const armIdle = () => {
       clearTimeout(idleT);
-      idleT = setTimeout(() => { try { xhr.abort(); } catch {} }, 30000);
+      idleT = setTimeout(() => { try { xhr.abort(); } catch {} }, 15000);
     };
     armIdle();
     xhr.upload.onprogress = () => armIdle();
     xhr.upload.onload = () => {
       // Body fully sent; the server answers immediately after receipt, so the
-      // wait from here is bounded — 30s without a status is death, not slowness.
+      // wait from here is bounded — 15s without a status is death, not slowness.
       clearTimeout(idleT);
-      respT = setTimeout(() => { try { xhr.abort(); } catch {} }, 30000);
+      respT = setTimeout(() => { try { xhr.abort(); } catch {} }, 15000);
     };
     xhr.onload = () => {
       if(xhr.status === 403) pairExpiredNow();
