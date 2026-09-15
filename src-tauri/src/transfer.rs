@@ -2,7 +2,8 @@
 // (serve: Range/ETag + per-request counters), /dl, /view, /dl-status,
 // /cancel, /rm, and the ledger (DlProg map + refused-push set) they share.
 // Push events ride crate::server::notifier; the catalog is the source of
-// truth; the transfer page's rings and pulses render what these counters say.
+// truth; the transfer page's receiver rings render what these counters say
+// (download counters feed the outcome log only).
 
 use crate::catalog;
 use crate::logger::{loge, logf, logw};
@@ -31,10 +32,7 @@ use tokio_util::io::ReaderStream;
 ///   - downloads are keyed by a unique per-request transfer id ("msg#n"), so
 ///     two concurrent pulls of the same file are two independent counters and
 ///     dropping one can never disturb the other. Download entries feed the
-///     outcome log, presence, and the sender-side DlState mirror (the PC's
-///     "being pulled" card pulse aggregates the incomplete entries of one
-///     message id — see msg_has_active_download), and are pruned by the
-///     monitor's time windows.
+///     outcome log only, and are pruned by the monitor's time windows.
 #[derive(Clone, Default)]
 pub(crate) struct DlProg {
     pub(crate) total: u64,
@@ -122,26 +120,6 @@ fn push_progress(
             sent: e.sent,
         });
     }
-}
-
-/// True while any download transfer of `msg_id` (entries keyed "msg#n") is
-/// still incomplete — the sender-side card pulse is the UNION of these: it
-/// stays lit until every concurrent pull of the file is done or reaped, so
-/// cancelling one of two parallel pulls never darkens the card while the
-/// other still runs. The caller already holds the dl_progress lock.
-fn msg_has_active_download(map: &std::collections::HashMap<String, DlProg>, msg_id: &str) -> bool {
-    let prefix = format!("{msg_id}#");
-    map.iter()
-        .any(|(k, e)| k.starts_with(&prefix) && e.total > 0 && e.sent < e.total)
-}
-
-/// Re-evaluate and push the DlState mirror for `msg_id`. Pushed on every
-/// transition point (pull registered, one pull completed/cut); a redundant
-/// same-state push is one tiny SSE event the frontend applies idempotently.
-/// The caller already holds the dl_progress lock.
-fn push_dl_state(map: &std::collections::HashMap<String, DlProg>, msg_id: &str) {
-    let active = msg_has_active_download(map, msg_id);
-    let _ = notifier().send(PushEvent::DlState { id: msg_id.to_string(), active });
 }
 
 /// Upload query: the sender's declared file size (drives the pending row's
@@ -522,12 +500,9 @@ fn mime_for(name: &str) -> String {
 /// surfaces a disconnect as the body being dropped, not as an error inside
 /// the stream, so a per-chunk error arm never sees it. The guard reaps THIS
 /// transfer's counter — its own per-request id, so a sibling pull of the same
-/// file is never touched — writes the outcome into the log, and re-evaluates
-/// the message's DlState mirror (the card pulse ends only when the LAST pull
-/// of the file ends).
+/// file is never touched — and writes the outcome into the log.
 struct StreamCutGuard {
     tid: String,
-    msg_id: String,
     name: String,
 }
 impl Drop for StreamCutGuard {
@@ -542,7 +517,6 @@ impl Drop for StreamCutGuard {
             let total = map.get(&self.tid).map(|e| e.total).unwrap_or(0);
             let start_ms = map.get(&self.tid).map(|e| e.start_ms).unwrap_or(0);
             map.remove(&self.tid);
-            push_dl_state(&map, &self.msg_id);
             drop(map);
             // Cuts of real size carry their achieved rate (same shape as the
             // completion `dl` line): an abort with a speed needs no follow-up
@@ -716,10 +690,9 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
     // Progress tracking: real downloads (not inline previews) register a
     // per-request transfer counter — a fresh unique id per /dl, so two
     // concurrent pulls of the same file are two independent entries and
-    // dropping one can never disturb the other. Per-byte progress is not
-    // pushed (the puller's browser owns that UI); what IS pushed is the
-    // aggregated DlState mirror, so the sending PC's card pulses while any
-    // pull of the file is being served.
+    // dropping one can never disturb the other. The counter feeds the
+    // outcome log only; per-byte progress is not pushed (the puller's
+    // browser owns that UI).
     let prog_id = if inline {
         None
     } else {
@@ -741,9 +714,6 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
             e.start_ms = now_ms();
             touch_entry(e);
         }
-        // The new pull makes the file "being served" (a fresh counter is
-        // incomplete by construction, so this is always a false->true flip).
-        push_dl_state(&map, &p.id);
         logf(&format!("download start {id}: {name} [{start}-{end}]/{len}"));
     }
     // Take() caps the read at the range end so a partial response carries
@@ -759,11 +729,10 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
     > = match &prog_id {
         Some(tid) => {
             let tid = tid.clone();
-            let msg_id = p.id.clone();
             let name = name.to_string();
             // Held for the stream's whole life: on drop (peer gone mid-transfer)
             // it reaps this transfer's counter and logs the outcome.
-            let cut = StreamCutGuard { tid: tid.clone(), msg_id: msg_id.clone(), name: name.clone() };
+            let cut = StreamCutGuard { tid: tid.clone(), name: name.clone() };
             // Stream-local byte count: this pull's authoritative sent figure,
             // independent of the shared counter's lifetime. The monitor reaps a
             // counter after 5s of silence (a paused puller reaped too); the
@@ -785,8 +754,7 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
                                 // count: the pull was silent past the monitor's
                                 // 5s window, the entry went away, and without
                                 // this rebuild the resumed stream would finish
-                                // uncounted — no done log, no dlstate flip,
-                                // and a wrong active-set for sibling pulls.
+                                // uncounted — no done log.
                                 logf(&format!(
                                     "download counter rebuilt {tid}: {sent}/{} bytes (was pruned while paused)",
                                     len
@@ -822,11 +790,6 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
                                 ));
                             }
                             logf(&format!("download done {tid}: {} bytes", e.sent));
-                            // This pull no longer counts as active; if it was
-                            // the LAST active pull of the file, end the
-                            // sender's card pulse. (A sibling pull still
-                            // mid-flight keeps the union lit.)
-                            push_dl_state(&map, &msg_id);
                         }
                     }
                     Err(err) => {

@@ -53,18 +53,8 @@ pub(crate) enum PushEvent {
     /// Upload progress for one pending row (throttled to ~1/s server-side; the
     /// final `sent >= total` tick fires immediately). Receiver-side only: the
     /// PC is the receiver of pushes and draws its ring from these; per-byte
-    /// download progress is still never pushed — the puller's browser owns
-    /// that UI. Download ACTIVITY is a coarser, separate event (DlState).
+    /// download progress is never pushed — the puller's browser owns that UI.
     Progress { id: String, total: u64, sent: u64 },
-    /// Sender-side download activity, aggregated per message id (the union of
-    /// its live per-request "msg#n" transfers): true while any pull of the
-    /// file is being served, false once none is. The PC pulses its card from
-    /// this — the symmetric counterpart of the sending phone's "Uploading…"
-    /// pulse — and deliberately paints no cancel affordance: a pull's cancel
-    /// belongs to the puller's browser, so this end gets no ✕, no percent and
-    /// no tap action. Hard-dead pulls are covered by the monitor's prune,
-    /// which broadcasts Resync for the reconcile path.
-    DlState { id: String, active: bool },
     /// Firewall repair flag changed.
     Fw(bool),
     /// A LAN device connected/disconnected, or the server address changed.
@@ -712,10 +702,6 @@ fn push_event_to_sse(ev: PushEvent) -> Event {
         PushEvent::Progress { id, total, sent } => Event::default()
             .event("progress")
             .json_data(serde_json::json!({ "id": id, "total": total, "sent": sent }))
-            .unwrap(),
-        PushEvent::DlState { id, active } => Event::default()
-            .event("dlstate")
-            .json_data(serde_json::json!({ "id": id, "active": active }))
             .unwrap(),
         PushEvent::Fw(need) => Event::default()
             .event("fw")

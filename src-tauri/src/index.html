@@ -340,13 +340,6 @@
   .msg.me .fc-ico {
     background: rgba(255, 255, 255, 0.2); color: #fff;
   }
-  /* Tombstone tile: the WHOLE icon block flips to danger, not just the caption —
-     caption color alone doesn't survive a glance (reported: tombstone reads
-     identical to a normal card). Same geometry, so list rhythm is untouched.
-     The .me override is required: tombstones are always own-side. */
-  .fc-ico.fail-ico { background: var(--danger-bg); color: var(--danger); }
-  .msg.me .fc-ico.fail-ico { background: var(--danger-bg); color: var(--danger); }
-  .fc-ico.fail-ico svg { width: 22px; height: 22px; display: block; }
   .fc-info { min-width: 0; flex: 1; }
   /* Icon rows (documents, video) carry an OVERLAID corner button
      (dlcardbtn / cardring, absolute top-right of the card), so the name line
@@ -400,21 +393,6 @@
   /* A file that is still uploading pulses gently (no numeric progress). */
   .file-card.pending { animation: pendingPulse 1.6s ease-in-out infinite; }
   @keyframes pendingPulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
-  /* Failure tombstone: a transfer the server never registered (client-side
-     only — nothing to sync). No pulse (nothing is moving), red caption, and
-     the corner slot becomes the dismiss ✕. The card is evidence, not a file:
-     pending guards already block preview/download/menu, so it cannot invite
-     a tap. Dismissed by the user, never auto-removed — a toast is transient
-     evidence, this is the persistent one. */
-  .file-card.pending.failed { animation: none; }
-  .fail-tag { color: var(--danger); font-weight: 700; }
-  .dlcardbtn.dismiss { font-size: 15px; }
-
-  /* A file being pulled away (PC sender side) pulses the same way: the
-     symmetric counterpart of the phone's own "uploading" pulse. It is not a
-     ring on purpose — the pull's cancel lives in the puller's browser, so
-     this end paints no ✕, no percent and no tap target. */
-  .file-card.downloading { animation: pendingPulse 1.6s ease-in-out infinite; }
 
   /* Fullscreen media preview (both ends, image/video) */
   .media-ov {
@@ -1071,9 +1049,8 @@ function applyListLive(items){
   checkUploadGone(items);
   pruneTransfers(items);
   // Repaint transfer state on every card: appended/rebuilt nodes lost their
-  // corner and pulse; kept nodes re-apply idempotently.
+  // corner; kept nodes re-apply idempotently.
   repaintTransfers();
-  repaintDownloads();
 }
 function reapply(){ lastList = ''; if(lastServer) applyList(lastServer); }
 let lastServer = [];
@@ -1094,8 +1071,7 @@ function pruneTransfers(items){
   for(const key of Object.keys(progCache)) if(!ids.has(key)) delete progCache[key];
   for(const key of Object.keys(doneIds))   if(!ids.has(key)) delete doneIds[key];
   for(const key of Object.keys(hideTimers)) if(!ids.has(key)){ clearTimeout(hideTimers[key]); delete hideTimers[key]; }
-  // No paint needed: the row is gone, so there is no card left to pulse.
-  for(const key of Object.keys(dlActive)) if(!ids.has(key)) delete dlActive[key];
+  for(const id of [...stalledRings]) if(!ids.has(id)) stalledRings.delete(id);
 }
 
 // Watch the server list for uploads the PC refused: each in-flight entry
@@ -1160,7 +1136,6 @@ function buildMsg(it, animate){
       const card = document.createElement('div');
       card.className = 'file-card';
       if(it.pending){ card.dataset.pending = '1'; card.classList.add('pending'); }
-      if(it.failed) card.classList.add('failed');
       const isImg = !it.pending && isImgName(it.name);
       const isVid = !it.pending && isVidName(it.name);
 
@@ -1177,9 +1152,7 @@ function buildMsg(it, animate){
       // With the diff-render below a kept card never refetches; only a
       // genuine rebuild does. Undecodable formats (HEIC on old iOS) fail as
       // before: onerror drops the preview, the card falls back to its icon.
-      if(it.failed){
-        card.innerHTML = `<div class="fc-ico fail-ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></div>`;
-      } else if(isImg || (isVid && it.poster)){
+      if(isImg || (isVid && it.poster)){
         card.classList.add('has-preview');
         const img = document.createElement('img');
         // No onload hook: the innerRO gravity already re-pins on every image
@@ -1214,13 +1187,7 @@ function buildMsg(it, animate){
       info.innerHTML = '<div class="fc-name"></div><div class="fc-size"></div>';
       info.querySelector('.fc-name').textContent = it.name;
       info.querySelector('.fc-size').textContent = fmtSize(it.size) + mediaSuffix(it);
-      if(it.failed){
-        // Tombstone caption: red, terminal, side-specific. The card is evidence,
-        // not a file — the pending guards on every action below already strip
-        // preview/download/menu, so this branch only paints the words.
-        info.querySelector('.fc-size').innerHTML +=
-          ' · <span class="fail-tag">' + (it.from === 'pc' ? '导入失败' : '发送失败') + '</span>';
-      } else if(it.pending){
+      if(it.pending){
         // Caption by WHAT IS MOVING, not by sender alone: a pending
         // from="phone" row is bytes crossing Wi-Fi (发送 on the phone, 接收
         // on the PC); a pending from="pc" row is a LOCAL copy into the inbox
@@ -1240,31 +1207,7 @@ function buildMsg(it, animate){
       const btn = document.createElement('button');
       btn.className = 'dlcardbtn hidden';
       btn.type = 'button';
-      if(it.failed){
-        // Tombstone dismiss: the corner slot becomes the ✕. Lifecycle is the
-        // user's — never auto-removed, and transferClick below would no-op on
-        // it anyway (pending guard), so bind dismiss directly.
-        btn.classList.remove('hidden');
-        btn.classList.add('dismiss');
-        btn.textContent = '✕';
-        btn.title = '关闭';
-        btn.onclick = (e) => {
-          e.stopPropagation();
-          const i = optUploads.findIndex(o => o.id === it.id);
-          if(i >= 0){
-            // Keep covering the dying server rows this tombstone was hiding,
-            // or they pop back as "发送中…" until the prune. Ids, not keys.
-            const o = optUploads[i];
-            for(const s of lastServer){
-              if(s.pending && tombKey(s.from, s.name, s.size) === tombKey(o.from, o.name, o.size)) dismissedIds.add(s.id);
-            }
-            optUploads.splice(i, 1);
-          }
-          reapply();
-        };
-      } else {
-        btn.onclick = (e) => { e.stopPropagation(); transferClick(it); };
-      }
+      btn.onclick = (e) => { e.stopPropagation(); transferClick(it); };
       card.appendChild(btn);
       const ring = document.createElement('div');
       ring.className = 'cardring';
@@ -1472,68 +1415,29 @@ async function openDefault(it){
 // tools do not badge the sender's file with "downloaded at HH:MM" either —
 // receipt is the receiver's own UI to confirm. The download-done fact lives
 // in the server log only.
-// Optimistic cards with in-place death morph (client-side only — the server
-// has no rows for either state). A picked file paints immediately
-// ("Uploading…" on the phone, "复制中…" on the PC) before the server
-// round-trips; each real pending row covers exactly one card, counted per
-// name|size — the same file picked twice keeps its twin until the second row
-// lands. PC entries match by name only: an add-local path carries no size
-// until the server stats it. Death flags the card in place — same id, same
-// slot, no remove+add flicker — and the tombstone covers its dying server
-// row first (same count rule), so the dead row and the tombstone never stand
-// side by side. Both merge only on their own side.
+// Optimistic cards (client-side only — the server has no rows for them).
+// A picked file paints immediately ("Uploading…" on the phone, "复制中…" on
+// the PC) before the server round-trips; each real pending row covers exactly
+// one card, counted per name|size — the same file picked twice keeps its twin
+// until the second row lands. PC entries match by name only: an add-local
+// path carries no size until the server stats it. Failure drops the card —
+// the batch summary toast is the signal. Both merge only on their own side.
 const optUploads = [];
 let optSeq = 0;
-// Match key shared by cover, coverage and dismiss (module scope so the dismiss
-// handler can find the same rows the merge hides).
-const tombKey = (from, name, size) => from + '|' + name + '|' + (from === 'pc' ? '' : size);
-// Dismissed tombstones keep covering by server row id: dismissing uncovers the
-// dying row the tombstone was hiding, and it would pop back as "发送中…" until
-// the 5s prune. By id, not by key — a future upload of the same file gets a
-// new id and must never be hidden. Self-cleaning: ids the server no longer
-// reports (pruned) or that graduated (pending false) are dropped on sight.
-const dismissedIds = new Set();
+// Match key for optimistic coverage (a real pending row hides one card).
+const optKey = (from, name, size) => from + '|' + name + '|' + (from === 'pc' ? '' : size);
 function withOptimistic(serverItems){
-  // Tombstone cover counts run first: a POST that died after its first bytes
-  // registered a pending row leaves it orphaned until the 5s prune. Consumed
-  // by count, so a live twin's row survives. Pending rows only: a graduated
-  // row always shows.
-  // Safe to do here: checkUploadGone/pruneTransfers below run on the raw
-  // server array, so hiding a row only changes paint, never refusal-abort or
-  // ledger mirrors.
-  const tombCover = {};
-  for(const o of optUploads){
-    if((o.from === 'pc') !== isPC || !o.failed) continue;
-    const k = tombKey(o.from, o.name, o.size);
-    tombCover[k] = (tombCover[k] || 0) + 1;
-  }
-  const serverIds = new Set(serverItems.map(it => it.id));
-  for(const id of dismissedIds) if(!serverIds.has(id)) dismissedIds.delete(id);
-  const live = serverItems.filter(it => {
-    if(!it.pending){ dismissedIds.delete(it.id); return true; }
-    if(dismissedIds.has(it.id)) return false;
-    const k = tombKey(it.from, it.name, it.size);
-    if(tombCover[k] > 0){ tombCover[k]--; return false; }
-    return true;
-  });
-  const out = live.slice();
+  const out = serverItems.slice();
   if(optUploads.length){
     const counts = {};
-    for(const it of live){
+    for(const it of serverItems){
       if(!it.pending) continue;
-      const k = tombKey(it.from, it.name, it.size);
+      const k = optKey(it.from, it.name, it.size);
       counts[k] = (counts[k] || 0) + 1;
     }
     for(const o of optUploads){
       if((o.from === 'pc') !== isPC) continue;
-      if(o.failed){
-        // Death morphed in place: same id the optimistic card had, so the
-        // diff-render keeps the node and only repaints it — a true morph.
-        out.push({ id: o.id, ts: String((o.at / 1000) | 0), from: o.from, kind: 'file',
-          name: o.name, size: o.size, source_kind: 'remote', pending: true, failed: true, text: '' });
-        continue;
-      }
-      const k = tombKey(o.from, o.name, o.size);
+      const k = optKey(o.from, o.name, o.size);
       if(counts[k] > 0){ counts[k]--; continue; }   // a real row already covers it
       out.push({ id: o.id, ts: String((o.at / 1000) | 0), from: o.from, kind: 'file',
         name: o.name, size: o.size, source_kind: 'remote', pending: true, text: '' });
@@ -1552,12 +1456,31 @@ function withOptimistic(serverItems){
 //               state at all — no rings, no mirrors, nothing to sync. Its own
 //               uploads are sender-side: the optimistic "Uploading…" card is
 //               the feedback, and completion arrives as the row turning real.
-// Sender-side feedback on the PC (a file being pulled away) is the coarser
-// DlState card pulse further down — deliberately not a ring, since this end
-// can neither see the pull's percent nor cancel it.
 const progCache = {};   // id -> {sent,total,t} latest server snapshot (uploads)
 const doneIds = {};     // transfers already flashed complete -> corner stays idle
 const hideTimers = {};  // per-id "hide the finished ring" timers
+// Local ring-idle fallback: the server prunes a silent transfer after 5s and
+// broadcasts `resync`, but a dead SSE delivers neither the ticks nor the
+// resync. The viewer therefore expires its own rings: no `progress` tick for
+// RING_IDLE_MS means "the bytes stopped (or I stopped hearing about them)" —
+// either way the ring must not freeze. 6s = 5s server window + 1s margin for
+// the 1s monitor tick, the ~1/s push throttle and SSE flight. Silent by
+// design (no toast): success/failure truth stays on the server row
+// (graduated vs gone); this only guarantees the corner never pollutes.
+// A fresh tick un-stalls instantly, so a slow-but-alive transfer re-lights.
+const RING_IDLE_MS = 6000;
+const stalledRings = new Set();
+function pruneIdleRings(){
+  if(!isPC) return;
+  const now = Date.now();
+  let changed = false;
+  for(const id of Object.keys(progCache)){
+    const p = progCache[id];
+    if(!p || p.sent >= p.total) continue;   // completion flashes via doneIds
+    if(now - p.t > RING_IDLE_MS && !stalledRings.has(id)){ stalledRings.add(id); changed = true; }
+  }
+  if(changed) for(const id of stalledRings) paintCorner(id);
+}
 function itemById(id){ for(const it of curItems) if(it.id === id) return it; return null; }
 const BTN_DL = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
 // The PC corner's idle occupant: reveal the file's folder — it is the file's
@@ -1581,6 +1504,7 @@ function cornerState(id){
   // draw nothing here — the puller's browser owns that UI — and the sending
   // phone draws nothing either (sender-side).
   if(!isPC || !it.pending) return null;
+  if(stalledRings.has(id)) return null;   // locally expired, see pruneIdleRings
   const prog = progCache[id];
   const total = (prog && prog.total) || it.size || 1;
   const sent = prog ? Math.min(prog.sent, total) : 0;
@@ -1599,10 +1523,6 @@ function paintCorner(id){
   const ring = card.querySelector('.cardring');
   const btn = card.querySelector('.dlcardbtn');
   if(!ring || !btn) return;
-  // Tombstone owns its corner (dismiss ✕ bound at build): repaints must
-  // neither hide it nor paint transfer state over it.
-  const it0 = itemById(id);
-  if(it0 && it0.failed) return;
   let st = cornerState(id);
   // A completion that was already flashed is idle now, not a ring to re-show.
   if(st && st.done && doneIds[id]) st = null;
@@ -1784,9 +1704,7 @@ function nativeDownload(it){
 
 // Transfer snapshots arrive as `progress` SSE events (~1/s per upload) and a
 // one-shot /dl-status resync on connect. Rings are receiver-side: the PC
-// applies pushes for the pending rows it is receiving; download progress is
-// never pushed (the puller's browser owns that UI) — the sending side's pull
-// feedback is the coarser DlState card pulse below.
+// applies pushes for the pending rows it is receiving.
 function syncProgress(list){
   if(!isPC) return;
   const now = Date.now();
@@ -1797,87 +1715,29 @@ function syncProgress(list){
     // place where the bytes land.
     if(!item || !item.pending) continue;
     progCache[d.id] = { sent: d.sent, total: d.total, t: now };
+    stalledRings.delete(d.id);   // slow-but-alive re-lights
     paintCorner(d.id);
   }
 }
 
-// ---- Sender-side download pulse (PC) --------------------------------------
-// While any pull of a file is being served, the sending PC pulses its card —
-// the symmetric counterpart of the sending phone's "Uploading…" pulse. The
-// mirror is deliberately NOT a ring: a pull's cancel belongs to the puller's
-// browser, so this end paints no ✕, no percent and no tap action — just
-// "bytes are moving to someone".
-//
-// Union rule: the card stays lit until EVERY per-request transfer ("msg#n")
-// of that file is complete or reaped, so cancelling one of two parallel pulls
-// never darkens it while the other still runs. Live state arrives as `dlstate`
-// SSE events (pushed at each transition: pull registered, one pull done or
-// cut); a /dl-status snapshot rebuilds the whole set on (re)connect and on
-// every `resync` — which is also the convergence path for a hard-dead pull
-// (socket hung, no FIN): its entry lingers until the monitor's 5s silence
-// prune, whose resync turns the pulse off then.
-const dlActive = {};   // msg id -> some download of it is being served
-function syncDlState(id, active){
-  if(!isPC) return;
-  if(active) dlActive[id] = true; else delete dlActive[id];
-  paintDl(id);
-}
-// Rebuild the mirror from a /dl-status snapshot. Entries keyed "msg#n" are
-// download transfers (uploads are keyed by their plain message id); an entry
-// is active while incomplete — completed entries linger 15s in the snapshot
-// and must not count.
-function rebuildDlMirror(snap){
-  if(!isPC) return;
-  const active = {};
-  for(const d of snap){
-    const h = d.id.indexOf('#');
-    if(h < 0) continue;                          // an upload counter, not a pull
-    if(d.total > 0 && d.sent < d.total) active[d.id.slice(0, h)] = true;
-  }
-  for(const id of Object.keys(dlActive)) if(!active[id]){ delete dlActive[id]; paintDl(id); }
-  for(const id of Object.keys(active)) if(!dlActive[id]){ dlActive[id] = true; paintDl(id); }
-}
-function paintDl(id){
-  const card = document.querySelector('.msg[data-id="'+id+'"] .file-card');
-  if(!card) return;
-  const on = !!dlActive[id];
-  card.classList.toggle('downloading', on);
-  // Caption parity with the pending cards: "Uploading…"/"Receiving…" get one,
-  // so "Sending…" rides the same fc-size line. The base text is cached on the
-  // node; render() writes it fresh on every rebuild, so the cache never goes
-  // stale.
-  const size = card.querySelector('.fc-size');
-  if(size){
-    if(size.dataset.base === undefined) size.dataset.base = size.textContent;
-    size.textContent = on ? size.dataset.base + ' · 发送中…' : size.dataset.base;
-  }
-}
-// render() rebuilt the DOM and wiped the pulse classes; re-apply from the
-// mirror. Runs right after repaintTransfers in applyList.
-function repaintDownloads(){
-  for(const it of curItems) if(it.kind === 'file') paintDl(it.id);
-}
-
 // Fetch the server's live-transfer snapshot, apply it, then reconcile the
 // local mirrors with it: refresh counters for rows the server is still
-// receiving, drop mirror state for ids it no longer tracks, and rebuild the
-// download-pulse set. The server pushes nothing on a refused push or a
-// dead-transfer prune — it broadcasts `resync` instead — so this reconcile is
-// what lets a corner (and a pulse) return to idle instead of freezing on its
-// last value forever.
+// receiving, drop mirror state for ids it no longer tracks. The server
+// pushes nothing on a refused push or a dead-transfer prune — it broadcasts
+// `resync` instead — so this reconcile is what lets a corner return to idle
+// instead of freezing on its last value forever.
 async function resyncProgress(){
   let snap;
   try { snap = await (await api('/dl-status')).json(); } catch { return; }
   snap = snap || [];
   syncProgress(snap);
   reconcileMirrors(snap);
-  rebuildDlMirror(snap);
   repaintTransfers();
-  repaintDownloads();
 }
 function reconcileMirrors(snap){
   const known = new Set(snap.map(d => d.id));
   for(const id of Object.keys(progCache)) if(!known.has(id) && !doneIds[id]) delete progCache[id];
+  for(const id of [...stalledRings]) if(known.has(id)) stalledRings.delete(id);
 }
 
 // Double-submit guard: the button used to stay enabled and the input uncleared
@@ -1953,17 +1813,13 @@ async function startUpload(f){
   const ac = new AbortController();
   const up = { ac, name: f.name, size: f.size || 0, seen: false };
   inFlightUploads.push(up);
-  // Death morphs the optimistic card in place (same id, same slot): success
-  // removes it, failure flags it into a tombstone. No remove+add flicker.
+  // Success and failure both drop the optimistic card: success is replaced
+  // by the server's real row, failure by the batch summary toast.
   const finish = (ok) => {
     const i = inFlightUploads.indexOf(up);
     if(i >= 0) inFlightUploads.splice(i, 1);
-    if(ok){
-      const j = optUploads.indexOf(opt);
-      if(j >= 0) optUploads.splice(j, 1);
-    } else {
-      opt.failed = true;
-    }
+    const j = optUploads.indexOf(opt);
+    if(j >= 0) optUploads.splice(j, 1);
     reapply();
   };
   // One boolean for every cause: a receiver-side refusal tears the socket
@@ -1977,9 +1833,10 @@ async function startUpload(f){
   // card pulsing forever. XHR upload progress resets an idle timer; silence
   // past it aborts into the same failure path as everything else. Absolute
   // timeouts would murder slow-but-healthy uploads, so only IDLENESS kills:
-  // bytes moving slowly still reset the clock. 15s: the server pruned at 5s
-  // of its own silence long ago — nothing recoverable is still alive over
-  // there; an elevator ride longer than this re-sends on return.
+  // bytes moving slowly still reset the clock. 8s: the server kills at 5s of
+  // its own silence — nothing recoverable is still alive over there, and 3s
+  // of margin covers the 1s monitor tick plus retransmit jitter; an elevator
+  // ride longer than this re-sends on return.
   const ok = await new Promise((resolve) => {
     let done = false;
     let idleT = 0, respT = 0;
@@ -1989,15 +1846,15 @@ async function startUpload(f){
     ac.signal.addEventListener('abort', () => { try { xhr.abort(); } catch {} }, { once: true });
     const armIdle = () => {
       clearTimeout(idleT);
-      idleT = setTimeout(() => { try { xhr.abort(); } catch {} }, 15000);
+      idleT = setTimeout(() => { try { xhr.abort(); } catch {} }, 8000);
     };
     armIdle();
     xhr.upload.onprogress = () => armIdle();
     xhr.upload.onload = () => {
       // Body fully sent; the server answers immediately after receipt, so the
-      // wait from here is bounded — 15s without a status is death, not slowness.
+      // wait from here is bounded — 8s without a status is death, not slowness.
       clearTimeout(idleT);
-      respT = setTimeout(() => { try { xhr.abort(); } catch {} }, 15000);
+      respT = setTimeout(() => { try { xhr.abort(); } catch {} }, 8000);
     };
     xhr.onload = () => {
       if(xhr.status === 403) pairExpiredNow();
@@ -2010,7 +1867,7 @@ async function startUpload(f){
     try { xhr.send(fd); } catch { settle(false); }
   });
   // Failure is judged here, all causes alike — network death, idle-timeout
-  // abort, refusal abort, HTTP error statuses. finish() morphs the card.
+  // abort, refusal abort, HTTP error statuses. finish() drops the card.
   finish(ok);
   return ok;
 }
@@ -2107,12 +1964,10 @@ async function addLocalPaths(paths){
     for(let i = optUploads.length - 1; i >= 0; i--) if(optUploads[i].batch === batch) optUploads.splice(i, 1);
   };
   // Request death (both attempts threw, or !ok): drop the batch, toast stays
-  // the signal. No tombstones on this side, deliberately: an import failure is
-  // either impossible (loopback POST cannot die while this page lives) or
-  // unattributable (the server never says WHICH sibling was skipped — and
-  // "added: 0" also means benign things like re-dragging an in-inbox file, so
-  // red would fire on non-failures). Toasts stay honest; tombstones stay on
-  // the phone, where one POST is one file and every failure attributes exactly.
+  // the signal. An import failure is either impossible (loopback POST cannot
+  // die while this page lives) or unattributable (the server never says WHICH
+  // sibling was skipped — and "added: 0" also means benign things like
+  // re-dragging an in-inbox file). Toasts stay honest.
   const failBatch = () => {
     dropBatch();
     reapply();
@@ -2150,7 +2005,7 @@ async function addLocalPaths(paths){
     if(m) n = parseInt(m[1], 10);
   } catch {}
   if(fresh.length === 1 && n === 0){
-    // Single file, skipped: toast-only, never a tombstone — added:0 conflates
+    // Single file, skipped: toast-only — added:0 conflates
     // genuine failure with benign skips (already-in-inbox re-drag most notably).
     toast('添加失败');
   } else if(n < fresh.length){
@@ -2304,13 +2159,6 @@ function connect(){
   es.onmessage = () => { lastSeen = Date.now(); };
   es.addEventListener('list', e => { lastSeen = Date.now(); applyList(JSON.parse(e.data)); });
   es.addEventListener('progress', e => { lastSeen = Date.now(); syncProgress([JSON.parse(e.data)]); });
-  // Sender-side pull activity (PC only): the card pulse tracks the union of
-  // the file's live per-request transfers.
-  es.addEventListener('dlstate', e => {
-    lastSeen = Date.now();
-    const d = JSON.parse(e.data);
-    syncDlState(d.id, d.active);
-  });
   // A `resync` means this client fell behind and may have dropped pushes (see
   // PushEvent::Resync for the full trigger list). Re-fetch BOTH the file list
   // and the transfer mirrors so nothing stays stale.
@@ -2393,7 +2241,8 @@ function reconcile(){
 // named event also proves the link alive (see lastSeen above), so >3s of total
 // silence with the channel NOT already failing means the socket is half-open —
 // EventSource will never notice on its own. Force a fresh connection; its
-// `open` replays state.
+// `open` replays state. The same tick expires stale rings (see
+// pruneIdleRings) — no extra timer, one 1s loop covers both.
 setInterval(() => {
   if(pairExpired) return;
   if(!esDown && lastSeen && Date.now() - lastSeen > 3000){
@@ -2401,6 +2250,7 @@ setInterval(() => {
     try { es.close(); } catch {}
     connect();
   }
+  pruneIdleRings();
 }, 1000);
 
 // A backgrounded phone/browser can have its EventSource suspended (Chrome keeps
