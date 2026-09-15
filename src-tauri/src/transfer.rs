@@ -271,6 +271,16 @@ pub(crate) async fn upload(
             }
         };
         let write_result = match write_result {
+            // Declared-size check (?size=, always sent by our own page): the
+            // body looked complete (clean FIN) but carried fewer — or more —
+            // bytes than the sender's File.size. Graduate nothing: the Err
+            // arm below drops the row + partial file and logs both numbers,
+            // so a truncation surfaces as "传输失败" instead of a
+            // normal-looking but short card. size == 0 means unknown (old
+            // client), skip the check rather than fail everything.
+            Ok(()) if size > 0 && total != size => Err(format!(
+                "size mismatch: got {total} expected {size}"
+            )),
             Ok(()) => match tokio::fs::rename(&stored, &final_path).await {
                 Ok(()) => Ok(()),
                 // Graduation failed (file locked by AV/backup): the bytes may
