@@ -2326,6 +2326,16 @@ if(isPC){
   // a page almost no identity chrome of its own, so the header logo is the
   // only branding surface there.
   document.querySelector('.brand').style.display = 'none';
+  // The hidden brand leaves .head-actions the sole visible child of the
+  // space-between bar — it would sit left with a dead void on the right.
+  // Split the entry from the tools instead: inbox/clear stay left, the
+  // connect pill docks right as a DIRECT child of the bar, so space-between
+  // spreads the two groups (an auto margin inside .head-actions cannot work:
+  // a sole flex item shrink-wraps, the free space lives in the parent).
+  // Phone keeps the joined order; its bar is hidden anyway, and a desktop
+  // LAN browser keeps brand + group.
+  document.querySelector('.head').appendChild($('connectBtn'));
+  document.querySelector('.head-sep').style.display = 'none';
   // No connect gate: the timeline paints on the first list, paired or not.
   // Pairing is enforced per request by the server's token middleware, so the
   // page never needs to wait for (or block on) a device. The header QR stays
