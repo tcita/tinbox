@@ -1837,16 +1837,24 @@ async function startUpload(f){
   // its own silence — nothing recoverable is still alive over there, and 3s
   // of margin covers the 1s monitor tick plus retransmit jitter; an elevator
   // ride longer than this re-sends on return.
+  let responseTimedOut = false;
   const ok = await new Promise((resolve) => {
     let done = false;
     let idleT = 0, respT = 0;
     const settle = (v) => { if(!done){ done = true; clearTimeout(idleT); clearTimeout(respT); resolve(v); } };
     const xhr = new XMLHttpRequest();
+    // Do not rely on a later `onabort` dispatch to close the Promise: the
+    // watchdog exists precisely so a browser/WebView edge case cannot leave
+    // the optimistic card alive forever.
+    const failAndAbort = () => {
+      try { xhr.abort(); } catch {}
+      settle(false);
+    };
     // Receiver-side refusal (checkUploadGone) rides the same abort handle.
-    ac.signal.addEventListener('abort', () => { try { xhr.abort(); } catch {} }, { once: true });
+    ac.signal.addEventListener('abort', failAndAbort, { once: true });
     const armIdle = () => {
       clearTimeout(idleT);
-      idleT = setTimeout(() => { try { xhr.abort(); } catch {} }, 8000);
+      idleT = setTimeout(failAndAbort, 8000);
     };
     armIdle();
     xhr.upload.onprogress = () => armIdle();
@@ -1854,7 +1862,7 @@ async function startUpload(f){
       // Body fully sent; the server answers immediately after receipt, so the
       // wait from here is bounded — 8s without a status is death, not slowness.
       clearTimeout(idleT);
-      respT = setTimeout(() => { try { xhr.abort(); } catch {} }, 8000);
+      respT = setTimeout(() => { responseTimedOut = true; failAndAbort(); }, 8000);
     };
     xhr.onload = () => {
       if(xhr.status === 403) pairExpiredNow();
@@ -1869,6 +1877,10 @@ async function startUpload(f){
   // Failure is judged here, all causes alike — network death, idle-timeout
   // abort, refusal abort, HTTP error statuses. finish() drops the card.
   finish(ok);
+  // The request body may have reached disk even though its final HTTP response
+  // was lost. Do one non-blocking list/status pass in that ambiguous case;
+  // normal failures keep their existing behavior and cause no extra request.
+  if(!ok && responseTimedOut) reconcile();
   return ok;
 }
 
