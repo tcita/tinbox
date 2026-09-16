@@ -870,7 +870,7 @@ const IMG_EXTS = ['jpg','jpeg','png','gif','webp','heic','bmp','svg'];
 const VID_EXTS = ['mp4','mov','m4v','avi','mkv','webm'];
 const isImgName = n => IMG_EXTS.includes((n.split('.').pop()||'').toLowerCase());
 const isVidName = n => VID_EXTS.includes((n.split('.').pop()||'').toLowerCase());
-// Every HTTP call to the local server goes through api(): the method, query
+// Every HTTP call to the local server goes through serverFetch(): the method, query
 // and body conventions live in exactly one place instead of a bespoke fetch
 // per handler. Returns the raw Response, so each caller keeps its own .ok /
 // .json() / .text() semantics and its own error policy (toast, swallow or
@@ -891,7 +891,7 @@ function pairExpiredNow(){
   try { es.close(); } catch {}
   location.reload();
 }
-async function api(path, { method = 'GET', query, body, signal } = {}){
+async function serverFetch(path, { method = 'GET', query, body, signal } = {}){
   const init = { method, signal };
   if(body !== undefined){
     init.body = body instanceof FormData ? body : JSON.stringify(body);
@@ -995,7 +995,7 @@ async function copyText(it){
 // showed three copy fetches, zero failures reported, empty pastes. One
 // path, one writer, always a file.
 async function copyFile(it){
-  const r = await api('/copy-file', { method:'POST', query:{ id: it.id } });
+  const r = await serverFetch('/copy-file', { method:'POST', query:{ id: it.id } });
   toast(r.ok ? '文件已复制' : '复制失败');
 }
 // No confirmation dialog: window.confirm is broken inside the Tauri WebView
@@ -1003,13 +1003,13 @@ async function copyFile(it){
 // the old guard never blocked anything anyway). Delete is a deliberate
 // context-menu action; the toast reports the outcome.
 async function delItem(it){
-  const res = await api('/rm', { method:'POST', query:{ id: it.id } });
+  const res = await serverFetch('/rm', { method:'POST', query:{ id: it.id } });
   // Failure-only like sends: the vanishing card confirms success.
   if(!res.ok) toast('删除失败');
   refresh();
 }
 async function revealItem(it){
-  const res = await api('/reveal', { method:'POST', query:{ id: it.id } });
+  const res = await serverFetch('/reveal', { method:'POST', query:{ id: it.id } });
   if(!res.ok) toast('文件不存在');
 }
 function hideCtxMenu(){ $('ctxMenu').classList.remove('show'); }
@@ -1058,7 +1058,7 @@ let lastServer = [];
 // driven by EventSource (onopen/onerror), not by fetch failures.
 async function refresh(){
   try {
-    applyList(await (await api('/list')).json());
+    applyList(await (await serverFetch('/list')).json());
   } catch {}
 }
 
@@ -1402,7 +1402,7 @@ function render(items){
 }
 
 async function openDefault(it){
-  const res = await api('/open', { method:'POST', query:{ id: it.id } });
+  const res = await serverFetch('/open', { method:'POST', query:{ id: it.id } });
   if(!res.ok) toast('文件不存在');
 }
 
@@ -1610,7 +1610,7 @@ function transferClick(it){
 // and the partial file) and we clear the local mirror so the ring vanishes
 // right away.
 async function stopTransfer(id){
-  try { await api('/cancel', { method:'POST', query:{ id } }); } catch {}
+  try { await serverFetch('/cancel', { method:'POST', query:{ id } }); } catch {}
   clearMirror(id);
 }
 // Drop this end's mirror of one transfer (counter, flash timers).
@@ -1728,7 +1728,7 @@ function syncProgress(list){
 // instead of freezing on its last value forever.
 async function resyncProgress(){
   let snap;
-  try { snap = await (await api('/dl-status')).json(); } catch { return; }
+  try { snap = await (await serverFetch('/dl-status')).json(); } catch { return; }
   snap = snap || [];
   syncProgress(snap);
   reconcileMirrors(snap);
@@ -1752,7 +1752,7 @@ function sendText(){
   const text = t.value.trim();
   if(!text) return;
   sending = true; updateSendBtn();
-  api('/send-text', { method:'POST', body:{ text } }).then(r => {
+  serverFetch('/send-text', { method:'POST', body:{ text } }).then(r => {
     sending = false;
     if(r.ok){ t.value = ''; autoSize(); updateSendBtn(); }
     else { updateSendBtn(); toast('发送失败'); }
@@ -1914,7 +1914,7 @@ $('txt').addEventListener('keydown', e => {
 $('send').onclick = sendText;
 
 $('inboxBtn').onclick = () => {
-  api('/open-dir', {method:'POST'}).catch(()=>toast('无法打开收件箱'));
+  serverFetch('/open-dir', {method:'POST'}).catch(()=>toast('无法打开收件箱'));
 };
 
 // Clear-all lives in the header, so it is PC-only the same way the inbox and
@@ -1926,7 +1926,7 @@ $('clearCancel').onclick = () => { $('clearOverlay').classList.remove('show'); }
 $('clearConfirm').onclick = async () => {
   $('clearOverlay').classList.remove('show');
   try {
-    const r = await api('/rm-all', {method:'POST'});
+    const r = await serverFetch('/rm-all', {method:'POST'});
     toast(r.ok ? '已清空' : '清空失败');
   } catch { toast('清空失败'); }
   refresh();
@@ -1992,14 +1992,14 @@ async function addLocalPaths(paths){
   // did. Still loud after: a real failure toasts twice as hard.
   let r;
   try {
-    r = await api('/add-local', { method:'POST', body:{ paths: fresh } });
+    r = await serverFetch('/add-local', { method:'POST', body:{ paths: fresh } });
   } catch {
     // The one observable trace of this bug class: count every silent retry
     // in the server log, so the stale-socket phenomenon goes from folklore
     // to a measurable frequency (the pool's own internals emit no events).
     reportClientError('add-local: first attempt failed to fetch (likely stale pooled socket), retrying');
     try {
-      r = await api('/add-local', { method:'POST', body:{ paths: fresh } });
+      r = await serverFetch('/add-local', { method:'POST', body:{ paths: fresh } });
     } catch {
       failBatch();
       toast('添加失败');
@@ -2290,7 +2290,7 @@ function applyFw(needRepair){
     // landed. The success toast lives HERE, not in the repair click: the
     // repair return only means "UAC granted", the confirmation is this
     // transition.
-    api('/untop', {method:'POST'}).catch(()=>{});
+    serverFetch('/untop', {method:'POST'}).catch(()=>{});
     toast('网络访问已恢复');
   }
   fwWasShown = show;
@@ -2300,7 +2300,7 @@ $('fwRepair').onclick = async () => {
   $('fwQuit').disabled = true;
   $('fwHint').textContent = '请在弹窗中确认管理员授权(UAC)…';
   try {
-    const r = await api('/repair', {method:'POST'});
+    const r = await serverFetch('/repair', {method:'POST'});
     const txt = await r.text();
     if(txt.trim() === 'ok'){
       // The launcher is spawned — the UAC prompt (if any) is on screen now.
@@ -2317,7 +2317,7 @@ $('fwRepair').onclick = async () => {
   $('fwRepair').disabled = false;
   $('fwQuit').disabled = false;
 };
-$('fwQuit').onclick = () => { api('/quit', {method:'POST'}).catch(()=>{}); };
+$('fwQuit').onclick = () => { serverFetch('/quit', {method:'POST'}).catch(()=>{}); };
 
 // QR lightbox: the small header QR opens a large scan-ready version on click.
 // Closing is explicit — the card's ✕ button or the Escape key; the backdrop
@@ -2365,9 +2365,9 @@ if(isPC){
 let clientLogSeq = 0;
 function reportClientError(msg){
   const tag = '#' + (++clientLogSeq) + ' ' + msg;
-  api('/log', { method:'POST', body:{ msg: tag } }).catch(() => {
+  serverFetch('/log', { method:'POST', body:{ msg: tag } }).catch(() => {
     setTimeout(() => {
-      api('/log', { method:'POST', body:{ msg: tag + ' (retry)' } }).catch(()=>{});
+      serverFetch('/log', { method:'POST', body:{ msg: tag + ' (retry)' } }).catch(()=>{});
     }, 1000);
   });
 }
