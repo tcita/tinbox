@@ -2140,12 +2140,12 @@ $('clearConfirm').onclick = async () => {
     const r = await serverFetch('/rm-all', {method:'POST'});
     if(!r.ok){ toast('清空失败'); }
     else {
-      // Server answers "cleared:<gone>:<kept>" — kept files (over-quota or
-      // bin errors) stay fully intact for Explorer; name the count, not names.
+      // Server answers "cleared:<gone>:<kept>" — leftovers are exactly the
+      // files the bin couldn't take; no names, no counts, just the pointer.
       let msg = '已清空';
       try {
         const m = /^cleared:(\d+):(\d+)$/.exec((await r.text()).trim());
-        if(m && +m[2] > 0) msg = +m[1] > 0 ? `部分清空，${m[2]} 个需手动删除` : '过大或回收站拒收，请去收件箱手动删除';
+        if(m && +m[2] > 0) msg = '部分未清空，请手动删除剩余文件';
       } catch {}
       toast(msg);
     }
