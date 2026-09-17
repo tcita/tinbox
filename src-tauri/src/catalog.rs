@@ -330,12 +330,18 @@ pub fn save() {
 pub fn reconcile() {
     let dir = inbox_dir();
     let mut on_disk: Vec<(PathBuf, String)> = Vec::new();
+    let mut skipped_dirs = 0usize;
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().to_string();
             let Ok(meta) = e.metadata() else { continue };
-            // Inbox is a flat landing zone: no recursion, no dot-dirs.
+            // Inbox is a flat landing zone: no recursion, no dot-dirs. A
+            // hand-dropped subfolder is ignored whole (its files are never
+            // adopted) — counted here so the log says so instead of silence.
             if !meta.is_file() || name.starts_with('.') {
+                if meta.is_dir() && !name.starts_with('.') {
+                    skipped_dirs += 1;
+                }
                 continue;
             }
             // Kill the sentinel-named residue before it can be mistaken for
@@ -432,6 +438,12 @@ pub fn reconcile() {
             "catalog: reconciled with inbox — {adopted} adopted, {dropped} dangling record(s) dropped"
         ));
         save();
+    }
+    if skipped_dirs > 0 {
+        crate::logger::logf(&format!(
+            "catalog: ignored {skipped_dirs} subdirector{} in inbox (flat layout — files inside are not indexed)",
+            if skipped_dirs == 1 { "y" } else { "ies" }
+        ));
     }
 }
 
