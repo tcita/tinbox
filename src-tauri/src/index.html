@@ -2334,6 +2334,11 @@ async function addLocalPaths(paths){
   } else if(n < fresh.length){
     // Failure-only: landed cards confirm success; toast only the shortfall.
     toast(`导入成功 ${n}/${fresh.length} 个文件`);
+  } else if(n > fresh.length){
+    // A dropped folder expands server-side (collect_files flattens it — the
+    // inbox keeps no hierarchy), so one drag lands N cards. Name the count:
+    // otherwise "dragged 1, got N" reads as a bug.
+    toast(`导入 ${n} 个文件`);
   }
 }
 // Tauri fires tauri://drag-drop with the real paths in parallel with the HTML5
