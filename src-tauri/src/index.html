@@ -103,18 +103,80 @@
   .brand-icon img { width: 20px; height: 20px; display: block; }
   .head-actions { display: flex; align-items: center; gap: 10px; }
 
-  #inboxBtn, #clearBtn {
+  #inboxBtn, #settingsBtn {
     border: 1px solid var(--line); background: var(--card); color: var(--text);
     width: 32px; height: 32px; border-radius: 10px;
     display: flex; align-items: center; justify-content: center;
     cursor: pointer; transition: all 0.2s var(--ease-out);
     box-shadow: 0 1px 3px rgba(0,0,0,0.04);
   }
-  #inboxBtn:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
+  #inboxBtn:hover, #settingsBtn:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
   /* Destructive trails neutral: the trash hovers danger-red, never the
      inviting accent blue — a tap here must feel warned, not welcomed. */
-  #clearBtn:hover { border-color: var(--danger); color: var(--danger); transform: translateY(-1px); }
-  #inboxBtn:active, #clearBtn:active { transform: scale(0.95); }
+  #inboxBtn:active, #settingsBtn:active { transform: scale(0.95); }
+  /* Settings is a small control panel: actions live beside the value they
+     affect, while operational details stay visually secondary. */
+  #settingsOverlay .fw-card { max-width: 470px; padding: 0; overflow: hidden; text-align: left; }
+  .st-head { display: flex; align-items: center; gap: 12px; padding: 22px 22px 18px; border-bottom: 1px solid var(--line); }
+  .st-head .fw-icon { width: 42px; height: 42px; border-radius: 13px; margin: 0; flex: none; }
+  .st-title-wrap { min-width: 0; flex: 1; }
+  .st-title { font-size: 18px; font-weight: 700; letter-spacing: -0.35px; }
+  .st-x {
+    width: 32px; height: 32px; padding: 0; border: 0; border-radius: 9px; background: transparent;
+    color: var(--sub); display: grid; place-items: center; cursor: pointer; transition: all .15s ease;
+  }
+  .st-x:hover { background: var(--card-subtle); color: var(--text); }
+  .st-body { padding: 16px 22px 6px; }
+  .st-section { margin-bottom: 14px; }
+  .st-section-title { margin: 0 0 7px; font-size: 12px; font-weight: 650; color: var(--sub); letter-spacing: .15px; }
+  .st-panel { border: 1px solid var(--line); border-radius: 14px; background: var(--card-subtle); overflow: hidden; }
+  .st-location { padding: 13px; }
+  .st-path {
+    font-family: ui-monospace, Consolas, monospace; font-size: 12px; line-height: 1.35; color: var(--text);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
+  }
+  .st-path-row { display: flex; align-items: center; gap: 12px; }
+  .st-change {
+    flex: none; border: 1px solid var(--line-strong); background: var(--card); color: var(--accent);
+    border-radius: 9px; padding: 7px 10px; font: 600 12px inherit; cursor: pointer; transition: all .15s ease;
+  }
+  .st-change:hover { border-color: var(--accent); background: var(--accent-bg); }
+  .st-impact { display: flex; align-items: flex-start; gap: 7px; margin-top: 11px; font-size: 12px; color: var(--sub); line-height: 1.4; }
+  .st-impact svg { color: var(--accent); flex: none; margin-top: 1px; }
+  .radio-row { display: block; }
+  .radio-row button {
+    position: relative; display: block; width: 100%; min-height: 0; padding: 13px 42px 13px 44px;
+    border: 0; background: transparent; color: var(--text); font: inherit; text-align: left;
+    cursor: pointer; transition: background .15s ease;
+  }
+  .radio-row button + button { border-top: 1px solid var(--line); }
+  .radio-row button:hover { background: rgba(127,127,127,.06); }
+  .radio-row button.sel { background: var(--accent-bg); }
+  .radio-row button .dot {
+    position: absolute; top: 50%; left: 14px; width: 17px; height: 17px; border: 2px solid var(--sub); border-radius: 50%;
+    transform: translateY(-50%);
+  }
+  .radio-row button.sel .dot { border-color: var(--accent); }
+  .radio-row button.sel .dot::after { content: ''; position: absolute; inset: 2px; border-radius: 50%; background: var(--accent); }
+  .st-option-title { display: block; margin-bottom: 3px; font-size: 13px; font-weight: 650; }
+  .st-danger-section { padding-top: 4px; border-top: 1px solid var(--line); }
+  .st-danger-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 13px; }
+  .st-danger-copy { min-width: 0; }
+  .st-danger-title { font-size: 13px; font-weight: 650; color: var(--text); }
+  .st-danger-desc { margin-top: 3px; font-size: 11.5px; line-height: 1.35; color: var(--sub); }
+  .st-danger-btn {
+    flex: none; border: 1px solid rgba(255,59,48,.35); border-radius: 9px; padding: 7px 10px;
+    background: var(--card); color: var(--danger); font: 600 12px inherit; cursor: pointer; transition: all .15s ease;
+  }
+  .st-danger-btn:hover { border-color: var(--danger); background: var(--danger-bg); }
+  .st-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 22px 18px; }
+  .fw-hint.st-hint { flex: 1; margin: 0; text-align: right; }
+  @media (max-width: 430px) {
+    #settingsOverlay { padding: 12px; }
+    .st-head { padding: 18px 18px 15px; }
+    .st-body { padding: 14px 18px 4px; }
+    .st-footer { padding: 8px 18px 15px; }
+  }
 
   /* Primary connect entry (PC): a labeled pill, not a bare QR tile — a 28px
      code is unscannable anyway, its only job was click-to-enlarge, and an
@@ -607,6 +669,9 @@
     padding: 20px;
   }
   .fw-overlay.show { display: flex; }
+  /* Clear confirmation can be opened from Settings, which is later in the
+     document; it must sit above that parent surface rather than behind it. */
+  #clearOverlay { z-index: 350; }
   .fw-card {
     background: var(--card); border-radius: 24px; padding: 28px 24px 22px;
     max-width: 360px; width: 100%; text-align: center;
@@ -687,8 +752,8 @@
     <button id="inboxBtn" title="打开收件箱">
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
     </button>
-    <button id="clearBtn" title="清空全部消息">
-      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+    <button id="settingsBtn" title="设置">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
     </button>
   </div>
 </div>
@@ -741,12 +806,47 @@
     <div class="fw-icon">
       <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
     </div>
-    <div class="fw-title">清空全部消息？</div>
+    <div class="fw-title">清空全部内容？</div>
     <div class="fw-desc">将删除全部文字与文件记录，收件箱内的文件移入回收站；过大或回收站拒收的文件会保留，此操作不可撤销。</div>
     <div class="fw-btns">
       <button class="fw-btn quit" id="clearCancel">取消</button>
       <button class="fw-btn danger" id="clearConfirm">清空</button>
     </div>
+  </div>
+</div>
+
+<!-- Settings (PC): the header gear opens this card. Guests never see it —
+     the whole .head bar is hidden for them — and the endpoints refuse guests. -->
+<div class="fw-overlay" id="settingsOverlay">
+  <div class="fw-card">
+    <header class="st-head">
+      <div class="fw-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg></div>
+      <div class="st-title-wrap"><div class="st-title">设置</div></div>
+      <button class="st-x" id="stClose" title="关闭设置" aria-label="关闭设置"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="m6 6 12 12M18 6 6 18"/></svg></button>
+    </header>
+    <div class="st-body">
+      <section class="st-section">
+        <h2 class="st-section-title">收件箱位置</h2>
+        <div class="st-panel st-location">
+          <div class="st-path-row"><div class="st-path" id="stPath" title="">…</div><button class="st-change" id="stChange">更改位置</button></div>
+          <div class="st-impact"><svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10" fill="currentColor"/><path d="M12 6.8v6.4m0 3.9h.01" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/></svg><span>更改后需重启应用生效。</span></div>
+        </div>
+      </section>
+      <section class="st-section">
+        <h2 class="st-section-title">关闭窗口时</h2>
+        <div class="st-panel radio-row" id="stCloseRadio">
+          <button data-v="tray"><span class="dot"></span><span class="st-option-title">最小化到托盘</span></button>
+          <button data-v="quit"><span class="dot"></span><span class="st-option-title">直接退出</span></button>
+        </div>
+      </section>
+      <section class="st-section st-danger-section">
+        <div class="st-panel st-danger-row">
+          <div class="st-danger-copy"><div class="st-danger-title">删除全部文字与文件记录</div>
+          <button class="st-danger-btn" id="clearBtn">清空</button>
+        </div>
+      </section>
+    </div>
+    <footer class="st-footer"><div class="fw-hint st-hint" id="stHint"></div></footer>
   </div>
 </div>
 
@@ -2126,12 +2226,64 @@ $('inboxBtn').onclick = () => {
   serverFetch('/open-dir', {method:'POST'}).catch(()=>toast('无法打开收件箱'));
 };
 
-// Clear-all lives in the header, so it is owner-only the same way the inbox and
-// QR tiles are (the whole bar hides on coarse pointers); the backend enforces
-// owner-only again like /rm. Double-submit is harmless by construction: the
-// second POST finds an empty index and answers "nothing to delete".
+// Clear-all lives in the owner-only settings panel; the backend enforces the
+// same owner boundary again like /rm. Double-submit is harmless by construction:
+// the second POST finds an empty index and answers "nothing to delete".
 $('clearBtn').onclick = () => { $('clearOverlay').classList.add('show'); };
 $('clearCancel').onclick = () => { $('clearOverlay').classList.remove('show'); };
+// Settings (PC, owner-only like inbox/clear — guests have no .head at all).
+// The directory switch applies on restart: in-flight uploads and the in-memory
+// catalog hold the old absolute paths, so live-switching would split one
+// session across two folders. Save records the path; the card keeps showing
+// it until the user quits via the tray and relaunches.
+$('settingsBtn').onclick = openSettings;
+$('stClose').onclick = () => { $('settingsOverlay').classList.remove('show'); };
+async function openSettings(){
+  $('settingsOverlay').classList.add('show');
+  $('stHint').textContent = '';
+  $('stPath').textContent = '…';
+  try {
+    const r = await serverFetch('/settings');
+    if(!r.ok) throw 0;
+    const s = await r.json();
+    $('stPath').textContent = s.inbox_dir;
+    $('stPath').title = s.inbox_dir;
+    if(!s.is_default) $('stHint').textContent = '已使用自定义位置';
+    paintCloseRadio(s.close_behavior || 'tray');
+  } catch { $('stPath').textContent = '读取失败'; }
+}
+function paintCloseRadio(v){
+  document.querySelectorAll('#stCloseRadio button').forEach(b =>
+    b.classList.toggle('sel', b.dataset.v === v));
+}
+$('stCloseRadio').onclick = async (e) => {
+  const b = e.target.closest('button'); if(!b) return;
+  try {
+    const r = await serverFetch('/settings/close-behavior', { method:'POST', body:{ behavior: b.dataset.v } });
+    if(!r.ok) throw 0;
+    paintCloseRadio((await r.json()).close_behavior);
+  } catch { toast('保存失败'); }
+};
+$('stChange').onclick = async () => {
+  // Native picker, server-driven (works from the webview and a loopback
+  // desktop browser alike). Cancel resolves null — silent return, same as
+  // the file picker in pickLocal.
+  let dir = null;
+  try {
+    const r = await serverFetch('/settings/pick-dir', { method:'POST' });
+    if(!r.ok) throw 0;
+    dir = (await r.json()).path;
+  } catch { toast('打开选择器失败'); return; }
+  if(!dir) return;
+  try {
+    const r = await serverFetch('/settings/inbox-dir', { method:'POST', body:{ path: dir } });
+    if(!r.ok){ toast(await r.text() || '保存失败'); return; }
+    const s = await r.json();
+    $('stPath').textContent = s.inbox_dir;
+    $('stPath').title = s.inbox_dir;
+    $('stHint').textContent = '已保存，重启应用后生效';
+  } catch { toast('保存失败'); }
+};
 $('clearConfirm').onclick = async () => {
   $('clearOverlay').classList.remove('show');
   try {
@@ -2562,7 +2714,7 @@ function closeQrLightbox(){ $('qrLightbox').classList.remove('show'); }
 $('connectBtn').onclick = openQrLightbox;
 $('qlClose').onclick = closeQrLightbox;
 document.addEventListener('keydown', e => {
-  if(e.key === 'Escape'){ closeQrLightbox(); $('clearOverlay').classList.remove('show'); }
+  if(e.key === 'Escape'){ closeQrLightbox(); $('clearOverlay').classList.remove('show'); $('settingsOverlay').classList.remove('show'); }
 });
 
 if(isOwner){

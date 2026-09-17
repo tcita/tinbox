@@ -8,6 +8,7 @@ mod netinfo;
 mod pairing;
 mod presence;
 mod server;
+mod settings;
 mod transfer;
 
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
@@ -41,18 +42,27 @@ fn create_main_window<R: tauri::Runtime>(
     // the drop, so no navigation to the file.
     .build()?;
 
-    // Close (x) DESTROYS the window instead of quitting: the LAN server (and
+    // Close (x) defaults to tray-hide instead of quitting: the LAN server (and
     // its pairing token) is process-lifetime, so a quit-on-close would force
     // the phone to rescan on every window reopen — while a merely hidden
     // webview keeps its renderer alive at ~hundreds of MB. Destroying frees
     // the whole WebView2 tree; the page is a stateless view (state replays
     // over /events on reload), so rebuilding later is cheap. Quitting stays
-    // explicit via the tray menu / repair overlay.
+    // explicit via the tray menu / repair overlay — or the close-behavior
+    // setting below, which quits outright on close when the user asks for it.
     #[cfg(desktop)]
     {
         let doomed = window.clone();
         window.on_window_event(move |event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
+                // User setting, read live (no restart needed): quit outright,
+                // or the default tray-hide above. exit() surfaces as
+                // ExitRequested with a code, which the run hook lets through.
+                if !crate::settings::close_to_tray() {
+                    crate::logger::logf("window close: quitting by user setting");
+                    doomed.app_handle().exit(0);
+                    return;
+                }
                 api.prevent_close();
                 let _ = doomed.destroy();
                 crate::logger::logf(

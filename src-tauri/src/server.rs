@@ -12,6 +12,7 @@ use crate::desktop::{copy_file, open_dir, open_file, reveal};
 use crate::logger::{loge, logf, logw};
 use crate::netinfo::{collect_ips, note_foreign_subnet, qr};
 use crate::pairing::{request_token, require_token, UNPAIRED_MARKER};
+use crate::settings::{get_settings, open_data_dir, pick_dir, set_close_behavior, set_inbox_dir};
 use crate::presence::{
     lan_peer_connected, monitor_loop, now_mono, LAST_PAIRED_ACT, LAN_EVENTS_OPEN,
     SSE_HEARTBEAT_SECS,
@@ -249,7 +250,11 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 crate::logger::data_root().display()
             ));
 
-            // Inbox directory (under the data root); ensure it exists on first run.
+            // User settings first: the inbox directory override must be known
+            // before inbox_dir() is touched anywhere below.
+            crate::settings::load();
+
+            // Inbox directory (default or custom); ensure it exists on first run.
             if let Err(e) = std::fs::create_dir_all(catalog::inbox_dir()) {
                 loge(&format!("could not create inbox directory: {}", e));
             }
@@ -312,6 +317,11 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 .route("/repair", post(repair))
                 .route("/quit", post(quit))
                 .route("/untop", post(untop))
+                .route("/settings", get(get_settings))
+                .route("/settings/pick-dir", post(pick_dir))
+                .route("/settings/open-data-dir", post(open_data_dir))
+                .route("/settings/close-behavior", post(set_close_behavior))
+                .route("/settings/inbox-dir", post(set_inbox_dir))
                 // Inner-to-outer: token gate first, access log outermost (the
                 // log must also see refused requests).
                 .layer(from_fn(require_token))

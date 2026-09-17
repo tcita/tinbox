@@ -176,7 +176,9 @@ fn exe_parent() -> PathBuf {
 }
 
 pub fn inbox_dir() -> PathBuf {
-    crate::logger::data_root().join("inbox")
+    // User-overridable (settings.json); every caller funnels through here so
+    // a custom directory moves uploads, adds, reconcile and open-dir together.
+    crate::settings::effective_inbox_dir()
 }
 
 pub fn catalog_path() -> PathBuf {
