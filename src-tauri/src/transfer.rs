@@ -1,6 +1,6 @@
 // Byte-transfer machinery: the upload endpoint, the shared file dispatch
 // (serve: Range/ETag + per-request counters), /dl, /view, /dl-status,
-// /cancel, /rm, and the ledger (DlProg map + refused-push set) they share.
+// /cancel, /rm, and the ledger (DlProg map + stopped-push set) they share.
 // Push events ride crate::server::notifier; the catalog is the source of
 // truth; the transfer page's receiver rings render what these counters say
 // (download counters feed the outcome log only).
@@ -32,7 +32,9 @@ use tokio_util::io::ReaderStream;
 ///   - downloads are keyed by a unique per-request transfer id ("msg#n"), so
 ///     two concurrent pulls of the same file are two independent counters and
 ///     dropping one can never disturb the other. Download entries feed the
-///     outcome log only, and are pruned by the monitor's time windows.
+///     outcome log plus the PC's outgoing ring (the server's "served" truth;
+///     the pulling phone ignores these), and are pruned by the monitor's
+///     time windows.
 #[derive(Clone, Default)]
 pub(crate) struct DlProg {
     pub(crate) total: u64,
@@ -67,10 +69,10 @@ fn touch_entry(e: &mut DlProg) {
     e.last_ts = now_mono();
 }
 
-/// Ids of uploads the PC (receiver) refused via /cancel. The upload writer
-/// polls this on every chunk and tears down when it sees its id, dropping the
-/// pending row and the partial file. Only uploads can be refused: pulls are
-/// the puller's business — their only cancel is the receiver's own browser UI.
+/// Ids of uploads stopped via /cancel. The upload writer polls this on every
+/// chunk and tears down when it sees its id, dropping the pending row and
+/// the partial file. Only uploads can be stopped: pulls are the puller's
+/// business — their only cancel is the receiver's own browser UI.
 static CANCELLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 fn cancelled() -> &'static Mutex<HashSet<String>> {
     CANCELLED.get_or_init(|| Mutex::new(HashSet::new()))
@@ -756,32 +758,33 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
                 match &chunk {
                     Ok(b) => {
                         sent += b.len() as u64;
-                        let mut map = dl_lock();
-                        let e = match map.get_mut(&tid) {
-                            Some(e) => e,
-                            None => {
-                                // Re-seed a pruned counter from the stream's own
-                                // count: the pull was silent past the monitor's
-                                // 5s window, the entry went away, and without
-                                // this rebuild the resumed stream would finish
-                                // uncounted — no done log.
-                                logf(&format!(
-                                    "download counter rebuilt {tid}: {sent}/{} bytes (was pruned while paused)",
-                                    len
-                                ));
-                                let e = map.entry(tid.clone()).or_default();
-                                e.total = len;
-                                e.sent = sent;
-                                // Fresh entry, fresh clock: the rate a resumed
-                                // pull reports is post-resume, not whole-life.
-                                e.start_ms = now_ms();
-                                touch_entry(e);
-                                map.get_mut(&tid).unwrap()
-                            }
-                        };
-                        e.sent = sent;
-                        touch_entry(e);
-                        if e.sent >= e.total && e.total > 0 {
+                        let done = {
+                            let mut map = dl_lock();
+                            let e = match map.get_mut(&tid) {
+                                Some(e) => e,
+                                None => {
+                                    // Re-seed a pruned counter from the stream's own
+                                    // count: the pull was silent past the monitor's
+                                    // 5s window, the entry went away, and without
+                                    // this rebuild the resumed stream would finish
+                                    // uncounted — no done log.
+                                    logf(&format!(
+                                        "download counter rebuilt {tid}: {sent}/{} bytes (was pruned while paused)",
+                                        len
+                                    ));
+                                    let e = map.entry(tid.clone()).or_default();
+                                    e.total = len;
+                                    e.sent = sent;
+                                    // Fresh entry, fresh clock: the rate a resumed
+                                    // pull reports is post-resume, not whole-life.
+                                    e.start_ms = now_ms();
+                                    touch_entry(e);
+                                    map.get_mut(&tid).unwrap()
+                                }
+                            };
+                            e.sent = sent;
+                            touch_entry(e);
+                            if e.sent >= e.total && e.total > 0 {
                             // Completion throughput, measured here and not in
                             // a stream wrapper: hyper drops the body once
                             // Content-Length is satisfied WITHOUT a final
@@ -800,6 +803,19 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
                                 ));
                             }
                             logf(&format!("download done {tid}: {} bytes", e.sent));
+                            }
+                            e.sent >= e.total && e.total > 0
+                        };
+                        // Outgoing progress for the PC's download ring: what this
+                        // end believes it has served. Throttled ~1/s per pull,
+                        // forced on completion. Keyed by per-request tid
+                        // ("card#n"); the PC strips the suffix to find its card
+                        // and takes the max across concurrent pulls of one file.
+                        // The pulling phone ignores these — its own downloader
+                        // owns that UI.
+                        {
+                            let mut map = dl_lock();
+                            push_progress(&mut map, &tid, now_ms(), done);
                         }
                     }
                     Err(err) => {
@@ -990,19 +1006,37 @@ pub(crate) async fn dl_status() -> impl IntoResponse {
     Json(items)
 }
 
-/// Refuse an incoming upload (receiver-side cancel). Only the PC can do this —
-/// it is the device receiving the push. The id is flagged so the in-flight
-/// upload writer tears down on its next chunk; the pending row and the partial
-/// file are removed right away, so the sending phone (which sees its row
-/// vanish and aborts) is not left streaming into nothing. Downloads have no
-/// server-side cancel at all: the puller's own browser UI is that cancel.
+/// Stop an in-flight upload. Two cases share the endpoint (guests are NOT
+/// distinguished from each other — single-user assumption, see pairing):
+///   - sender-side abort: the sending phone drops its OWN pending push
+///     (its optimistic card's ✕ aborts locally first, then hits this so the
+///     server's pending row + partial file die at once instead of waiting out
+///     the 5s upload-silence timeout);
+///   - owner stop: the PC drops any pending push (retained for compat; the PC
+///     page no longer offers a refuse button — stopping is the sender's job).
+/// A guest may only stop a pending from="guest" row (never the owner's local
+/// copy, never a graduated file — that stays /rm, owner-only). Missing ids
+/// answer OK so a double-stop is idempotent.
+/// Downloads have no server-side cancel at all: the puller's own browser UI
+/// is that cancel.
 pub(crate) async fn cancel(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(p): Query<IdParam>,
 ) -> impl IntoResponse {
-    if from_by_peer(peer) != "owner" {
-    logw(&format!("cancel: rejected stop request from guest id={}", p.id));
-    return (StatusCode::FORBIDDEN, "guest cannot stop transfers").into_response();
+    let is_owner = from_by_peer(peer) == "owner";
+    if !is_owner {
+        match catalog::find(&p.id) {
+            Some(e) if e.pending && e.from == "guest" => {}
+            Some(_) => {
+                logw(&format!("cancel: rejected stop request from guest id={}", p.id));
+                return (StatusCode::FORBIDDEN, "guest cannot stop transfers").into_response();
+            }
+            None => {
+                // Already gone (aborted + reaped, or optimistic-only abort that
+                // never made a row): idempotent OK, nothing to tear down.
+                return (StatusCode::OK, "gone").into_response();
+            }
+        }
     }
     cancel_lock().insert(p.id.clone());
     // Remove the pending row and best-effort the partial file. If the writer
@@ -1022,7 +1056,11 @@ pub(crate) async fn cancel(
     // then push the corrected list.
     dl_lock().remove(&p.id);
     let _ = notifier().send(PushEvent::List(catalog::all_items()));
-    logf(&format!("cancel {}: upload refused", p.id));
+    logf(&format!(
+        "cancel {}: upload stopped by {}",
+        p.id,
+        if is_owner { "receiver" } else { "sender" }
+    ));
     (StatusCode::OK, "stopped").into_response()
 }
 

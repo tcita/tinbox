@@ -293,17 +293,25 @@
   .dlcardbtn svg { width: 14px; height: 14px; display: block; }
   .dlcardbtn.hidden { display: none; }
   .msg.me .dlcardbtn { background: rgba(0,0,0,0.45); }
-  /* Corner transfer ring, drawn like a browser's download chip: a thin accent
-     arc sweeping clockwise from 12 o'clock (SVG, round caps, animates between
-     the ~1/s ticks) on a dark disc. The center carries STATE, not decoration:
-     a big ✕ — this end is the receiver and this is its refuse affordance, the
-     whole 30px circle the tap target — and a green check flashed at
-     completion. No percentage is painted; the number lives in the tooltip. */
+  /* Corner transfer ring, drawn like a browser's download chip: a thin arc
+     sweeping clockwise from 12 o'clock (SVG, round caps, animates between
+     ticks) on a dark disc. The disc is dark in both color schemes, so arcs
+     are picked for luminance on near-black, not for theme hue: sky blue for
+     uploads (incoming + sender's own), orange (.out) for outgoing pulls,
+     green for the completion flash. Each end draws from its own local truth,
+     never synced: the PC mirrors received bytes (`progress` pushes) for
+     incoming pushes and served bytes (per-request `card#n` pushes, maxed per
+     card) for outgoing pulls; the sending phone mirrors handed-to-socket
+     bytes (XHR `upload.onprogress`). The sender's ring center carries ✕
+     (its stop affordance, same tap target); PC rings show the live percent
+     in the center instead of sitting empty. The number in the title stays
+     as backup. */
+  .cardring .cr-arc.out { stroke: #ff9f0a; stroke-width: 3.5; }
   .cardring {
     position: absolute; top: 8px; right: 8px; z-index: 4;
     width: 30px; height: 30px; border-radius: 50%;
     display: none; align-items: center; justify-content: center;
-    background: rgba(0,0,0,0.6);
+    background: rgba(0,0,0,0.68);
     box-shadow: 0 1px 4px rgba(0,0,0,0.28);
     backdrop-filter: blur(4px); -webkit-backdrop-filter: blur(4px);
   }
@@ -311,22 +319,26 @@
     position: absolute; inset: 0; width: 100%; height: 100%;
     transform: rotate(-90deg);
   }
-  .cardring .cr-track { fill: none; stroke: rgba(255,255,255,0.22); stroke-width: 3; }
+  .cardring .cr-track { fill: none; stroke: rgba(255,255,255,0.28); stroke-width: 3.5; }
   .cardring .cr-arc {
-    fill: none; stroke: var(--accent); stroke-width: 3; stroke-linecap: round;
+    fill: none; stroke: #7cc4ff; stroke-width: 3.5; stroke-linecap: round;
     stroke-dasharray: 0 100; transition: stroke-dasharray .35s ease;
   }
   .cardring.p0 .cr-arc { display: none; }
   .cardring.done .cr-arc { stroke: #30d158; }
   .cardring .cr-glyph { position: relative; color: #fff; display: flex; }
   .cardring .cr-glyph svg { width: 13px; height: 13px; display: block; }
-  .cardring .cr-glyph.stop { font-size: 13px; font-weight: 600; line-height: 1; }
+  .cardring .cr-glyph.cancel { font-size: 13px; font-weight: 600; line-height: 1; }
+  /* Live percent in the disc center (PC rings): the disc used to hold an ✕
+     button, now it holds data instead of empty dark — same white-on-dark in
+     both schemes, tabular digits so 7%→100% doesn't jitter. */
+  .cardring .cr-glyph.pct { font-size: 9px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
   .cardring.show { display: flex; }
-  /* Same 44px invisible hit zone as the corner button: the ring IS the stop
-     affordance and stops are urgent — a near-miss must widen into the ring,
-     never fall through to the card beneath (preview/navigation instead of
-     a stop). Painting nothing, like the button's halo. */
-  .cardring::before {
+  /* The sender's ring IS its stop affordance — a near-miss must widen into
+     the ring, never fall through to the card beneath (preview/navigation
+     instead of a stop). The PC ring is progress-only and needs no halo. */
+  .cardring.canstop { cursor: pointer; }
+  .cardring.canstop::before {
     content: ''; position: absolute; inset: -7px; border-radius: 50%;
   }
   /* A transferring upload card stops its idle pulse so the ring is the only
@@ -802,7 +814,7 @@ const isWebview = !!(window.__TAURI__ && window.__TAURI__.event);
 const me = isOwner ? 'owner' : 'guest';
 // The phone's in-flight uploads (downloads are native and out of reach). One
 // entry per in-flight request: parallel uploads each keep their own
-// peer-refusal detection, so refusing the older of two concurrent pushes still
+// row-vanish detection, so stopping the older of two concurrent pushes still
 // aborts the right stream instead of reporting a late generic failure.
 const inFlightUploads = [];
 
@@ -1089,13 +1101,17 @@ function pruneTransfers(items){
   for(const key of Object.keys(doneIds))   if(!ids.has(key)) delete doneIds[key];
   for(const key of Object.keys(hideTimers)) if(!ids.has(key)){ clearTimeout(hideTimers[key]); delete hideTimers[key]; }
   for(const id of [...stalledRings]) if(!ids.has(id)) stalledRings.delete(id);
+  // Outgoing tids die with their card; a deleted card never gets pulled again.
+  for(const key of Object.keys(outProg)) if(!ids.has(outProg[key].card)) delete outProg[key];
+  for(const key of Object.keys(outDone)) if(!ids.has(key)) delete outDone[key];
 }
 
-// Watch the server list for uploads the PC refused: each in-flight entry
-// watches its own name+size pair, so once its pending row is seen and then
-// vanishes, that push was refused — abort locally so we stop streaming into
-// the socket the server already tore down. Entries are independent: refusing
-// one of two parallel uploads never touches the other's detection.
+// Watch the server list for uploads whose pending row vanished mid-flight
+// (sender aborted from another tab, PC cleared all, or the server reaped a
+// dead push): each in-flight entry watches its own name+size pair, so once
+// its pending row is seen and then vanishes — abort locally so we stop
+// streaming into the socket the server already tore down. Entries are
+// independent: stopping one of two parallel uploads never touches the other.
 
 // Payload signature of one rendered item: a card is REBUILT in place only when
 // this changes (pending→ready, size fix), APPENDED when genuinely new, and
@@ -1232,9 +1248,13 @@ function buildMsg(it, animate){
         + '<circle class="cr-track" cx="15" cy="15" r="12" pathLength="100"/>'
         + '<circle class="cr-arc" cx="15" cy="15" r="12" pathLength="100"/>'
         + '</svg><span class="cr-glyph"></span>';
-      // Ring is only shown while something is moving; tapping it dispatches to
-      // whichever stop the local device owns (see ringTap).
-      ring.onclick = (e) => { e.stopPropagation(); ringTap(it); };
+      // Sender's stop affordance: the phone's own pending card taps the ring
+      // to abort (cancelOwnUpload). The PC ring is progress-only, no handler.
+      // A real button-grade node, not a gesture hijack — native long-press is
+      // untouched.
+      if(!isOwner && it.pending && mine){
+        ring.onclick = (e) => { e.stopPropagation(); cancelOwnUpload(it); };
+      }
       card.appendChild(ring);
 
       // Media on both ends opens the instant in-app preview (bytes are
@@ -1464,18 +1484,24 @@ function withOptimistic(serverItems){
 }
 
 // ---- Corner transfer ring ----------------------------------------------
-// Rings are drawn by the RECEIVER of a transfer, and only it can cancel:
-//   PC        — the receiver of phone pushes: its ring rides the server's
-//               received-byte counter (`progress` events for the pending row)
-//               and its ✕ is the refuse affordance (/cancel).
-//   Phone     — the receiver of pulls, whose progress and cancel live entirely
-//               in the browser's own download UI; the page keeps NO transfer
-//               state at all — no rings, no mirrors, nothing to sync. Its own
-//               uploads are sender-side: the optimistic "Uploading…" card is
-//               the feedback, and completion arrives as the row turning real.
+// Each end draws from its own local truth, never synced:
+//   PC    — mirrors received bytes (`progress` pushes) for incoming pushes,
+//           and served bytes (per-request `card#n` pushes, maxed per card,
+//           orange arc) for outgoing pulls. Progress-only on both.
+//   Phone — mirrors handed-to-socket bytes (XHR `upload.onprogress`) on its
+//           own pending cards; the ring center is its ✕ stop affordance.
+//           Pulls draw nothing anywhere in-page — the browser's own download
+//           UI owns that. No transfer state crosses the wire, so there is
+//           nothing to sync.
 const progCache = {};   // id -> {sent,total,t} latest server snapshot (uploads)
 const doneIds = {};     // transfers already flashed complete -> corner stays idle
 const hideTimers = {};  // per-id "hide the finished ring" timers
+// Outgoing pulls, PC only: per-request tid ("card#n") -> {card, sent, total,
+// t}. The phone never fills this (syncProgress early-returns there) — its
+// download UI is the browser's own. card#n keys never collide with upload
+// pending-row ids, so the two mirrors share no state.
+const outProg = {};     // tid -> {card, sent, total, t} latest served snapshot
+const outDone = {};     // cardId flashed complete for an outgoing pull
 // Local ring-idle fallback: the server prunes a silent transfer after 5s and
 // broadcasts `resync`, but a dead SSE delivers neither the ticks nor the
 // resync. The viewer therefore expires its own rings: no `progress` tick for
@@ -1515,11 +1541,9 @@ const GLYPH_DONE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" s
 function cornerState(id){
   const it = itemById(id);
   if(!it || it.kind !== 'file') return null;
-  // Only the receiver draws, and on this page the receiver is the PC for
-  // every pending row: a phone push (bytes crossing Wi-Fi land here) and the
-  // PC's own drag-in copy (bytes land here from the source disk) alike. Pulls
-  // draw nothing here — the puller's browser owns that UI — and the sending
-  // phone draws nothing either (sender-side).
+  // Receiver truth (PC only): every pending row — a phone push landing here
+  // and the PC's own drag-in copy alike. Pulls draw nothing here — the
+  // puller's browser owns that UI.
   if(!isOwner || !it.pending) return null;
   if(stalledRings.has(id)) return null;   // locally expired, see pruneIdleRings
   const prog = progCache[id];
@@ -1529,7 +1553,67 @@ function cornerState(id){
            done: !!(prog && total > 0 && prog.sent >= total) };
 }
 
-// Paint one card's corner: the ring while a transfer this end mirrors is
+// Sender truth (phone only): handed-to-socket bytes from the in-flight XHR,
+// keyed by name+size so the optimistic card and the server's pending row
+// share one number across the id handoff. No entry (or no computable length)
+// means no local truth — fall back to the card pulse. Never marked done:
+// graduation arrives as the row turning non-pending, which hides the ring.
+function senderCornerState(id){
+  if(isOwner) return null;
+  const it = itemById(id);
+  if(!it || it.kind !== 'file' || !it.pending || it.from !== me) return null;
+  let sent = -1;
+  for(const up of inFlightUploads){
+    if(up.name === it.name && up.size === it.size && typeof up.sent === 'number'){
+      if(up.sent > sent) sent = up.sent;
+    }
+  }
+  if(sent < 0) return null;
+  const total = it.size || 0;
+  if(total <= 0) return { pct: 0, done: false };
+  return { pct: Math.min(sent, total) / total * 100, done: false };
+}
+
+// Repaint every card sharing one upload's name+size pair (the optimistic card
+// before the server row lands, the server row after — sometimes both during
+// handoff). Throttled to ~7/s: progress events fire per chunk.
+function paintSenderPair(up, force){
+  const now = Date.now();
+  if(!force && now - (up.lastPaint || 0) < 150) return;
+  up.lastPaint = now;
+  for(const it of curItems){
+    if(it.kind === 'file' && it.pending && it.name === up.name && it.size === up.size){
+      paintCorner(it.id);
+    }
+  }
+}
+
+// Outgoing pull aggregate (PC): max served percent across this card's fresh
+// per-request tids ("card#n"). Stale tids (no tick past RING_IDLE_MS — a cut
+// pull waits for the server prune + resync) are swept here so the ring never
+// freezes. done sticks while a fresh completed tid is around; the flash is
+// armed once via outDone and re-armed by the next pull's fresh ticks.
+function outState(id){
+  if(!isOwner) return null;
+  const it = itemById(id);
+  if(!it || it.kind !== 'file' || it.pending) return null;
+  const now = Date.now();
+  let pct = -1, done = false;
+  for(const key of Object.keys(outProg)){
+    const o = outProg[key];
+    if(o.card !== id) continue;
+    if(now - o.t > RING_IDLE_MS){ delete outProg[key]; continue; }
+    const total = o.total || 0;
+    if(total <= 0){ pct = 100; done = true; continue; }
+    const p = Math.min(o.sent, total) / total * 100;
+    if(p > pct) pct = p;
+    if(o.sent >= total) done = true;
+  }
+  if(pct < 0) return null;
+  return { pct, done };
+}
+
+// Paint one card's corner: the ring while a transfer this end tracks is
 // live, the end's persistent action button otherwise (Download on the phone,
 // Reveal in Explorer on the PC). Called after every render (cards were
 // rebuilt) and on every `progress` tick; idle cards early-return so cost
@@ -1544,9 +1628,69 @@ function paintCorner(id){
   // A completion that was already flashed is idle now, not a ring to re-show.
   if(st && st.done && doneIds[id]) st = null;
 
+  // Sender-side ring (phone): local XHR truth. Shares the disc, adds the
+  // ✕ stop affordance; no completion flash — graduation hides the ring.
+  if(!st && !isOwner){
+    const sst = senderCornerState(id);
+    if(sst){
+      btn.classList.add('hidden');
+      card.classList.add('transferring');
+      ring.classList.add('show', 'canstop');
+      ring.classList.remove('done');
+      ring.querySelector('.cr-arc').classList.remove('out');
+      const p = Math.max(0, Math.min(100, sst.pct));
+      ring.classList.toggle('p0', !(p > 0));
+      ring.querySelector('.cr-arc').style.strokeDasharray = p + ' ' + (100 - p);
+      ring.title = Math.round(p) + '% · 轻触取消';
+      const glyph = ring.querySelector('.cr-glyph');
+      glyph.classList.add('cancel');
+      glyph.classList.remove('pct');
+      glyph.innerHTML = '';
+      glyph.textContent = '✕';
+      return;
+    }
+  }
+
+  // Outgoing pull (PC): this card's bytes are being pulled by a paired
+  // browser. Same disc, orange arc (.out) to tell it apart from incoming;
+  // progress-only, never a button.
+  if(!st && isOwner){
+    const o = outState(id);
+    if(o && !(o.done && outDone[id])){
+      btn.classList.add('hidden');
+      card.classList.add('transferring');
+      ring.classList.add('show');
+      ring.classList.remove('done', 'canstop');
+      const arc = ring.querySelector('.cr-arc');
+      arc.classList.add('out');
+      const p = Math.max(0, Math.min(100, o.pct));
+      ring.classList.toggle('p0', !(p > 0));
+      arc.style.strokeDasharray = p + ' ' + (100 - p);
+      ring.title = '正在被拉取 ' + Math.round(p) + '%';
+      const glyph = ring.querySelector('.cr-glyph');
+      glyph.classList.remove('cancel');
+      if(o.done){
+        glyph.classList.remove('pct');
+        glyph.innerHTML = GLYPH_DONE;
+        ring.classList.add('done');
+        outDone[id] = true;
+        if(hideTimers[id]) clearTimeout(hideTimers[id]);
+        hideTimers[id] = setTimeout(() => paintCorner(id), 1200);
+      } else {
+        glyph.classList.add('pct');
+        glyph.textContent = Math.round(p) + '%';
+        if(hideTimers[id]){ clearTimeout(hideTimers[id]); hideTimers[id] = null; }
+      }
+      return;
+    }
+  }
+
   if(!st){
-    ring.classList.remove('show', 'done', 'p0');
+    ring.classList.remove('show', 'done', 'p0', 'canstop');
     card.classList.remove('transferring');
+    ring.querySelector('.cr-arc').classList.remove('out');
+    const glyph = ring.querySelector('.cr-glyph');
+    if(glyph){ glyph.classList.remove('cancel', 'pct'); glyph.innerHTML = ''; }
     if(!card.dataset.pending){
       // The corner's idle occupant is a persistent action button on both
       // ends, each pointing at what that end can do with the file: the PC
@@ -1554,8 +1698,8 @@ function paintCorner(id){
       // through its browser (Files/Downloads dir). Uniform on every card
       // including images: the Files destination is a real need (originals,
       // re-sharing), and per-type exceptions only puzzle. Both yield the
-      // corner only to a receiver-side ring, so each never gets hidden by
-      // the transfers the other end runs.
+      // corner to a live ring, so each never gets hidden by the transfers
+      // the other end runs.
       if(isOwner){
         btn.classList.remove('hidden');
         btn.innerHTML = BTN_FOLDER;
@@ -1576,23 +1720,26 @@ function paintCorner(id){
   btn.classList.add('hidden');
   card.classList.add('transferring');
   ring.classList.add('show');
+  ring.classList.remove('canstop');
+  ring.querySelector('.cr-arc').classList.remove('out');
   ring.classList.toggle('done', !!st.done);
   const p = Math.max(0, Math.min(100, st.pct));
   // A zero-length dash with round caps would paint a stray dot at 0% — hide
-  // the arc there instead (class p0) and let the glyph say "started".
+  // the arc there instead (class p0).
   ring.classList.toggle('p0', !(p > 0));
   ring.querySelector('.cr-arc').style.strokeDasharray = p + ' ' + (100 - p);
   // The number lives in the tooltip, not on the ring.
   ring.title = Math.round(p) + '%';
-  // Center carries state: a big ✕ (this page IS the receiver — refuse the
-  // push) while moving; a green check at completion.
+  // Center flashes the completion check; while moving it shows the live
+  // percent (the disc's whole job now that the ✕ is gone).
   const glyph = ring.querySelector('.cr-glyph');
-  glyph.classList.toggle('stop', !st.done);
+  glyph.classList.remove('cancel');
   if(st.done){
+    glyph.classList.remove('pct');
     glyph.innerHTML = GLYPH_DONE;
   } else {
-    glyph.innerHTML = '';
-    glyph.textContent = '✕';
+    glyph.classList.add('pct');
+    glyph.textContent = Math.round(p) + '%';
   }
 
   if(!st.done && hideTimers[id]){ clearTimeout(hideTimers[id]); hideTimers[id] = null; }
@@ -1622,25 +1769,27 @@ function transferClick(it){
   downloadFile(it);
 }
 
-// PC host action: refuse the incoming push for this id. The server flags the
-// id (the upload writer tears down on its next chunk, dropping the pending row
-// and the partial file) and we clear the local mirror so the ring vanishes
-// right away.
-async function stopTransfer(id){
-  try { await serverFetch('/cancel', { method:'POST', query:{ id } }); } catch {}
-  clearMirror(id);
-}
-// Drop this end's mirror of one transfer (counter, flash timers).
-function clearMirror(id){
-  delete progCache[id];
-  delete doneIds[id];
-  if(hideTimers[id]){ clearTimeout(hideTimers[id]); hideTimers[id] = null; }
-  paintCorner(id);
-}
-// Corner-ring tap: this page draws only its own receiving uploads, so a tap
-// is always "refuse this push". The phone draws no rings at all.
-function ringTap(it){
-  if(isOwner){ stopTransfer(it.id); }
+// Sender-side abort: the phone stops its OWN upload. Local abort first (the
+// XHR settles false and finish() drops the optimistic card), then /cancel with the real id so the
+// server's pending row + partial file die at once instead of waiting out the
+// 5s silence timeout. Both ends converge on the next List push: the card
+// vanishes on PC and phone alike — i.e. the failure path, not a delete.
+// Optimistic-only cards (opt-*) have no server row yet: local abort alone,
+// the writer (if it ever lands) dies on the broken socket / timeout.
+async function cancelOwnUpload(it){
+  for(const up of [...inFlightUploads]){
+    if(up.name === it.name && up.size === it.size){
+      try { up.ac.abort(); } catch {}
+    }
+  }
+  for(let i = optUploads.length - 1; i >= 0; i--){
+    const o = optUploads[i];
+    if(o.name === it.name && o.size === it.size && o.from === it.from) optUploads.splice(i, 1);
+  }
+  if(!String(it.id).startsWith('opt-')){
+    try { await serverFetch('/cancel', { method:'POST', query:{ id: it.id } }); } catch {}
+  }
+  reapply();
 }
 function checkUploadGone(items){
   for(const up of inFlightUploads){
@@ -1648,9 +1797,10 @@ function checkUploadGone(items){
       && i.name === up.name && i.size === up.size);
     if(mine.some(i => i.pending)){ up.seen = true; continue; }
     if(!mine.length && up.seen){
-      // Refused by the receiver: abort locally so we stop streaming into the
-      // socket the server is already tearing down. The failure toast is the
-      // same "Transfer failed" whichever path wins the race.
+      // Pending row vanished mid-flight (self-abort from another tab, PC
+      // clear-all, or a reaped dead push): abort locally so we stop
+      // streaming into the socket the server already tore down. The failure
+      // toast is the same "Transfer failed" whichever path wins the race.
       up.seen = false;
       up.ac.abort();
     } else {
@@ -1719,13 +1869,30 @@ function nativeDownload(it){
   setTimeout(() => f.remove(), 300000);
 }
 
-// Transfer snapshots arrive as `progress` SSE events (~1/s per upload) and a
-// one-shot /dl-status resync on connect. Rings are receiver-side: the PC
-// applies pushes for the pending rows it is receiving.
+// Transfer snapshots arrive as `progress` SSE events (~1/s per transfer) and
+// a one-shot /dl-status resync on connect. The PC applies both directions:
+// pending rows it is receiving (keyed by row id) and ready cards being pulled
+// (keyed by per-request "card#n", maxed per card at paint). The phone applies
+// neither — uploads ride its local XHR truth, downloads its browser UI.
 function syncProgress(list){
   if(!isOwner) return;
   const now = Date.now();
   for(const d of list){
+    const hash = String(d.id).lastIndexOf('#');
+    if(hash > 0){
+      // One pull's served bytes: keep per-tid, aggregate at paint. A fresh
+      // (non-done) tick re-arms the completion flash for the next pull.
+      const card = String(d.id).slice(0, hash);
+      const item = itemById(card);
+      if(!item || item.kind !== 'file' || item.pending) continue;
+      outProg[d.id] = { card, sent: d.sent, total: d.total, t: now };
+      if(d.total > 0 && d.sent < d.total){
+        if(outDone[card]) delete outDone[card];
+        if(hideTimers[card]){ clearTimeout(hideTimers[card]); hideTimers[card] = null; }
+      }
+      paintCorner(card);
+      continue;
+    }
     const item = itemById(d.id);
     // Any pending row's ring paints on the PC: both a phone push AND the
     // PC's own drag-in copy stream progress pushes with this end as the
@@ -1740,7 +1907,7 @@ function syncProgress(list){
 // Fetch the server's live-transfer snapshot, apply it, then reconcile the
 // local mirrors with it: refresh counters for rows the server is still
 // receiving, drop mirror state for ids it no longer tracks. The server
-// pushes nothing on a refused push or a dead-transfer prune — it broadcasts
+// pushes nothing on a stopped push or a dead-transfer prune — it broadcasts
 // `resync` instead — so this reconcile is what lets a corner return to idle
 // instead of freezing on its last value forever.
 async function resyncProgress(){
@@ -1755,6 +1922,10 @@ function reconcileMirrors(snap){
   const known = new Set(snap.map(d => d.id));
   for(const id of Object.keys(progCache)) if(!known.has(id) && !doneIds[id]) delete progCache[id];
   for(const id of [...stalledRings]) if(known.has(id)) stalledRings.delete(id);
+  // A pull gone from the snapshot was cut or pruned server-side: drop its
+  // tid so no corner freezes. outDone stays — the flash guard is re-armed by
+  // the next pull's fresh ticks and swept with its card.
+  for(const key of Object.keys(outProg)) if(!known.has(key)) delete outProg[key];
 }
 
 // Double-submit guard: the button used to stay enabled and the input uncleared
@@ -1824,11 +1995,12 @@ async function startUpload(f){
   // rejects those with a 400 ("bad filename") and the user only sees 传输失败.
   // Name them here from the MIME type so the paste flow uploads like a file.
   fd.append('file', f, f.name || fallbackName(f));
-  // The abort handle is what checkUploadGone pulls when the receiver refuses
-  // the push: aborting cancels the request mid-stream, so the phone stops
-  // writing bytes into a socket the server is already tearing down.
+  // The abort handle is what checkUploadGone pulls when the pending row
+  // vanishes mid-flight: aborting cancels the request mid-stream, so the
+  // phone stops writing bytes into a socket the server is already tearing
+  // down.
   const ac = new AbortController();
-  const up = { ac, name: f.name, size: f.size || 0, seen: false };
+  const up = { ac, name: f.name, size: f.size || 0, seen: false, sent: 0, lastPaint: 0 };
   inFlightUploads.push(up);
   // Success and failure both drop the optimistic card: success is replaced
   // by the server's real row, failure by the batch summary toast.
@@ -1839,12 +2011,11 @@ async function startUpload(f){
     if(j >= 0) optUploads.splice(j, 1);
     reapply();
   };
-  // One boolean for every cause: a receiver-side refusal tears the socket
-  // down before the row-vanish list event can arrive, so the client genuinely
-  // cannot tell a refused push from a WiFi drop — over-precise toasts only
-  // mislead (a refusal used to read "Network error"). Every ending collapses
-  // into just success vs failure, and the batch summary toast lives in
-  // uploadFiles.
+  // One boolean for every cause: a torn-down socket wins the race before the
+  // row-vanish list event can arrive, so the client genuinely cannot tell a
+  // stopped push from a WiFi drop — over-precise toasts only mislead.
+  // Every ending collapses into just success vs failure, and the batch
+  // summary toast lives in uploadFiles.
   // Transport is XHR, not fetch: fetch never settles on a half-open socket
   // (WiFi dropped mid-POST — neither side errors), leaving the optimistic
   // card pulsing forever. XHR upload progress resets an idle timer; silence
@@ -1867,17 +2038,29 @@ async function startUpload(f){
       try { xhr.abort(); } catch {}
       settle(false);
     };
-    // Receiver-side refusal (checkUploadGone) rides the same abort handle.
+    // Sender self-abort (cancelOwnUpload) rides the same abort handle.
     ac.signal.addEventListener('abort', failAndAbort, { once: true });
     const armIdle = () => {
       clearTimeout(idleT);
       idleT = setTimeout(failAndAbort, 8000);
     };
     armIdle();
-    xhr.upload.onprogress = () => armIdle();
+    // Sender truth for this end's ring: handed-to-socket bytes. Throttled —
+    // progress fires per chunk, painting every tick would churn the DOM.
+    // Keyed by name+size in senderCornerState, so the optimistic card and
+    // the server's pending row share one number across the id handoff.
+    xhr.upload.onprogress = (e) => {
+      armIdle();
+      if(e.lengthComputable){
+        up.sent = e.loaded;
+        paintSenderPair(up, false);
+      }
+    };
     xhr.upload.onload = () => {
       // Body fully sent; the server answers immediately after receipt, so the
       // wait from here is bounded — 8s without a status is death, not slowness.
+      up.sent = up.size;
+      paintSenderPair(up, true);
       clearTimeout(idleT);
       respT = setTimeout(() => { responseTimedOut = true; failAndAbort(); }, 8000);
     };
@@ -1892,7 +2075,7 @@ async function startUpload(f){
     try { xhr.send(fd); } catch { settle(false); }
   });
   // Failure is judged here, all causes alike — network death, idle-timeout
-  // abort, refusal abort, HTTP error statuses. finish() drops the card.
+  // abort, self-abort, HTTP error statuses. finish() drops the card.
   finish(ok);
   // The request body may have reached disk even though its final HTTP response
   // was lost. Do one non-blocking list/status pass in that ambiguous case;

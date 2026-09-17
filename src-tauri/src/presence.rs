@@ -68,7 +68,7 @@ pub(crate) fn now_mono() -> u64 {
 ///                 one active device covers the others. Fine because nothing
 ///                 destructive or user-facing depends on the bit.
 ///   death         a transfer ends only through its own stream: an upload dies
-///                 via the writer's per-chunk silence timeout (or a refusal
+///                 via the writer's per-chunk silence timeout (or a stop
 ///                 flag), a pull dies when hyper drops the response body —
 ///                 StreamCutGuard reaps its counter and writes the outcome to
 ///                 the log; a hanging entry is reaped by the monitor's prune.
@@ -78,11 +78,12 @@ pub(crate) fn now_mono() -> u64 {
 ///                 on visibilitychange, each pass pulling /list and
 ///                 /dl-status once; there are no polling timers.
 ///
-/// Ownership follows the receiver: rings and cancel live on the device that
-/// receives a transfer (the PC for pushes — its refuse is /cancel; the phone
-/// for pulls — the browser's own download UI), and the sender gets only an
-/// event log. No cross-device transfer state is mirrored anywhere, so there
-/// is nothing to sync.
+/// Ownership follows the transfer: progress rings mirror on the receiving PC,
+/// stopping lives on the sending phone (its card ✕ aborts locally, then
+/// /cancel clears the server row); pulls are the phone's business — the
+/// browser's own download UI. The sender gets only an event log. No
+/// cross-device transfer state is mirrored anywhere, so there is nothing to
+/// sync.
 ///
 /// Desk-range profile: both devices are in hand and sessions are short, so
 /// the numbers below are tight. One floor to respect: the presence window

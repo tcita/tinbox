@@ -80,7 +80,7 @@ pub(crate) enum PushEvent {
     ///     events (surfaced as BroadcastStream lag),
     ///   - monitor_loop: stale entries were pruned (finished past 15s, or
     ///     silent past 5s),
-    ///   - cancel(): a push was refused by the PC — it pushes no terminal
+    ///   - cancel(): a push was stopped mid-flight — it pushes no terminal
     ///     progress tick, so clients must reconcile their mirrors away.
     /// Clients additionally reconcile on (re)connect and on visibilitychange
     /// (each pass pulls /list and /dl-status once). The phone keeps no
