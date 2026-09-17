@@ -1064,13 +1064,74 @@ pub(crate) async fn cancel(
     (StatusCode::OK, "stopped").into_response()
 }
 
+/// Move one file to the Recycle Bin — and ONLY to the bin. Hand-rolled
+/// IFileOperation (the `windows` crate is already in the tree) instead of the
+/// `trash` crate, for one reason: flag control. The crate hard-codes
+/// FOF_WANTNUKEWARNING alongside the silent flags, so an oversize file is
+/// silently NUKED (or worse — fail-fast inside the native delete) while we
+/// report "binned". Here WANTNUKEWARNING is deliberately absent: oversize
+/// returns a clean error into the 409-ask path, never a prompt, never a nuke.
+/// The bin_size_gate above stays regardless — native code plus giant files
+/// keep their distance no matter the flags.
+fn recycle_delete(path: &str) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::Com::{
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL,
+        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
+    use windows::Win32::UI::Shell::{
+        FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName,
+        FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_SILENT,
+    };
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            unsafe {
+                CoUninitialize();
+            }
+        }
+    }
+    unsafe {
+        // Balanced per-call COM init; S_FALSE (already initialized) is fine,
+        // only a failed HRESULT errors out.
+        let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        if hr.is_err() {
+            return Err(format!("CoInitializeEx: {hr}"));
+        }
+        let _guard = Guard;
+        let pfo: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_ALL)
+            .map_err(|e| format!("FileOperation: {e}"))?;
+        pfo.SetOperationFlags(
+            FOF_SILENT | FOF_NOCONFIRMATION | FOF_ALLOWUNDO | FOF_NOERRORUI | FOF_NOCONFIRMMKDIR,
+        )
+        .map_err(|e| format!("SetOperationFlags: {e}"))?;
+        let wide: Vec<u16> = std::ffi::OsStr::new(path)
+            .encode_wide()
+            .chain([0])
+            .collect();
+        let item: IShellItem =
+            SHCreateItemFromParsingName(windows::core::PCWSTR(wide.as_ptr()), None)
+                .map_err(|e| format!("parse path: {e}"))?;
+        pfo.DeleteItem(&item, None)
+            .map_err(|e| format!("DeleteItem: {e}"))?;
+        pfo.PerformOperations()
+            .map_err(|e| format!("PerformOperations: {e}"))?;
+        // Confirm it actually left: without WANTNUKEWARNING there is no nuke
+        // path, but a silent no-op must never report "binned" either.
+        if std::path::Path::new(path).exists() {
+            return Err("still present after recycle".to_string());
+        }
+        Ok(())
+    }
+}
+
 /// Whether a file may be handed to the shell trash: its size must fit 5% of
 /// the hosting volume's total size (the Recycle Bin's default quota rule).
 /// Anything bigger — or whose size/quota can't be determined — never reaches
-/// trash::delete, for two load-bearing reasons:
-///   - under our silent flags the shell auto-confirms its own "too large,
-///     delete permanently?" warning, so an oversize file would be NUKED while
-///     we toast "moved to Recycle Bin";
+/// recycle_delete, for two load-bearing reasons:
+///   - the shell must never be asked to nuke (see recycle_delete: no
+///     WANTNUKEWARNING), and a giant file near any quota edge is exactly
+///     where that question would arise;
 ///   - huge files have fail-fasted the whole process inside the native delete
 ///     (0xc0000409 on a 40 GiB inbox file — no Rust panic, no catch_unwind).
 /// Oversize deletions go 409-ask → force hard-delete instead.
@@ -1197,7 +1258,7 @@ pub(crate) async fn remove(
                 } else {
                     // Unconfirmed, gate passed: the bin's verdict decides.
                     // Refusal answers 409 with record + bytes untouched.
-                    match trash::delete(path) {
+                    match recycle_delete(path) {
                         Ok(()) => (
                             format!("{name}: record removed (inbox file moved to Recycle Bin)"),
                             true,
@@ -1288,7 +1349,7 @@ pub(crate) async fn remove_all(
                         logw(&format!("remove-all: {} over bin quota, asking", path));
                         keep = true;
                     } else {
-                        match trash::delete(path) {
+                        match recycle_delete(path) {
                             Ok(()) => binned += 1,
                             Err(er) => {
                                 logw(&format!("remove-all: bin refused {} ({}), asking", path, er));

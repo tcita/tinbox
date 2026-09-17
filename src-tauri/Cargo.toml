@@ -30,9 +30,6 @@ qrcode = "0.14"
 clipboard-win = "5"
 # PNG for the QR-code encoder; JPEG for Shell-extracted video posters.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-# Deletes go to the Windows Recycle Bin (recoverable, like Explorer) instead
-# of unlinking: trash::delete shells to the bin, with a hard-delete fallback.
-trash = "3"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [
