@@ -622,6 +622,9 @@
   .fw-card.danger .fw-icon { background: var(--danger-bg); color: var(--danger); }
   .fw-title { font-size: 17px; font-weight: 700; margin: 0 0 8px; letter-spacing: -0.3px; }
   .fw-desc { font-size: 13px; color: var(--sub); line-height: 1.5; margin: 0 0 22px; text-align: left; }
+  /* Refused-names list inside the permanent-delete confirm: capped scroll,
+     built with textContent per item so hostile filenames can't inject. */
+  #permDesc ul { margin: 8px 0 0; padding-left: 18px; max-height: 132px; overflow-y: auto; }
   .fw-btns { display: flex; gap: 10px; }
   .fw-btn {
     flex: 1; border: 0; border-radius: 12px; padding: 11px 0; font-size: 14px;
@@ -2199,20 +2202,42 @@ $('clearConfirm').onclick = async () => {
       } catch {}
       toast('已清空' + extra);
     } else {
-      // 409 "binrefused:<binned>:<refused>": the binned ones are already
+      // 409 {"binned":B,"refused":[...names]}: the binned ones are already
       // gone (List pushed), the refused stay fully intact — confirm wipes
-      // only the remainder permanently.
+      // only the remainder permanently. Names are listed so the dialog says
+      // WHO, capped with an overflow line for huge sweeps.
       let t = '';
       try { t = (await r.text()).trim(); } catch {}
-      const m = /^binrefused:(\d+):(\d+)$/.exec(t);
-      if(r.status === 409 && m){
-        permMode = { kind: 'all' };
-        permDesc.textContent = +m[1] > 0
-          ? `其中 ${m[1]} 个已移入回收站，${m[2]} 个无法进入回收站，永久删除这 ${m[2]} 个吗？`
-          : `${m[2]} 个文件无法进入回收站，将永久删除，继续吗？`;
-        $('permOverlay').classList.add('show');
+      let asked = false;
+      if(r.status === 409){
+        try {
+          const j = JSON.parse(t);
+          if(j && Array.isArray(j.refused)){
+            permMode = { kind: 'all' };
+            permDesc.innerHTML = '';
+            const head = document.createElement('div');
+            head.textContent = j.binned > 0
+              ? `其中 ${j.binned} 个已移入回收站，以下 ${j.refused.length} 个无法进入回收站，永久删除它们吗？`
+              : `以下 ${j.refused.length} 个文件无法进入回收站，将永久删除，继续吗？`;
+            permDesc.appendChild(head);
+            const ul = document.createElement('ul');
+            for(const n of j.refused.slice(0, 30)){
+              const li = document.createElement('li');
+              li.textContent = n;
+              ul.appendChild(li);
+            }
+            if(j.refused.length > 30){
+              const li = document.createElement('li');
+              li.textContent = `等共 ${j.refused.length} 个`;
+              ul.appendChild(li);
+            }
+            permDesc.appendChild(ul);
+            $('permOverlay').classList.add('show');
+            asked = true;
+          }
+        } catch {}
       }
-      else toast('清空失败');
+      if(!asked) toast('清空失败');
     }
   } catch { toast('清空失败'); }
   refresh();

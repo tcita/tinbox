@@ -1255,6 +1255,13 @@ pub(crate) async fn remove_all(
         }
     }
     if !refused.is_empty() {
+        let names: Vec<String> = refused
+            .iter()
+            .filter_map(|e| match &e.body {
+                catalog::MsgBody::File { name, .. } => Some(name.clone()),
+                catalog::MsgBody::Text { .. } => None,
+            })
+            .collect();
         let r = refused.len();
         // Put the kept records back (single persist); the binned ones stay gone.
         catalog::restore(refused);
@@ -1262,9 +1269,10 @@ pub(crate) async fn remove_all(
         logf(&format!(
             "remove-all: swept what the bin took ({binned} binned), {r} refused — asking"
         ));
+        // Names included so the confirm dialog can say WHO, not just how many.
         return (
             StatusCode::CONFLICT,
-            format!("binrefused:{}:{}", binned, r),
+            Json(serde_json::json!({ "binned": binned, "refused": names })),
         )
             .into_response();
     }
