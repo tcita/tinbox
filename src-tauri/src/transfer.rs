@@ -1064,6 +1064,31 @@ pub(crate) async fn cancel(
     (StatusCode::OK, "stopped").into_response()
 }
 
+/// Move a tinbox-owned inbox copy to the Recycle Bin instead of unlinking it:
+/// deletes stay recoverable, matching Explorer expectations. Pending-upload
+/// partials never come here (they're transfer garbage — hard-deleted at their
+/// own sites, the bin must not fill with half-files). When the bin refuses
+/// (oversize, detached volume) fall back to a hard delete so a delete never
+/// silently keeps its bytes; returns a log label either way.
+fn trash_inbox_file(path: &str) -> String {
+    match trash::delete(path) {
+        Ok(()) => "inbox file moved to Recycle Bin".to_string(),
+        Err(e) => {
+            logw(&format!("trash refused {} ({}), hard-deleting", path, e));
+            match std::fs::remove_file(path) {
+                Ok(()) => "inbox file deleted (bin refused)".to_string(),
+                Err(e2) => {
+                    logw(&format!(
+                        "remove: could not delete inbox file {}: {}",
+                        path, e2
+                    ));
+                    "inbox file left on disk (delete failed)".to_string()
+                }
+            }
+        }
+    }
+}
+
 pub(crate) async fn remove(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(p): Query<IdParam>,
@@ -1085,19 +1110,9 @@ pub(crate) async fn remove(
     let label = match &entry.body {
         catalog::MsgBody::File { source, name, .. } => match source {
             // Every Remote file is a tinbox-owned inbox copy (a phone upload, or a
-            // PC file copied in on add): deleting the record deletes the copy too.
+            // PC file copied in on add): deleting the record bins the copy too.
             catalog::Source::Remote { path } => {
-                let ok = match std::fs::remove_file(path) {
-                    Ok(()) => true,
-                    Err(e) => {
-                        logw(&format!("remove: could not delete inbox file {}: {}", path, e));
-                        false
-                    }
-                };
-                format!(
-                    "{name}: record removed (inbox file {})",
-                    if ok { "deleted" } else { "left on disk (delete failed)" }
-                )
+                format!("{name}: record removed ({})", trash_inbox_file(path))
             }
             // Legacy zero-copy rows point at an original PC path tinbox does not
             // own: remove the record only.
@@ -1124,9 +1139,10 @@ pub(crate) async fn remove(
 }
 
 /// Delete EVERYTHING in one sweep: every record plus every tinbox-owned inbox
-/// copy. PC-only like /rm (same rationale, amplified — a guest must
+/// copy (to the Recycle Bin — same semantics as /rm, so a sweep is
+/// recoverable too). PC-only like /rm (same rationale, amplified — a guest must
 /// not be able to vaporize the owner's history). Per-entry semantics mirror
-/// remove(): Remote inbox copies are deleted from disk, legacy Local
+/// remove(): Remote inbox copies go to the bin, legacy Local
 /// originals are kept, pending writers are flagged so their partials tear
 /// down. One persist (take_all) and one List push for the whole sweep, not N.
 pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> impl IntoResponse {
@@ -1150,9 +1166,8 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
             catalog::MsgBody::File { source, .. } => {
                 files += 1;
                 if let catalog::Source::Remote { path } = source {
-                    if std::fs::remove_file(path).is_err() {
-                        logw(&format!("remove-all: could not delete inbox file {}", path));
-                    }
+                    // Same bin semantics as remove(); failures already logged.
+                    trash_inbox_file(path);
                 }
             }
             catalog::MsgBody::Text { .. } => texts += 1,

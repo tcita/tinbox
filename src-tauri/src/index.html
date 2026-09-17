@@ -984,7 +984,7 @@ function showCtxMenu(x, y, it, bubble){
     } else {
       add('复制', copyIco, '', () => copyFile(it));
     }
-    add('删除', delIco, 'danger', () => delItem(it));
+    add('删除此' + (it.kind === 'text' ? '消息' : '文件'), delIco, 'danger', () => delItem(it));
     any = true;
   }
   if(!any) return;
@@ -1033,8 +1033,11 @@ async function copyFile(it){
 // context-menu action; the toast reports the outcome.
 async function delItem(it){
   const res = await serverFetch('/rm', { method:'POST', query:{ id: it.id } });
-  // Failure-only like sends: the vanishing card confirms success.
+  // Files land in the Recycle Bin (disk space returns only after emptying
+  // it), so success gets one toast — otherwise "deleted but space unchanged"
+  // reads as a bug. Texts vanish silently like before: the gone card is proof.
   if(!res.ok) toast('删除失败');
+  else if(it.kind !== 'text') toast('已移入回收站');
   refresh();
 }
 async function revealItem(it){
