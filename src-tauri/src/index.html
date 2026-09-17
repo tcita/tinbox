@@ -2145,7 +2145,7 @@ $('clearConfirm').onclick = async () => {
       let msg = '已清空';
       try {
         const m = /^cleared:(\d+):(\d+)$/.exec((await r.text()).trim());
-        if(m && +m[2] > 0) msg = '部分未清空，请手动删除剩余文件';
+        if(m && +m[2] > 0) msg = '部分未清空，请去收件箱手动删除';
       } catch {}
       toast(msg);
     }
