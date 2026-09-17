@@ -658,8 +658,8 @@ pub fn take_all() -> Vec<Entry> {
     all
 }
 
-/// Re-insert records withheld from a destructive sweep (bin-refused files
-/// whose bytes + poster were left untouched): single persist. Timeline order
+/// Re-insert records withheld from a destructive sweep (files the bin
+/// couldn't take, left fully intact): single persist. Timeline order
 /// is by ts at read time, so append order is free.
 pub fn restore(mut items: Vec<Entry>) {
     if items.is_empty() {

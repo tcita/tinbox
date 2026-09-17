@@ -1181,35 +1181,37 @@ fn volume_total_bytes(path: &str) -> Option<u64> {
     }
 }
 
-/// /rm and /rm-all query: which record, plus force=1 as the confirmed
-/// "delete permanently" after a bin refusal (Explorer's oversize-file prompt).
-#[derive(serde::Deserialize)]
-pub(crate) struct RmQuery {
-    id: Option<String>,
-    force: Option<u8>,
-}
-
 pub(crate) async fn remove(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Query(p): Query<RmQuery>,
+    Query(p): Query<IdParam>,
 ) -> impl IntoResponse {
     // Deleting is the owner's privilege: a guest (non-local visitor) has
     // no permission to delete any entry - the directory is shared, so if a
     // guest deletes one entry, the owner's chat history disappears with it,
     // irreversibly. Enforced on the backend to prevent bypassing the frontend.
     if from_by_peer(peer) != "owner" {
-    logw(&format!("remove: rejected delete request from guest id={:?}", p.id));
+    logw(&format!("remove: rejected delete request from guest id={}", p.id));
     return (StatusCode::FORBIDDEN, "guest cannot delete").into_response();
     }
-    let Some(ref id) = p.id else {
-        return (StatusCode::BAD_REQUEST, "missing id").into_response();
-    };
     // Resolve the entry first so a materialized inbox file can be deleted before
     // the record is dropped.
-    let Some(entry) = catalog::find(id) else {
+    let Some(entry) = catalog::find(&p.id) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
-    let force = p.force.unwrap_or(0) != 0;
+
+    // Deleting never asks: fitting files go to the bin, anything the bin
+    // can't take fails untouched (record + bytes kept) for Explorer to handle.
+    // Oversize/edge files are deliberately NOT tinbox's job.
+    if let catalog::MsgBody::File {
+        source: catalog::Source::Remote { path },
+        ..
+    } = &entry.body
+    {
+        if !entry.pending && !bin_size_gate(path) {
+            logw(&format!("remove: {} over bin quota, left intact", path));
+            return (StatusCode::BAD_REQUEST, "over-quota").into_response();
+        }
+    }
 
     let (label, binned) = match &entry.body {
         catalog::MsgBody::File { source, name, .. } => match source {
@@ -1230,42 +1232,17 @@ pub(crate) async fn remove(
                         }
                     };
                     (format!("{name}: record removed ({detail})"), false)
-                } else if force {
-                    // Confirmed "delete permanently": hard-delete directly, no
-                    // shell — the user accepted permanent loss, and the shell
-                    // must never see a file it would nuke-or-crash (see gate).
-                    match std::fs::remove_file(path) {
-                        Ok(()) => (
-                            format!("{name}: record removed (permanently deleted)"),
-                            false,
-                        ),
-                        Err(e) => {
-                            logw(&format!(
-                                "remove: could not delete {}: {}",
-                                path, e
-                            ));
-                            (
-                                format!("{name}: record removed (left on disk)"),
-                                false,
-                            )
-                        }
-                    }
-                } else if !bin_size_gate(path) {
-                    // Over quota (or unknown): never touch the shell — answer
-                    // 409 with record + bytes untouched, frontend asks first.
-                    logw(&format!("remove: {} over bin quota, asking", path));
-                    return (StatusCode::CONFLICT, "bin-refused").into_response();
                 } else {
-                    // Unconfirmed, gate passed: the bin's verdict decides.
-                    // Refusal answers 409 with record + bytes untouched.
+                    // Gate passed above: the bin's verdict decides, refusal
+                    // fails untouched (see the pre-check).
                     match recycle_delete(path) {
                         Ok(()) => (
                             format!("{name}: record removed (inbox file moved to Recycle Bin)"),
                             true,
                         ),
                         Err(e) => {
-                            logw(&format!("remove: bin refused {} ({}), asking", path, e));
-                            return (StatusCode::CONFLICT, "bin-refused").into_response();
+                            logw(&format!("remove: bin failed {} ({}), left intact", path, e));
+                            return (StatusCode::BAD_REQUEST, "bin-failed").into_response();
                         }
                     }
                 }
@@ -1297,22 +1274,17 @@ pub(crate) async fn remove(
     (StatusCode::OK, if binned { "binned" } else { "deleted" }).into_response()
 }
 
-/// Delete EVERYTHING in one sweep, in two phases like /rm: landed inbox
-/// copies go to the Recycle Bin; files the bin can't take stay fully intact
-/// (record + bytes + poster) and the sweep answers 409, so the frontend can
-/// ask "delete the rest permanently?" — force=1 is that confirmation and
-/// hard-deletes directly, no shell. PC-only like /rm (same rationale,
-/// amplified — a guest must not be able to vaporize the owner's history).
-/// One List push for the whole sweep, not N.
-pub(crate) async fn remove_all(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Query(p): Query<RmQuery>,
-) -> impl IntoResponse {
+/// Delete EVERYTHING in one sweep: landed inbox copies go to the Recycle
+/// Bin; anything the bin can't take (over quota, shell errors) stays fully
+/// intact and is counted, never asked — bulk leftovers are Explorer's job,
+/// like single oversize deletes. PC-only like /rm (same rationale, amplified
+/// — a guest must not be able to vaporize the owner's history). One List push
+/// for the whole sweep, not N.
+pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> impl IntoResponse {
     if from_by_peer(peer) != "owner" {
         logw("remove-all: rejected delete request from guest");
         return (StatusCode::FORBIDDEN, "guest cannot delete").into_response();
     }
-    let force = p.force.unwrap_or(0) != 0;
     let all = catalog::take_all();
     if all.is_empty() {
         return (StatusCode::OK, "nothing to delete").into_response();
@@ -1320,6 +1292,7 @@ pub(crate) async fn remove_all(
     let mut files = 0usize;
     let mut texts = 0usize;
     let mut binned = 0usize;
+    let mut skipped = 0usize;
     let mut refused: Vec<catalog::Entry> = Vec::new();
     let total = all.len();
     for e in all {
@@ -1333,26 +1306,20 @@ pub(crate) async fn remove_all(
             catalog::MsgBody::File { source, .. } => {
                 files += 1;
                 if let catalog::Source::Remote { path } = source {
-                    // Never-landed partials are garbage: hard-delete, no bin,
-                    // no confirm — like everywhere else.
+                    // Never-landed partials are garbage: hard-delete, no bin.
                     if e.pending {
                         if std::fs::remove_file(path).is_err() {
                             logw(&format!("remove-all: could not delete partial {}", path));
                         }
-                    } else if force {
-                        // Confirmed permanent: hard-delete directly, no shell.
-                        if std::fs::remove_file(path).is_err() {
-                            logw(&format!("remove-all: could not delete {}", path));
-                        }
                     } else if !bin_size_gate(path) {
                         // Over quota (or unknown): never touch the shell.
-                        logw(&format!("remove-all: {} over bin quota, asking", path));
+                        logw(&format!("remove-all: {} over bin quota, kept", path));
                         keep = true;
                     } else {
                         match recycle_delete(path) {
                             Ok(()) => binned += 1,
                             Err(er) => {
-                                logw(&format!("remove-all: bin refused {} ({}), asking", path, er));
+                                logw(&format!("remove-all: bin failed {} ({}), kept", path, er));
                                 keep = true;
                             }
                         }
@@ -1364,6 +1331,7 @@ pub(crate) async fn remove_all(
         if keep {
             // Untouched: record goes back, bytes and poster stay.
             refused.push(e);
+            skipped += 1;
             continue;
         }
         if matches!(e.body, catalog::MsgBody::File { .. }) {
@@ -1371,37 +1339,22 @@ pub(crate) async fn remove_all(
         }
     }
     if !refused.is_empty() {
-        let names: Vec<String> = refused
-            .iter()
-            .filter_map(|e| match &e.body {
-                catalog::MsgBody::File { name, .. } => Some(name.clone()),
-                catalog::MsgBody::Text { .. } => None,
-            })
-            .collect();
-        let r = refused.len();
         // Put the kept records back (single persist); the binned ones stay gone.
         catalog::restore(refused);
-        let _ = notifier().send(PushEvent::List(catalog::all_items()));
-        logf(&format!(
-            "remove-all: swept what the bin took ({binned} binned), {r} refused — asking"
-        ));
-        // Names included so the confirm dialog can say WHO, not just how many.
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "binned": binned, "refused": names })),
-        )
-            .into_response();
     }
+    let _ = notifier().send(PushEvent::List(catalog::all_items()));
     logf(&format!(
-        "remove-all: cleared {} entries ({} files, {} texts, {} binned)",
+        "remove-all: cleared {} of {} entries ({} files, {} texts, {} binned, {} kept)",
+        total - skipped,
         total,
         files,
         texts,
-        binned
+        binned,
+        skipped
     ));
     (
         StatusCode::OK,
-        format!("cleared:{}:{}:{}", total, binned, files),
+        format!("cleared:{}:{}", total - skipped, skipped),
     )
         .into_response()
 }
