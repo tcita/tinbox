@@ -1034,17 +1034,15 @@ async function copyFile(it){
 async function delItem(it){
   const res = await serverFetch('/rm', { method:'POST', query:{ id: it.id } });
   // "binned" names the bin (space returns after emptying it); record-only
-  // removals stay silent. Anything else fails untouched: "over-quota" says
-  // where to go instead — oversize files are Explorer's job, not the app's.
+  // removals stay silent. Failures leave record + bytes untouched — the card
+  // stays, the log says why, Explorer handles the rest.
   if(res.ok){
     if(it.kind !== 'text' && it.source_kind !== 'local'){
       try { if((await res.text()).trim() === 'binned') toast('已移入回收站'); }
       catch {}
     }
   } else {
-    let t = '';
-    try { t = (await res.text()).trim(); } catch {}
-    toast(t === 'over-quota' ? '文件过大，请去收件箱手动删除' : '删除失败');
+    toast('删除失败');
   }
   refresh();
 }

@@ -1071,8 +1071,7 @@ pub(crate) async fn cancel(
 /// silently NUKED (or worse — fail-fast inside the native delete) while we
 /// report "binned". Here WANTNUKEWARNING is deliberately absent: oversize
 /// returns a clean error into the plain-failure path, never a prompt, never
-/// a nuke. The shell_size_ok cap below stays regardless — native code plus
-/// giant files keep their distance no matter the flags.
+/// a nuke.
 fn recycle_delete(path: &str) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::System::Com::{
@@ -1125,25 +1124,10 @@ fn recycle_delete(path: &str) -> Result<(), String> {
     }
 }
 
-/// Largest file handed to the shell trash: 4 GiB. This is NOT a quota
-/// prediction (there is no reliable one — the default is 10% of the first
-/// 40 GB of quota plus 5% above, quota-based, per-drive customizable and
-/// explicitly non-contractual — so we don't pretend to compute it). It is a
-/// plain safety cap, for two concrete reasons:
-///   - a giant bin move stalls its HTTP handler for tens of seconds (the
-///     40 GiB delete sat 34s), while the whole server assumes fast handlers;
-///   - huge files have fail-fasted the process inside the native delete
-///     (0xc0000409 — no Rust panic, no catch_unwind).
-/// Over-cap deletions fail untouched for Explorer; the bin's own verdict
-/// (refusal included) still comes back as a clean error under our flags.
-fn shell_size_ok(path: &str) -> bool {
-    const MAX_SHELL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-    match std::fs::metadata(path).map(|m| m.len()) {
-        Ok(n) => n <= MAX_SHELL_BYTES,
-        Err(_) => false,
-    }
-}
-
+/// No size cap on top: same-volume bin moves are renames (a 20 GiB file bins
+/// in seconds), so any invented threshold would refuse files that bin
+/// perfectly well. Oversize verdicts belong to the shell and come back as
+/// clean errors under our flags.
 pub(crate) async fn remove(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(p): Query<IdParam>,
@@ -1162,20 +1146,9 @@ pub(crate) async fn remove(
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
 
-    // Deleting never asks: fitting files go to the bin, anything the bin
-    // can't take fails untouched (record + bytes kept) for Explorer to handle.
+    // Deleting never asks: files go to the bin, anything the bin can't take
+    // fails untouched (record + bytes kept) for Explorer to handle.
     // Oversize/edge files are deliberately NOT tinbox's job.
-    if let catalog::MsgBody::File {
-        source: catalog::Source::Remote { path },
-        ..
-    } = &entry.body
-    {
-        if !entry.pending && !shell_size_ok(path) {
-            logw(&format!("remove: {} over bin quota, left intact", path));
-            return (StatusCode::BAD_REQUEST, "over-quota").into_response();
-        }
-    }
-
     let (label, binned) = match &entry.body {
         catalog::MsgBody::File { source, name, .. } => match source {
             // Every Remote file is a tinbox-owned inbox copy (a phone upload, or a
@@ -1274,10 +1247,6 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
                         if std::fs::remove_file(path).is_err() {
                             logw(&format!("remove-all: could not delete partial {}", path));
                         }
-                    } else if !shell_size_ok(path) {
-                        // Over quota (or unknown): never touch the shell.
-                        logw(&format!("remove-all: {} over bin quota, kept", path));
-                        keep = true;
                     } else {
                         match recycle_delete(path) {
                             Ok(()) => binned += 1,
