@@ -1034,10 +1034,14 @@ async function copyFile(it){
 async function delItem(it){
   const res = await serverFetch('/rm', { method:'POST', query:{ id: it.id } });
   // Files land in the Recycle Bin (disk space returns only after emptying
-  // it), so success gets one toast — otherwise "deleted but space unchanged"
-  // reads as a bug. Texts vanish silently like before: the gone card is proof.
+  // it) — but only when the server says so ("binned"); a fallback
+  // hard-delete reports plain "deleted" and stays silent like before.
+  // Texts vanish silently either way: the gone card is proof.
   if(!res.ok) toast('删除失败');
-  else if(it.kind !== 'text') toast('已移入回收站');
+  else {
+    try { if((await res.text()).trim() === 'binned') toast('已移入回收站'); }
+    catch {}
+  }
   refresh();
 }
 async function revealItem(it){
@@ -2130,7 +2134,17 @@ $('clearConfirm').onclick = async () => {
   $('clearOverlay').classList.remove('show');
   try {
     const r = await serverFetch('/rm-all', {method:'POST'});
-    toast(r.ok ? '已清空' : '清空失败');
+    if(!r.ok){ toast('清空失败'); }
+    else {
+      // Server answers "cleared:<n>:<binned>" — name the bin only when files
+      // actually went there, so the toast never lies about disk space.
+      let extra = '';
+      try {
+        const m = /^cleared:\d+:(\d+)$/.exec((await r.text()).trim());
+        if(m && +m[1] > 0) extra = '，文件进回收站';
+      } catch {}
+      toast('已清空' + extra);
+    }
   } catch { toast('清空失败'); }
   refresh();
 };

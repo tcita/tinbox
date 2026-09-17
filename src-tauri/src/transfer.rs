@@ -1069,20 +1069,21 @@ pub(crate) async fn cancel(
 /// partials never come here (they're transfer garbage — hard-deleted at their
 /// own sites, the bin must not fill with half-files). When the bin refuses
 /// (oversize, detached volume) fall back to a hard delete so a delete never
-/// silently keeps its bytes; returns a log label either way.
-fn trash_inbox_file(path: &str) -> String {
+/// silently keeps its bytes; returns the log label plus whether the file
+/// actually went to the bin (the frontend toasts accordingly).
+fn trash_inbox_file(path: &str) -> (String, bool) {
     match trash::delete(path) {
-        Ok(()) => "inbox file moved to Recycle Bin".to_string(),
+        Ok(()) => ("inbox file moved to Recycle Bin".to_string(), true),
         Err(e) => {
             logw(&format!("trash refused {} ({}), hard-deleting", path, e));
             match std::fs::remove_file(path) {
-                Ok(()) => "inbox file deleted (bin refused)".to_string(),
+                Ok(()) => ("inbox file deleted (bin refused)".to_string(), false),
                 Err(e2) => {
                     logw(&format!(
                         "remove: could not delete inbox file {}: {}",
                         path, e2
                     ));
-                    "inbox file left on disk (delete failed)".to_string()
+                    ("inbox file left on disk (delete failed)".to_string(), false)
                 }
             }
         }
@@ -1107,20 +1108,22 @@ pub(crate) async fn remove(
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
 
-    let label = match &entry.body {
+    let (label, binned) = match &entry.body {
         catalog::MsgBody::File { source, name, .. } => match source {
             // Every Remote file is a tinbox-owned inbox copy (a phone upload, or a
             // PC file copied in on add): deleting the record bins the copy too.
             catalog::Source::Remote { path } => {
-                format!("{name}: record removed ({})", trash_inbox_file(path))
+                let (detail, binned) = trash_inbox_file(path);
+                (format!("{name}: record removed ({detail})"), binned)
             }
             // Legacy zero-copy rows point at an original PC path tinbox does not
             // own: remove the record only.
-            catalog::Source::Local { path } => format!(
-                "{name}: record removed (original kept: {path})"
+            catalog::Source::Local { path } => (
+                format!("{name}: record removed (original kept: {path})"),
+                false,
             ),
         },
-        catalog::MsgBody::Text { .. } => "text message deleted".to_string(),
+        catalog::MsgBody::Text { .. } => ("text message deleted".to_string(), false),
     };
 
     // Deleting an in-flight upload's pending row directly: flag it so the upload
@@ -1135,7 +1138,9 @@ pub(crate) async fn remove(
     dl_lock().remove(&entry.id);
     logf(&format!("remove: {}", label));
     let _ = notifier().send(PushEvent::List(catalog::all_items()));
-    (StatusCode::OK, "deleted").into_response()
+    // Machine-readable outcome for the toast: "binned" only when the bytes
+    // actually went to the bin (fallback hard-deletes report plain "deleted").
+    (StatusCode::OK, if binned { "binned" } else { "deleted" }).into_response()
 }
 
 /// Delete EVERYTHING in one sweep: every record plus every tinbox-owned inbox
@@ -1156,6 +1161,7 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
     }
     let mut files = 0usize;
     let mut texts = 0usize;
+    let mut binned = 0usize;
     for e in &all {
         // Same teardown as remove(): stop the writer, drop the mirror.
         if e.pending {
@@ -1167,7 +1173,9 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
                 files += 1;
                 if let catalog::Source::Remote { path } = source {
                     // Same bin semantics as remove(); failures already logged.
-                    trash_inbox_file(path);
+                    if trash_inbox_file(path).1 {
+                        binned += 1;
+                    }
                 }
             }
             catalog::MsgBody::Text { .. } => texts += 1,
@@ -1176,10 +1184,15 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
     crate::poster::clear_all();
     let _ = notifier().send(PushEvent::List(catalog::all_items()));
     logf(&format!(
-        "remove-all: cleared {} entries ({} files, {} texts)",
+        "remove-all: cleared {} entries ({} files, {} texts, {} binned)",
         all.len(),
         files,
-        texts
+        texts,
+        binned
     ));
-    (StatusCode::OK, format!("deleted: {}", all.len())).into_response()
+    (
+        StatusCode::OK,
+        format!("cleared:{}:{}", all.len(), binned),
+    )
+        .into_response()
 }
