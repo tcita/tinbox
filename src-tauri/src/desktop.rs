@@ -44,9 +44,9 @@ pub(crate) async fn open_file(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(p): Query<IdParam>,
 ) -> impl IntoResponse {
-    if from_by_peer(peer) != "pc" {
-        logw("open: rejected from phone (would open viewer on the PC)");
-        return (StatusCode::FORBIDDEN, "phone cannot open PC files").into_response();
+    if from_by_peer(peer) != "owner" {
+        logw("open: rejected from guest (would open viewer on the PC)");
+        return (StatusCode::FORBIDDEN, "guest cannot open PC files").into_response();
     }
     let Some(entry) = catalog::find(&p.id) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
@@ -75,16 +75,16 @@ pub(crate) async fn open_file(
 }
 
 /// Reveal a file's location on the PC side by id: Remote rows select the inbox
-/// copy (phone upload or PC add), legacy Local rows the original PC file. Only
-/// File messages. PC-only: a phone request must not pop Explorer windows on
+/// copy (guest upload or owner add), legacy Local rows the original PC file. Only
+/// File messages. PC-only: a guest request must not pop Explorer windows on
 /// the PC (same guard posture as /cancel and /add-local).
 pub(crate) async fn reveal(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(p): Query<IdParam>,
 ) -> impl IntoResponse {
-    if from_by_peer(peer) != "pc" {
-        logw("reveal: rejected from phone (would open Explorer on the PC)");
-        return (StatusCode::FORBIDDEN, "phone cannot open PC folders").into_response();
+    if from_by_peer(peer) != "owner" {
+        logw("reveal: rejected from guest (would open Explorer on the PC)");
+        return (StatusCode::FORBIDDEN, "guest cannot open PC folders").into_response();
     }
     let Some(entry) = catalog::find(&p.id) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
@@ -107,16 +107,16 @@ pub(crate) async fn reveal(
 /// Copy an inbox file to the system clipboard as a file (CF_HDROP), so an
 /// Explorer paste — or Ctrl+V into any app's file target — receives the file
 /// itself. The web Clipboard API cannot carry files, so this rides the
-/// same-process server exactly like /open and /reveal. PC-only: the phone
+/// same-process server exactly like /open and /reveal. PC-only: a guest
 /// must not reach the desktop clipboard (same guard posture as /reveal).
 pub(crate) async fn copy_file(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(p): Query<IdParam>,
 ) -> impl IntoResponse {
     use clipboard_win::{formats, Clipboard, Setter};
-    if from_by_peer(peer) != "pc" {
-        logw("copy-file: rejected from phone (would write the PC clipboard)");
-        return (StatusCode::FORBIDDEN, "phone cannot use the PC clipboard").into_response();
+    if from_by_peer(peer) != "owner" {
+        logw("copy-file: rejected from guest (would write the PC clipboard)");
+        return (StatusCode::FORBIDDEN, "guest cannot use the PC clipboard").into_response();
     }
     let Some(entry) = catalog::find(&p.id) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
@@ -154,13 +154,13 @@ pub(crate) async fn copy_file(
     }
 }
 
-/// Open the PC-side inbox directory (the phone frontend hides this button).
+/// Open the PC-side inbox directory (guest frontends hide this button).
 /// Frontend "Inbox" click: open the inbox folder on the PC. PC-only for the
-/// same reason as /reveal — a phone request must not pop windows on the PC.
+/// same reason as /reveal — a guest request must not pop windows on the PC.
 pub(crate) async fn open_dir(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> impl IntoResponse {
-    if from_by_peer(peer) != "pc" {
-        logw("open-dir: rejected from phone (would open Explorer on the PC)");
-        return (StatusCode::FORBIDDEN, "phone cannot open PC folders").into_response();
+    if from_by_peer(peer) != "owner" {
+        logw("open-dir: rejected from guest (would open Explorer on the PC)");
+        return (StatusCode::FORBIDDEN, "guest cannot open PC folders").into_response();
     }
     match open::that(catalog::inbox_dir()) {
         Ok(_) => (StatusCode::OK, "opened").into_response(),

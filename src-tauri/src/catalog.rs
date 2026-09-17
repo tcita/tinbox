@@ -4,7 +4,7 @@
 //     legacy only: pre-change rows that reference an original PC path by
 //     zero-copy and are never file-deleted.
 //   Text messages: content inlined directly, no source.
-// Each message carries from("pc"/"phone") and ts; the frontend renders them
+// Each message carries from("owner"/"guest") and ts; the frontend renders them
 // on a timeline with left/right bubbles per sender.
 //
 // State is shared globally (`CATALOG`) so axum handlers (server thread
@@ -76,7 +76,7 @@ pub enum MsgBody {
 pub struct Entry {
     pub id: String,
     pub ts: String,
-    pub from: String, // "pc" | "phone"
+    pub from: String, // "owner" | "guest"
     pub body: MsgBody,
     /// True while a phone upload is still landing (the file on disk is
     /// incomplete). Missing on older files -> false.
@@ -205,7 +205,7 @@ fn cat_lock() -> std::sync::MutexGuard<'static, Vec<Entry>> {
 }
 
 /// Convert a legacy entry (top-level source/size/name/mtime, no body/from) to
-/// a new-format Entry. Local -> from="pc", Remote -> from="phone"; ts takes the
+/// a new-format Entry. Local -> from="owner", Remote -> from="guest"; ts takes the
 /// legacy mtime.
 fn migrate_old_entry(v: &serde_json::Value) -> Option<Entry> {
     // New format has a body field, legacy format does not. Entries with a body
@@ -223,7 +223,7 @@ fn migrate_old_entry(v: &serde_json::Value) -> Option<Entry> {
         .to_string();
     let source_val = v.get("source")?;
     let source: Source = serde_json::from_value(source_val.clone()).ok()?;
-    let from = if source.is_remote() { "phone" } else { "pc" }.to_string();
+    let from = if source.is_remote() { "guest" } else { "owner" }.to_string();
     Some(Entry {
         id,
         ts,
@@ -309,7 +309,7 @@ pub fn save() {
 /// Startup reconciliation: the inbox directory is the disk truth, the catalog
 /// is its index. Three divergences are repaired, both bounded to startup so the
 /// runtime keeps its single-writer simplicity:
-///   - orphan files (on disk, no record) are ADOPTED as from="pc" entries.
+///   - orphan files (on disk, no record) are ADOPTED as from="owner" entries.
 ///     This is also the self-heal path after a lost or quarantined index:
 ///     every file becomes manageable again, only text history is lost.
 ///   - dangling records (indexed, file gone — the user deleted or moved the
@@ -371,7 +371,7 @@ pub fn reconcile() {
         // add_remote stamps now_ts(); the entry is then corrected to the
         // file's mtime, which is the honest history moment.
         let ts = file_mtime_secs(path);
-        let entry = add_remote("pc", &new_id(), path, &display);
+        let entry = add_remote("owner", &new_id(), path, &display);
         {
             let mut v = cat_lock();
             if let Some(e) = v.iter_mut().find(|e| e.id == entry.id) {
@@ -474,8 +474,8 @@ pub fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 /// Register a file already materialized in inbox as a from="<from>" file message:
-/// "pc" for a file the PC added (the app copied it into inbox), "phone" for an
-/// inbound upload. The row is ready immediately (never pending).
+/// "owner" for a file the owner side added (the app copied it into inbox),
+/// "guest" for an inbound upload. The row is ready immediately (never pending).
 pub fn add_remote(from: &str, id: &str, inbox_path: &Path, display_name: &str) -> Entry {
     let size = std::fs::metadata(inbox_path).map(|m| m.len()).unwrap_or(0);
     // Probe once, at rest: the file is complete here (PC add, orphan
@@ -506,7 +506,7 @@ pub fn add_remote(from: &str, id: &str, inbox_path: &Path, display_name: &str) -
 
 /// Register an upload the moment its request arrives, marked `pending` so both
 /// devices can render the row and a progress ring while bytes stream in. The
-/// sender is the peer-determined `from` ("phone" for LAN pushes, "pc" for the
+/// sender is the peer-determined `from` ("guest" for LAN pushes, "owner" for the
 /// desktop's own paste-to-send, which has no real path and rides /upload).
 /// `size` is the declared total (sent in the query string); it is corrected to
 /// the on-disk length when the upload finishes.

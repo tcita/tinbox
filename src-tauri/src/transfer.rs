@@ -147,8 +147,8 @@ pub(crate) async fn upload(
     mut multipart: Multipart,
 ) -> impl IntoResponse {
     // The sender follows the peer, exactly like /send-text: LAN pushes are
-    // "phone", the desktop's own paste-to-send (no real path to /add-local)
-    // is "pc" and must not be misattributed to the phone.
+    // "guest", the desktop's own paste-to-send (no real path to /add-local)
+    // is "owner" and must not be misattributed to a guest device.
     let from = from_by_peer(peer);
     loop {
         let mut field = match multipart.next_field().await {
@@ -380,7 +380,7 @@ pub(crate) async fn copy_into_inbox(src: &Path) -> std::io::Result<(String, Path
     // Register the pending row + ledger entry FIRST, so feedback starts at
     // drop instant and the copy below just fills the ring. The declared total
     // is exact (a local stat, not the sender's claim).
-    catalog::add_remote_pending("pc", &id, &stored, &safe, size);
+    catalog::add_remote_pending("owner", &id, &stored, &safe, size);
     let _ = notifier().send(PushEvent::List(catalog::all_items()));
     {
         let mut map = dl_lock();
@@ -1000,9 +1000,9 @@ pub(crate) async fn cancel(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(p): Query<IdParam>,
 ) -> impl IntoResponse {
-    if from_by_peer(peer) != "pc" {
-        logw(&format!("cancel: rejected stop request from phone id={}", p.id));
-        return (StatusCode::FORBIDDEN, "phone cannot stop transfers").into_response();
+    if from_by_peer(peer) != "owner" {
+    logw(&format!("cancel: rejected stop request from guest id={}", p.id));
+    return (StatusCode::FORBIDDEN, "guest cannot stop transfers").into_response();
     }
     cancel_lock().insert(p.id.clone());
     // Remove the pending row and best-effort the partial file. If the writer
@@ -1030,13 +1030,13 @@ pub(crate) async fn remove(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(p): Query<IdParam>,
 ) -> impl IntoResponse {
-    // Deleting is the PC owner's privilege: the phone (non-local visitor) has
-    // no permission to delete any entry - the directory is shared, so if the
-    // phone deletes one entry, the PC's chat history disappears with it,
+    // Deleting is the owner's privilege: a guest (non-local visitor) has
+    // no permission to delete any entry - the directory is shared, so if a
+    // guest deletes one entry, the owner's chat history disappears with it,
     // irreversibly. Enforced on the backend to prevent bypassing the frontend.
-    if from_by_peer(peer) != "pc" {
-        logw(&format!("remove: rejected delete request from phone id={}", p.id));
-        return (StatusCode::FORBIDDEN, "phone cannot delete").into_response();
+    if from_by_peer(peer) != "owner" {
+    logw(&format!("remove: rejected delete request from guest id={}", p.id));
+    return (StatusCode::FORBIDDEN, "guest cannot delete").into_response();
     }
     // Resolve the entry first so a materialized inbox file can be deleted before
     // the record is dropped.
@@ -1086,15 +1086,15 @@ pub(crate) async fn remove(
 }
 
 /// Delete EVERYTHING in one sweep: every record plus every tinbox-owned inbox
-/// copy. PC-only like /rm (same rationale, amplified — a phone visitor must
+/// copy. PC-only like /rm (same rationale, amplified — a guest must
 /// not be able to vaporize the owner's history). Per-entry semantics mirror
 /// remove(): Remote inbox copies are deleted from disk, legacy Local
 /// originals are kept, pending writers are flagged so their partials tear
 /// down. One persist (take_all) and one List push for the whole sweep, not N.
 pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> impl IntoResponse {
-    if from_by_peer(peer) != "pc" {
-        logw("remove-all: rejected delete request from phone");
-        return (StatusCode::FORBIDDEN, "phone cannot delete").into_response();
+    if from_by_peer(peer) != "owner" {
+        logw("remove-all: rejected delete request from guest");
+        return (StatusCode::FORBIDDEN, "guest cannot delete").into_response();
     }
     let all = catalog::take_all();
     if all.is_empty() {

@@ -121,12 +121,13 @@ struct TextPayload {
 }
 
 /// Determine the sender from the requesting peer IP: loopback (127.x / ::1) ->
-/// "pc", anything else -> "phone".
+/// "owner" (this machine), anything else -> "guest" (a paired LAN device:
+/// phone, or another PC on the LAN — both are guests, neither owns the app).
 pub(crate) fn from_by_peer(peer: SocketAddr) -> &'static str {
     match peer.ip() {
-        std::net::IpAddr::V4(v4) if v4.is_loopback() => "pc",
-        std::net::IpAddr::V6(v6) if v6.is_loopback() => "pc",
-        _ => "phone",
+        std::net::IpAddr::V4(v4) if v4.is_loopback() => "owner",
+        std::net::IpAddr::V6(v6) if v6.is_loopback() => "owner",
+        _ => "guest",
     }
 }
 
@@ -389,7 +390,7 @@ fn migrate_legacy_shared() {
                 // shared and inbox are on the same disk, so rename is an
                 // instant move, not a copy.
                 if std::fs::rename(entry.path(), &stored).is_ok() {
-                    catalog::add_remote("phone", &id, &stored, &safe);
+                    catalog::add_remote("guest", &id, &stored, &safe);
                     moved += 1;
                 }
             }
@@ -435,7 +436,7 @@ async fn list() -> impl IntoResponse {
 }
 
 /// Send a text message. The sender is determined from the source IP (loopback
-/// = pc, anything else = phone).
+/// = owner, anything else = guest).
 async fn send_text(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     axum::Json(payload): axum::Json<TextPayload>,
@@ -458,20 +459,20 @@ struct AddLocalPayload {
 
 /// After the PC side's plus button picks real paths via the Tauri dialog, POST
 /// them here. Each chosen file is COPIED into the inbox folder (`{id}__{name}`)
-/// and only then registered as a ready from="pc" entry — a card appears only once
+/// and only then registered as a ready from="owner" entry — a card appears only once
 /// the copy is complete, so there is no intermediate "copying" state to confuse
 /// with a real transfer. Not routed through a custom command, avoiding the ACL
 /// restrictions on external URLs.
 ///
 /// Copying reads arbitrary PC-local paths, so this endpoint is PC-only (the same
-/// guard /cancel and /rm use): the phone must not be able to reach it.
+/// guard /cancel and /rm use): a guest must not be able to reach it.
 async fn add_local(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     axum::Json(payload): axum::Json<AddLocalPayload>,
 ) -> impl IntoResponse {
-    if from_by_peer(peer) != "pc" {
-        logw("add-local: rejected from phone (would copy PC-local paths)");
-        return (StatusCode::FORBIDDEN, "phone cannot add PC-local files").into_response();
+    if from_by_peer(peer) != "owner" {
+        logw("add-local: rejected from guest (would copy PC-local paths)");
+        return (StatusCode::FORBIDDEN, "guest cannot add PC-local files").into_response();
     }
     let inbox = catalog::inbox_dir();
     if let Err(e) = std::fs::create_dir_all(&inbox) {
@@ -552,8 +553,17 @@ async fn client_log(
 }
 
 /// Frontend "Repair" click: launch elevated UAC to delete the Block and add an
-/// Allow rule.
-async fn repair(State(_app): State<tauri::AppHandle>) -> impl IntoResponse {
+/// Allow rule. PC-only like /rm (same rationale, amplified — a guest
+/// must not be able to pop a UAC prompt on the owner's screen, let alone
+/// rewrite the owner's firewall rules).
+async fn repair(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(_app): State<tauri::AppHandle>,
+) -> impl IntoResponse {
+    if from_by_peer(peer) != "owner" {
+        logw("repair: rejected repair request from guest (would raise UAC on the PC)");
+        return (StatusCode::FORBIDDEN, "guest cannot repair firewall").into_response();
+    }
     // repair() only SPAWNS the elevated launcher and returns — fire-and-
     // forget by design (the UAC dialog may sit unanswered for minutes, and
     // blocking on it once froze the overlay's buttons for 11 minutes). So
@@ -568,13 +578,29 @@ async fn repair(State(_app): State<tauri::AppHandle>) -> impl IntoResponse {
 }
 
 /// Frontend "Quit" click: without network access the app is pointless.
-async fn quit(State(app): State<tauri::AppHandle>) -> impl IntoResponse {
+/// PC-only: a guest must not be able to kill the owner's process.
+async fn quit(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(app): State<tauri::AppHandle>,
+) -> impl IntoResponse {
+    if from_by_peer(peer) != "owner" {
+        logw("quit: rejected quit request from guest");
+        return (StatusCode::FORBIDDEN, "guest cannot quit").into_response();
+    }
     crate::firewall::quit(&app);
     (StatusCode::OK, "quitting").into_response()
 }
 
 /// Once the repair-overlay disappears, un-pin the window (back to normal).
-async fn untop(State(app): State<tauri::AppHandle>) -> impl IntoResponse {
+/// PC-only: it drives the PC window's always-on-top pin.
+async fn untop(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(app): State<tauri::AppHandle>,
+) -> impl IntoResponse {
+    if from_by_peer(peer) != "owner" {
+        logw("untop: rejected untop request from guest");
+        return (StatusCode::FORBIDDEN, "guest cannot untop").into_response();
+    }
     if let Some(w) = app.get_webview_window("main") {
         let _ = w.set_always_on_top(false);
     }

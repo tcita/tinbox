@@ -137,9 +137,9 @@
   /* Group divider: the connect entry is pairing, the rest are tools — the
      line says so without spending a label. */
   .head-sep { width: 1px; height: 20px; background: var(--line); margin: 0 1px; flex: none; }
-  /* Phone (coarse pointer): the header holds nothing the phone needs
-     (brand only — inbox/connect buttons are PC tools), so hide the whole bar and
-     give the rows back to the chat. */
+  /* Headerless guests: JS hides .head for every non-owner page (phone, desktop
+     LAN browser). This coarse-pointer rule stays as the no-JS fallback so
+     phones never show a half-wired bar. */
   @media (pointer: coarse) { .head { display: none; } }
 
   /* QR lightbox: the header connect button opens the large scan surface */
@@ -414,7 +414,7 @@
   .mo-close:active { transform: scale(0.92); }
   /* hover只有PC鼠标吃得到：加亮背景（dismiss语义，不用红色抢“危险”含义）。 */
   .mo-close:hover { background: rgba(255,255,255,0.28); }
-  /* PC-only二级动作：在浮层里用系统默认应用打开（/open）。胶囊按钮，
+  /* Owner-only二级动作：在浮层里用系统默认应用打开（/open）。胶囊按钮，
      点透不关闭浮层（stopPropagation），外抛后浮层留在原处。手机浮层只有✕：
      下载已在卡片角标常驻，同一个动作不配第二颗钮（PC 胶囊是卡片上没有的
      动作，才够格进浮层）。 */
@@ -788,8 +788,18 @@
 <script>
 const $ = id => document.getElementById(id);
 
-const isPC = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
-const me = isPC ? 'pc' : 'phone';
+const host = location.hostname.toLowerCase().replace(/\.$/, '');
+const isOwner = host === 'localhost' || host === '127.0.0.1'
+  || host === '::1' || host === '[::1]';
+// Webview identity (NOT the same question as isOwner): Tauri injects
+// window.__TAURI__ (withGlobalTauri, see tauri.conf.json) before any page
+// script runs, so its presence means "inside our own window" — no plain
+// browser, phone or desktop, ever has it. isOwner answers "same machine"
+// (loopback ⇒ the server grants owner powers); isWebview answers "our shell"
+// (Tauri-only capabilities: drag-drop listen, native dialog). A desktop
+// browser on localhost isOwner-but-not-webview: owner tools show AND work.
+const isWebview = !!(window.__TAURI__ && window.__TAURI__.event);
+const me = isOwner ? 'owner' : 'guest';
 // The phone's in-flight uploads (downloads are native and out of reach). One
 // entry per in-flight request: parallel uploads each keep their own
 // peer-refusal detection, so refusing the older of two concurrent pushes still
@@ -898,7 +908,14 @@ async function serverFetch(path, { method = 'GET', query, body, signal } = {}){
     if(!(body instanceof FormData)) init.headers = { 'Content-Type': 'application/json' };
   }
   const url = query ? path + qs(query) : path;
-  return fetch(url, init).then(r => { if(r.status === 403) pairExpiredNow(); return r; });
+  return fetch(url, init).then(r => {
+    // 403 has two sources: the pairing gate (token rotated — reload so the
+    // server renders its unpaired page) and the owner-only guards (a tool that
+    // should have been hidden — the caller surfaces its own error). The gate
+    // marks its refusals with x-tinbox-unpaired; only those reload.
+    if(r.status === 403 && r.headers.get('x-tinbox-unpaired')) pairExpiredNow();
+    return r;
+  });
 }
 
 // Context Menu
@@ -949,7 +966,7 @@ function showCtxMenu(x, y, it, bubble){
   // native selection + the system copy callout — so the app paints no menu
   // of its own there.
   let any = false;
-  if(isPC){
+  if(isOwner){
     if(it.kind === 'text'){
       add('复制', copyIco, '', () => copyText(it));
     } else {
@@ -1031,13 +1048,13 @@ function applyList(items){
 // and from each SSE `list` event (which carries the full array, so steady
 // state makes no /list requests at all).
 function applyListLive(items){
-  // A pending from="pc" row is the PC's LOCAL copy into its own inbox — the
-  // phone is neither sender nor receiver of those bytes, so showing it as a
+  // A pending from="owner" row is the owner's LOCAL copy into its own inbox —
+  // a guest is neither sender nor receiver of those bytes, so showing it as a
   // transfer would lie twice ("发送中/接收中" over a wire that carries
-  // nothing). The phone first sees the file when the copy graduates; until
-  // then the row stays PC-internal. The PC keeps it: its ring rides the
+  // nothing). A guest first sees the file when the copy graduates; until
+  // then the row stays owner-internal. The owner keeps it: its ring rides the
   // copy's progress pushes.
-  if(!isPC) items = items.filter(i => !(i.pending && i.from === 'pc'));
+  if(!isOwner) items = items.filter(i => !(i.pending && i.from === 'owner'));
   // Merge the sending phone's optimistic "just picked a file" cards in until the
   // server's real (pending) row appears, so the UI shows the card instantly.
   const view = withOptimistic(items);
@@ -1131,7 +1148,7 @@ function buildMsg(it, animate){
       // browser's own word selection with the system 全选/拷贝 callout. A
       // programmatic select-all could not summon that menu reliably on
       // every iOS version, so the native gesture IS the feature.
-      if(isPC) attachMenu(bubble, it, null);
+      if(isOwner) attachMenu(bubble, it, null);
     } else {
       const card = document.createElement('div');
       card.className = 'file-card';
@@ -1189,13 +1206,13 @@ function buildMsg(it, animate){
       info.querySelector('.fc-size').textContent = fmtSize(it.size) + mediaSuffix(it);
       if(it.pending){
         // Caption by WHAT IS MOVING, not by sender alone: a pending
-        // from="phone" row is bytes crossing Wi-Fi (发送 on the phone, 接收
-        // on the PC); a pending from="pc" row is a LOCAL copy into the inbox
-        // — 导入 on the PC, and the phone shows nothing at all (it receives
-        // nothing; its card appears when the copy graduates). The percent
+        // from="guest" row is bytes crossing Wi-Fi (发送 on the guest end, 接收
+        // on the owner end); a pending from="owner" row is a LOCAL copy into
+        // the inbox — 导入 on the owner end, and guests show nothing at all
+        // (they receive nothing; their card appears when the copy graduates). The percent
         // lives in the corner ring on the copying end.
         info.querySelector('.fc-size').textContent +=
-          ' · ' + (it.from === 'pc' ? '导入中…' : (mine ? '发送中…' : '接收中…'));
+          ' · ' + (it.from === 'owner' ? '导入中…' : (mine ? '发送中…' : '接收中…'));
       }
       card.appendChild(info);
 
@@ -1230,7 +1247,7 @@ function buildMsg(it, animate){
           if(it.pending) return;                          // still uploading
           openPreview(it);
         };
-      } else if(isPC){
+      } else if(isOwner){
         card.onclick = () => {
           if(it.pending) return;                          // still uploading
           openDefault(it);
@@ -1250,7 +1267,7 @@ function buildMsg(it, animate){
       // media menu on cards, and is simply dead on non-media files (their one
       // action, Download, lives on the corner button) — no 450ms timer, no
       // custom items, no suppression fighting the platform.
-      if(isPC) attachMenu(card, it, bubble);
+      if(isOwner) attachMenu(card, it, bubble);
       bubble.appendChild(card);
     }
 
@@ -1425,7 +1442,7 @@ async function openDefault(it){
 const optUploads = [];
 let optSeq = 0;
 // Match key for optimistic coverage (a real pending row hides one card).
-const optKey = (from, name, size) => from + '|' + name + '|' + (from === 'pc' ? '' : size);
+const optKey = (from, name, size) => from + '|' + name + '|' + (from === 'owner' ? '' : size);
 function withOptimistic(serverItems){
   const out = serverItems.slice();
   if(optUploads.length){
@@ -1436,7 +1453,7 @@ function withOptimistic(serverItems){
       counts[k] = (counts[k] || 0) + 1;
     }
     for(const o of optUploads){
-      if((o.from === 'pc') !== isPC) continue;
+      if((o.from === 'owner') !== isOwner) continue;
       const k = optKey(o.from, o.name, o.size);
       if(counts[k] > 0){ counts[k]--; continue; }   // a real row already covers it
       out.push({ id: o.id, ts: String((o.at / 1000) | 0), from: o.from, kind: 'file',
@@ -1471,7 +1488,7 @@ const hideTimers = {};  // per-id "hide the finished ring" timers
 const RING_IDLE_MS = 6000;
 const stalledRings = new Set();
 function pruneIdleRings(){
-  if(!isPC) return;
+  if(!isOwner) return;
   const now = Date.now();
   let changed = false;
   for(const id of Object.keys(progCache)){
@@ -1503,7 +1520,7 @@ function cornerState(id){
   // PC's own drag-in copy (bytes land here from the source disk) alike. Pulls
   // draw nothing here — the puller's browser owns that UI — and the sending
   // phone draws nothing either (sender-side).
-  if(!isPC || !it.pending) return null;
+  if(!isOwner || !it.pending) return null;
   if(stalledRings.has(id)) return null;   // locally expired, see pruneIdleRings
   const prog = progCache[id];
   const total = (prog && prog.total) || it.size || 1;
@@ -1539,7 +1556,7 @@ function paintCorner(id){
       // re-sharing), and per-type exceptions only puzzle. Both yield the
       // corner only to a receiver-side ring, so each never gets hidden by
       // the transfers the other end runs.
-      if(isPC){
+      if(isOwner){
         btn.classList.remove('hidden');
         btn.innerHTML = BTN_FOLDER;
         btn.title = '在资源管理器中显示';
@@ -1601,7 +1618,7 @@ function repaintTransfers(){
 // file's folder.
 function transferClick(it){
   if(it.pending) return;                 // still uploading, nothing to act on
-  if(isPC){ revealItem(it); return; }
+  if(isOwner){ revealItem(it); return; }
   downloadFile(it);
 }
 
@@ -1623,11 +1640,11 @@ function clearMirror(id){
 // Corner-ring tap: this page draws only its own receiving uploads, so a tap
 // is always "refuse this push". The phone draws no rings at all.
 function ringTap(it){
-  if(isPC){ stopTransfer(it.id); }
+  if(isOwner){ stopTransfer(it.id); }
 }
 function checkUploadGone(items){
   for(const up of inFlightUploads){
-    const mine = items.filter(i => i.from === 'phone'
+    const mine = items.filter(i => i.from === 'guest'
       && i.name === up.name && i.size === up.size);
     if(mine.some(i => i.pending)){ up.seen = true; continue; }
     if(!mine.length && up.seen){
@@ -1648,7 +1665,7 @@ function checkUploadGone(items){
 // keeps the BROWSER's native long-press callout: it shows the ORIGINAL bytes,
 // so the platform's "Save Image" / "Download" / share sheet operates on the
 // real photo — the one place where native menus are both natural and
-// byte-correct. PC-only second step: a pill button shells out to the system
+// byte-correct. Owner-only second step: a pill button shells out to the system
 // default viewer (openDefault → /open) for zoom/edit and for formats whose
 // native app beats any in-app view.
 function openPreview(it){
@@ -1666,13 +1683,13 @@ function openPreview(it){
     + '<button class="mo-close" aria-label="关闭">'
     + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
     + '</button>'
-    + (isPC ? '<button class="mo-open">用默认应用打开</button>' : '');
+    + (isOwner ? '<button class="mo-open">用默认应用打开</button>' : '');
   // Image: any tap dismisses (the whole layer IS the photo). Video: only the
   // backdrop or the ✕ dismisses — taps on the video itself must reach the
   // native controls (play/pause/seek), not close the layer under the finger.
   ov.onclick = (e) => { if(!isVid || e.target === ov) ov.remove(); };
   ov.querySelector('.mo-close').onclick = (e) => { e.stopPropagation(); ov.remove(); };
-  if(isPC) ov.querySelector('.mo-open').onclick = (e) => { e.stopPropagation(); openDefault(it); };
+  if(isOwner) ov.querySelector('.mo-open').onclick = (e) => { e.stopPropagation(); openDefault(it); };
   document.body.appendChild(ov);
 }
 
@@ -1706,7 +1723,7 @@ function nativeDownload(it){
 // one-shot /dl-status resync on connect. Rings are receiver-side: the PC
 // applies pushes for the pending rows it is receiving.
 function syncProgress(list){
-  if(!isPC) return;
+  if(!isOwner) return;
   const now = Date.now();
   for(const d of list){
     const item = itemById(d.id);
@@ -1795,7 +1812,7 @@ function fallbackName(f){
   return 'pasted-image.' + (m ? m[1].toLowerCase() : 'bin');
 }
 async function startUpload(f){
-  const opt = { id: 'opt-' + (++optSeq), name: f.name || fallbackName(f), size: f.size || 0, from: isPC ? 'pc' : 'phone', at: Date.now() };
+  const opt = { id: 'opt-' + (++optSeq), name: f.name || fallbackName(f), size: f.size || 0, from: isOwner ? 'owner' : 'guest', at: Date.now() };
   // Draw the sending side's card immediately ("Uploading…") before the server
   // round-trips; withOptimistic() replaces it with the server's pending row as
   // soon as that arrives.
@@ -1917,9 +1934,9 @@ $('inboxBtn').onclick = () => {
   serverFetch('/open-dir', {method:'POST'}).catch(()=>toast('无法打开收件箱'));
 };
 
-// Clear-all lives in the header, so it is PC-only the same way the inbox and
+// Clear-all lives in the header, so it is owner-only the same way the inbox and
 // QR tiles are (the whole bar hides on coarse pointers); the backend enforces
-// PC-only again like /rm. Double-submit is harmless by construction: the
+// owner-only again like /rm. Double-submit is harmless by construction: the
 // second POST finds an empty index and answers "nothing to delete".
 $('clearBtn').onclick = () => { $('clearOverlay').classList.add('show'); };
 $('clearCancel').onclick = () => { $('clearOverlay').classList.remove('show'); };
@@ -1938,7 +1955,7 @@ $('clearConfirm').onclick = async () => {
 // fires. The next tap presents normally; nothing page-side can detect or fix
 // the dropped one.
 $('plus').onclick = () => {
-  if(isPC){ pickLocal(); return; }
+  if(isOwner){ pickLocal(); return; }
   try { $('fileInput').showPicker(); }
   catch { $('fileInput').click(); }
 };
@@ -1970,7 +1987,7 @@ async function addLocalPaths(paths){
   // unknowable on this side until the server stats it.
   const base = p => p.split(/[\\/]/).pop() || p;
   const batch = 'b' + (++optSeq);
-  for(const p of fresh) optUploads.push({ id: 'opt-' + (++optSeq), name: base(p), size: 0, from: 'pc', at: Date.now(), batch });
+  for(const p of fresh) optUploads.push({ id: 'opt-' + (++optSeq), name: base(p), size: 0, from: 'owner', at: Date.now(), batch });
   reapply();
   const dropBatch = () => {
     for(let i = optUploads.length - 1; i >= 0; i--) if(optUploads[i].batch === batch) optUploads.splice(i, 1);
@@ -2028,7 +2045,7 @@ async function addLocalPaths(paths){
 // Tauri fires tauri://drag-drop with the real paths in parallel with the HTML5
 // drop. Listening to it covers platforms where the File.path injection is
 // missing; addLocalPaths' dedup makes the double-delivery harmless.
-if(isPC && window.__TAURI__ && window.__TAURI__.event){
+if(isWebview){
   window.__TAURI__.event.listen('tauri://drag-drop', e => {
     const p = e.payload;
     if(p && Array.isArray(p.paths) && p.paths.length) addLocalPaths(p.paths);
@@ -2071,7 +2088,7 @@ window.addEventListener('dragenter', e => {
   // Letting drops/pastes through would only re-upload the server's own bytes
   // (a long-pressed card image) back to it under a made-up name. preventDefault
   // stays so a stray drop can never navigate the page away.
-  if(!isPC) return;
+  if(!isOwner) return;
   dragCounter++;
   if(dragHasFiles(e)) dOverlay.classList.add('active');
 });
@@ -2093,13 +2110,13 @@ window.addEventListener('drop', e => {
   // proves it: "upload rejected: multipart read"), so even the deliberate
   // composer-drop misfires into a 传输失败 toast. Uploads ride the
   // plus-button picker, full stop.
-  if(!isPC) return;
+  if(!isOwner) return;
   const files = [...e.dataTransfer.files];
   if(!files.length) return;
   // PC drag-and-drop behaves like the plus button: real paths go to /add-local,
   // which copies them into the Inbox locally (no network upload). Only falls
   // back to an upload when real paths are unavailable (e.g. the phone side).
-  if(isPC){
+  if(isOwner){
     const paths = files.map(f => f.path).filter(p => typeof p === 'string' && p);
     if(paths.length === files.length){
       addLocalPaths(paths);
@@ -2128,7 +2145,7 @@ let everOnline = false;
 // this, every rebuilt window re-toasts for a phone that never left.
 let seenInfo = false;
 function applyInfo(d){
-  if(!isPC || !d) return;
+  if(!isOwner || !d) return;
   const online = !!d.mobileConnected;
   if(seenInfo && online && !everOnline){ toast('已配对,可以传输了'); $('qrLightbox').classList.remove('show'); }
   seenInfo = true;
@@ -2208,13 +2225,13 @@ const atWebApp = matchMedia('(display-mode: standalone), (display-mode: minimal-
   + ' (display-mode: fullscreen), (display-mode: window-controls-overlay)');
 const atWebAppLive = matchMedia('(display-mode: standalone), (display-mode: minimal-ui),'
   + ' (display-mode: window-controls-overlay)');
-const inWebApp = !isPC && (navigator.standalone === true
+const inWebApp = !isOwner && (navigator.standalone === true
   || document.referrer.startsWith('android-app://')
   || atWebApp.matches);
 if(inWebApp) $('webAppGate').classList.add('show');
 else connect();
 atWebAppLive.addEventListener('change', e => {
-  if(!isPC && e.matches && !pairExpired){
+  if(!isOwner && e.matches && !pairExpired){
     try { es.close(); } catch {}
     $('webAppGate').classList.add('show');
   }
@@ -2275,14 +2292,24 @@ document.addEventListener('visibilitychange', () => {
 
 let fwWasShown = false;
 // Firewall repair flag arrives as an SSE `fw` event (the server pushes only on
-// change); no /fw-status polling. The flag means the firewall would block the
-// phone on some network — either an applicable Block rule exists, or the Allow
-// rules do not cover every network type (the dialog's Allow is scoped to the
-// category active at answer time). The overlay is PREVENTIVE: it may appear
-// while the current network still works, because the next network change
-// would break connectivity. There is no dismiss: the fix is one UAC prompt,
-// and after it the all-profile Allow makes the issue permanent-impossible.
+// change); no /fw-status polling. The flag means the rule table is not the
+// canonical exactly-one-Allow-on-Any-profile: an applicable Block, a Block
+// scoped to another profile, or mere table hygiene (dialog Query strays,
+// duplicates, disabled leftovers). The overlay is PREVENTIVE on purpose — it
+// may appear while the current network still works — because the failure it
+// guards against is SILENT: the Windows dialog's Allow covers only the profile
+// active at answer time, and when a Private<->Public switch moves the machine
+// under a non-covered profile, inbound is default-blocked with NO second
+// prompt (a denied or already-ruled program is never re-asked), so the phone
+// just dies with no UI to repair from. Hence repair-now, not
+// repair-on-failure. There is no dismiss: the fix is one UAC prompt, and
+// after it the all-profile Allow makes the issue permanent-impossible.
 function applyFw(needRepair){
+  // Owner-only overlay: the repair flow raises a UAC prompt on the PC and the
+  // quit button kills the process — neither is a guest's business.
+  // The server also refuses /repair, /quit and /untop from non-loopback, so
+  // this early return only keeps the phone's screen clean.
+  if(!isOwner) return;
   const show = !!needRepair;
   $('fwOverlay').classList.toggle('show', show);
   if(fwWasShown && !show){
@@ -2331,12 +2358,14 @@ document.addEventListener('keydown', e => {
   if(e.key === 'Escape'){ closeQrLightbox(); $('clearOverlay').classList.remove('show'); }
 });
 
-if(isPC){
+if(isOwner){
+  // Owner console header, shared by the webview and a loopback desktop
+  // browser: both carry owner powers, so every button here works in both —
+  // no dead entries by construction. Guests (phone, desktop LAN browser) get
+  // the headerless transfer UI below instead.
   // The OS title bar already brands the window (icon + "tinbox") immediately
   // above the page header; painting the brand twice in 60px of vertical space
-  // is duplication. The phone keeps its in-page brand — mobile browsers give
-  // a page almost no identity chrome of its own, so the header logo is the
-  // only branding surface there.
+  // is duplication (a loopback browser tab titles itself the same way).
   document.querySelector('.brand').style.display = 'none';
   // The hidden brand leaves .head-actions the sole visible child of the
   // space-between bar — it would sit left with a dead void on the right.
@@ -2344,8 +2373,6 @@ if(isPC){
   // connect pill docks right as a DIRECT child of the bar, so space-between
   // spreads the two groups (an auto margin inside .head-actions cannot work:
   // a sole flex item shrink-wraps, the free space lives in the parent).
-  // Phone keeps the joined order; its bar is hidden anyway, and a desktop
-  // LAN browser keeps brand + group.
   document.querySelector('.head').appendChild($('connectBtn'));
   document.querySelector('.head-sep').style.display = 'none';
   // No connect gate: the timeline paints on the first list, paired or not.
@@ -2353,6 +2380,15 @@ if(isPC){
   // page never needs to wait for (or block on) a device. The header QR stays
   // the scan entry; the Inbox button is a real folder — the transfer landing
   // zone on disk — and nothing else.
+} else {
+  // Every guest — phone or desktop LAN browser — gets the same headerless
+  // transfer UI. Owner tools live in the header above, so there is nowhere a
+  // dead button can appear (no broken connect pill, no redundant brand).
+  // Behavior gates below still follow isOwner, not isWebview: a loopback
+  // browser keeps its working card menu (open/reveal pass the server's
+  // guard). Coarse-pointer phones never reach here either way: CSS hides the
+  // bar as a no-JS fallback.
+  document.querySelector('.head').style.display = 'none';
 }
 
 // Report client-side exceptions into the server log, so a failure on the phone
