@@ -1064,29 +1064,59 @@ pub(crate) async fn cancel(
     (StatusCode::OK, "stopped").into_response()
 }
 
-/// Move a tinbox-owned inbox copy to the Recycle Bin instead of unlinking it:
-/// deletes stay recoverable, matching Explorer expectations. Pending-upload
-/// partials never come here (they're transfer garbage — hard-deleted at their
-/// own sites, the bin must not fill with half-files). When the bin refuses
-/// (oversize, detached volume) fall back to a hard delete so a delete never
-/// silently keeps its bytes; returns the log label plus whether the file
-/// actually went to the bin (the frontend toasts accordingly).
-fn trash_inbox_file(path: &str) -> (String, bool) {
-    match trash::delete(path) {
-        Ok(()) => ("inbox file moved to Recycle Bin".to_string(), true),
-        Err(e) => {
-            logw(&format!("trash refused {} ({}), hard-deleting", path, e));
-            match std::fs::remove_file(path) {
-                Ok(()) => ("inbox file deleted (bin refused)".to_string(), false),
-                Err(e2) => {
-                    logw(&format!(
-                        "remove: could not delete inbox file {}: {}",
-                        path, e2
-                    ));
-                    ("inbox file left on disk (delete failed)".to_string(), false)
-                }
-            }
-        }
+/// Whether a file may be handed to the shell trash: its size must fit 5% of
+/// the hosting volume's total size (the Recycle Bin's default quota rule).
+/// Anything bigger — or whose size/quota can't be determined — never reaches
+/// trash::delete, for two load-bearing reasons:
+///   - under our silent flags the shell auto-confirms its own "too large,
+///     delete permanently?" warning, so an oversize file would be NUKED while
+///     we toast "moved to Recycle Bin";
+///   - huge files have fail-fasted the whole process inside the native delete
+///     (0xc0000409 on a 40 GiB inbox file — no Rust panic, no catch_unwind).
+/// Oversize deletions go 409-ask → force hard-delete instead.
+fn bin_size_gate(path: &str) -> bool {
+    let size = match std::fs::metadata(path).map(|m| m.len()) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    match volume_total_bytes(path) {
+        Some(total) => size <= total / 20,
+        None => false,
+    }
+}
+
+/// Hosting volume's total bytes for an absolute path, via GetDiskFreeSpaceExW.
+/// Paths here are absolute ("C:\..." or "\\?\C:\..."); only the drive letter
+/// is read, so junctions don't matter — the gate is heuristic anyway.
+fn volume_total_bytes(path: &str) -> Option<u64> {
+    let upper = path.replace('/', "\\");
+    let drive = if let Some(rest) = upper.strip_prefix("\\\\?\\") {
+        rest.chars().next()?
+    } else {
+        upper.chars().next()?
+    };
+    if !drive.is_ascii_alphabetic() {
+        return None;
+    }
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let root: Vec<u16> = format!("{}:\\", drive)
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let mut total = 0u64;
+    unsafe {
+        GetDiskFreeSpaceExW(
+            windows::core::PCWSTR(root.as_ptr()),
+            None,
+            Some(&mut total),
+            None,
+        )
+        .ok()?;
+    }
+    if total == 0 {
+        None
+    } else {
+        Some(total)
     }
 }
 
@@ -1140,13 +1170,33 @@ pub(crate) async fn remove(
                     };
                     (format!("{name}: record removed ({detail})"), false)
                 } else if force {
-                    // Confirmed "delete permanently": bin attempt, fallback hard.
-                    let (detail, binned) = trash_inbox_file(path);
-                    (format!("{name}: record removed ({detail})"), binned)
+                    // Confirmed "delete permanently": hard-delete directly, no
+                    // shell — the user accepted permanent loss, and the shell
+                    // must never see a file it would nuke-or-crash (see gate).
+                    match std::fs::remove_file(path) {
+                        Ok(()) => (
+                            format!("{name}: record removed (permanently deleted)"),
+                            false,
+                        ),
+                        Err(e) => {
+                            logw(&format!(
+                                "remove: could not delete {}: {}",
+                                path, e
+                            ));
+                            (
+                                format!("{name}: record removed (left on disk)"),
+                                false,
+                            )
+                        }
+                    }
+                } else if !bin_size_gate(path) {
+                    // Over quota (or unknown): never touch the shell — answer
+                    // 409 with record + bytes untouched, frontend asks first.
+                    logw(&format!("remove: {} over bin quota, asking", path));
+                    return (StatusCode::CONFLICT, "bin-refused").into_response();
                 } else {
-                    // Unconfirmed: the bin's verdict decides. Refusal answers
-                    // 409 with record + bytes untouched, so the frontend can
-                    // ask "delete permanently?" (Explorer's oversize prompt).
+                    // Unconfirmed, gate passed: the bin's verdict decides.
+                    // Refusal answers 409 with record + bytes untouched.
                     match trash::delete(path) {
                         Ok(()) => (
                             format!("{name}: record removed (inbox file moved to Recycle Bin)"),
@@ -1187,12 +1237,12 @@ pub(crate) async fn remove(
 }
 
 /// Delete EVERYTHING in one sweep, in two phases like /rm: landed inbox
-/// copies go to the Recycle Bin; files the bin refuses stay fully intact
+/// copies go to the Recycle Bin; files the bin can't take stay fully intact
 /// (record + bytes + poster) and the sweep answers 409, so the frontend can
-/// ask "delete the rest permanently?" — force=1 is that confirmation (bin
-/// attempt, fallback hard). PC-only like /rm (same rationale, amplified — a
-/// guest must not be able to vaporize the owner's history). One List push for
-/// the whole sweep, not N.
+/// ask "delete the rest permanently?" — force=1 is that confirmation and
+/// hard-deletes directly, no shell. PC-only like /rm (same rationale,
+/// amplified — a guest must not be able to vaporize the owner's history).
+/// One List push for the whole sweep, not N.
 pub(crate) async fn remove_all(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(p): Query<RmQuery>,
@@ -1229,9 +1279,14 @@ pub(crate) async fn remove_all(
                             logw(&format!("remove-all: could not delete partial {}", path));
                         }
                     } else if force {
-                        if trash_inbox_file(path).1 {
-                            binned += 1;
+                        // Confirmed permanent: hard-delete directly, no shell.
+                        if std::fs::remove_file(path).is_err() {
+                            logw(&format!("remove-all: could not delete {}", path));
                         }
+                    } else if !bin_size_gate(path) {
+                        // Over quota (or unknown): never touch the shell.
+                        logw(&format!("remove-all: {} over bin quota, asking", path));
+                        keep = true;
                     } else {
                         match trash::delete(path) {
                             Ok(()) => binned += 1,
