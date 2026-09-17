@@ -646,6 +646,19 @@ pub fn take_all() -> Vec<Entry> {
     all
 }
 
+/// Re-insert records withheld from a destructive sweep (bin-refused files
+/// whose bytes + poster were left untouched): single persist. Timeline order
+/// is by ts at read time, so append order is free.
+pub fn restore(mut items: Vec<Entry>) {
+    if items.is_empty() {
+        return;
+    }
+    let mut v = cat_lock();
+    v.append(&mut items);
+    drop(v);
+    save();
+}
+
 /// Flip the poster flag after a sidecar lands (or is lost). Returns true when
 /// the stored value actually changed, so the caller can skip a redundant save
 /// and List push.

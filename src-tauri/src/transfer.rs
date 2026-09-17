@@ -1090,23 +1090,35 @@ fn trash_inbox_file(path: &str) -> (String, bool) {
     }
 }
 
+/// /rm and /rm-all query: which record, plus force=1 as the confirmed
+/// "delete permanently" after a bin refusal (Explorer's oversize-file prompt).
+#[derive(serde::Deserialize)]
+pub(crate) struct RmQuery {
+    id: Option<String>,
+    force: Option<u8>,
+}
+
 pub(crate) async fn remove(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Query(p): Query<IdParam>,
+    Query(p): Query<RmQuery>,
 ) -> impl IntoResponse {
     // Deleting is the owner's privilege: a guest (non-local visitor) has
     // no permission to delete any entry - the directory is shared, so if a
     // guest deletes one entry, the owner's chat history disappears with it,
     // irreversibly. Enforced on the backend to prevent bypassing the frontend.
     if from_by_peer(peer) != "owner" {
-    logw(&format!("remove: rejected delete request from guest id={}", p.id));
+    logw(&format!("remove: rejected delete request from guest id={:?}", p.id));
     return (StatusCode::FORBIDDEN, "guest cannot delete").into_response();
     }
+    let Some(ref id) = p.id else {
+        return (StatusCode::BAD_REQUEST, "missing id").into_response();
+    };
     // Resolve the entry first so a materialized inbox file can be deleted before
     // the record is dropped.
-    let Some(entry) = catalog::find(&p.id) else {
+    let Some(entry) = catalog::find(id) else {
         return (StatusCode::NOT_FOUND, "not found").into_response();
     };
+    let force = p.force.unwrap_or(0) != 0;
 
     let (label, binned) = match &entry.body {
         catalog::MsgBody::File { source, name, .. } => match source {
@@ -1127,9 +1139,24 @@ pub(crate) async fn remove(
                         }
                     };
                     (format!("{name}: record removed ({detail})"), false)
-                } else {
+                } else if force {
+                    // Confirmed "delete permanently": bin attempt, fallback hard.
                     let (detail, binned) = trash_inbox_file(path);
                     (format!("{name}: record removed ({detail})"), binned)
+                } else {
+                    // Unconfirmed: the bin's verdict decides. Refusal answers
+                    // 409 with record + bytes untouched, so the frontend can
+                    // ask "delete permanently?" (Explorer's oversize prompt).
+                    match trash::delete(path) {
+                        Ok(()) => (
+                            format!("{name}: record removed (inbox file moved to Recycle Bin)"),
+                            true,
+                        ),
+                        Err(e) => {
+                            logw(&format!("remove: bin refused {} ({}), asking", path, e));
+                            return (StatusCode::CONFLICT, "bin-refused").into_response();
+                        }
+                    }
                 }
             }
             // Legacy zero-copy rows point at an original PC path tinbox does not
@@ -1159,18 +1186,22 @@ pub(crate) async fn remove(
     (StatusCode::OK, if binned { "binned" } else { "deleted" }).into_response()
 }
 
-/// Delete EVERYTHING in one sweep: every record plus every tinbox-owned inbox
-/// copy (to the Recycle Bin — same semantics as /rm, so a sweep is
-/// recoverable too). PC-only like /rm (same rationale, amplified — a guest must
-/// not be able to vaporize the owner's history). Per-entry semantics mirror
-/// remove(): Remote inbox copies go to the bin, legacy Local
-/// originals are kept, pending writers are flagged so their partials tear
-/// down. One persist (take_all) and one List push for the whole sweep, not N.
-pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> impl IntoResponse {
+/// Delete EVERYTHING in one sweep, in two phases like /rm: landed inbox
+/// copies go to the Recycle Bin; files the bin refuses stay fully intact
+/// (record + bytes + poster) and the sweep answers 409, so the frontend can
+/// ask "delete the rest permanently?" — force=1 is that confirmation (bin
+/// attempt, fallback hard). PC-only like /rm (same rationale, amplified — a
+/// guest must not be able to vaporize the owner's history). One List push for
+/// the whole sweep, not N.
+pub(crate) async fn remove_all(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Query(p): Query<RmQuery>,
+) -> impl IntoResponse {
     if from_by_peer(peer) != "owner" {
         logw("remove-all: rejected delete request from guest");
         return (StatusCode::FORBIDDEN, "guest cannot delete").into_response();
     }
+    let force = p.force.unwrap_or(0) != 0;
     let all = catalog::take_all();
     if all.is_empty() {
         return (StatusCode::OK, "nothing to delete").into_response();
@@ -1178,42 +1209,75 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
     let mut files = 0usize;
     let mut texts = 0usize;
     let mut binned = 0usize;
-    for e in &all {
+    let mut refused: Vec<catalog::Entry> = Vec::new();
+    let total = all.len();
+    for e in all {
         // Same teardown as remove(): stop the writer, drop the mirror.
         if e.pending {
             cancel_lock().insert(e.id.clone());
         }
         dl_lock().remove(&e.id);
+        let mut keep = false;
         match &e.body {
             catalog::MsgBody::File { source, .. } => {
                 files += 1;
                 if let catalog::Source::Remote { path } = source {
-                    // Landed copies go to the bin (failures already logged);
-                    // never-landed partials are hard-deleted, like everywhere.
+                    // Never-landed partials are garbage: hard-delete, no bin,
+                    // no confirm — like everywhere else.
                     if e.pending {
                         if std::fs::remove_file(path).is_err() {
                             logw(&format!("remove-all: could not delete partial {}", path));
                         }
-                    } else if trash_inbox_file(path).1 {
-                        binned += 1;
+                    } else if force {
+                        if trash_inbox_file(path).1 {
+                            binned += 1;
+                        }
+                    } else {
+                        match trash::delete(path) {
+                            Ok(()) => binned += 1,
+                            Err(er) => {
+                                logw(&format!("remove-all: bin refused {} ({}), asking", path, er));
+                                keep = true;
+                            }
+                        }
                     }
                 }
             }
             catalog::MsgBody::Text { .. } => texts += 1,
         }
+        if keep {
+            // Untouched: record goes back, bytes and poster stay.
+            refused.push(e);
+            continue;
+        }
+        if matches!(e.body, catalog::MsgBody::File { .. }) {
+            crate::poster::unlink(&e.id);
+        }
     }
-    crate::poster::clear_all();
-    let _ = notifier().send(PushEvent::List(catalog::all_items()));
+    if !refused.is_empty() {
+        let r = refused.len();
+        // Put the kept records back (single persist); the binned ones stay gone.
+        catalog::restore(refused);
+        let _ = notifier().send(PushEvent::List(catalog::all_items()));
+        logf(&format!(
+            "remove-all: swept what the bin took ({binned} binned), {r} refused — asking"
+        ));
+        return (
+            StatusCode::CONFLICT,
+            format!("binrefused:{}:{}", binned, r),
+        )
+            .into_response();
+    }
     logf(&format!(
         "remove-all: cleared {} entries ({} files, {} texts, {} binned)",
-        all.len(),
+        total,
         files,
         texts,
         binned
     ));
     (
         StatusCode::OK,
-        format!("cleared:{}:{}:{}", all.len(), binned, files),
+        format!("cleared:{}:{}:{}", total, binned, files),
     )
         .into_response()
 }

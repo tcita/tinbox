@@ -34,10 +34,6 @@ pub fn unlink(id: &str) {
     let _ = std::fs::remove_file(path_for(id));
 }
 
-pub fn clear_all() {
-    let _ = std::fs::remove_dir_all(poster_dir());
-}
-
 /// Queue a poster extract if this is a video. No-op for other types, missing
 /// files, or a sidecar that already exists (that path just marks catalog).
 pub fn request(id: &str, path: &Path, name: &str) {

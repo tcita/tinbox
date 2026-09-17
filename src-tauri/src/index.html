@@ -742,10 +742,27 @@
       <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
     </div>
     <div class="fw-title">清空全部消息？</div>
-    <div class="fw-desc">将删除全部文字与文件记录，收件箱内的文件副本一并删除，此操作不可撤销。</div>
+    <div class="fw-desc">将删除全部文字与文件记录，收件箱内的文件移入回收站，此操作不可撤销。</div>
     <div class="fw-btns">
       <button class="fw-btn quit" id="clearCancel">取消</button>
       <button class="fw-btn danger" id="clearConfirm">清空</button>
+    </div>
+  </div>
+</div>
+
+<!-- Permanent-delete confirm (PC): the Recycle Bin refused these bytes
+     (oversize, detached volume) — Explorer's "delete permanently?" prompt.
+     No backdrop dismiss, same as clear-all: both exits are explicit. -->
+<div class="fw-overlay" id="permOverlay">
+  <div class="fw-card danger">
+    <div class="fw-icon">
+      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+    </div>
+    <div class="fw-title">无法移入回收站</div>
+    <div class="fw-desc" id="permDesc"></div>
+    <div class="fw-btns">
+      <button class="fw-btn quit" id="permCancel">取消</button>
+      <button class="fw-btn danger" id="permConfirm">永久删除</button>
     </div>
   </div>
 </div>
@@ -1036,18 +1053,51 @@ async function delItem(it){
   // Name the outcome only when bytes moved: "binned" (space returns after
   // emptying the bin) vs fallback hard-delete ("deleted" — space freed now).
   // Record-only removals (texts, legacy local rows) stay silent: the gone
-  // card is proof.
-  if(!res.ok) toast('删除失败');
-  else if(it.kind !== 'text' && it.source_kind !== 'local'){
-    try {
-      const t = (await res.text()).trim();
-      if(t === 'binned') toast('已移入回收站');
-      else if(t === 'deleted') toast('已彻底删除');
+  // card is proof. 409 "bin-refused" asks first: nothing was touched, the
+  // user confirms permanent delete in the overlay below.
+  if(res.ok){
+    if(it.kind !== 'text' && it.source_kind !== 'local'){
+      try {
+        const t = (await res.text()).trim();
+        if(t === 'binned') toast('已移入回收站');
+        else if(t === 'deleted') toast('已彻底删除');
+      }
+      catch {}
     }
-    catch {}
+  } else {
+    let t = '';
+    try { t = (await res.text()).trim(); } catch {}
+    if(res.status === 409 && t === 'bin-refused'){
+      permMode = { kind: 'one', it };
+      permDesc.textContent = `“${it.name}”无法移入回收站，将永久删除，继续吗？`;
+      $('permOverlay').classList.add('show');
+    }
+    else toast('删除失败');
   }
   refresh();
 }
+// Permanent-delete confirm state: { kind: 'one', it } for a single file the
+// bin refused, { kind: 'all', refused } for a sweep remainder. force=1 is the
+// user's "yes, delete permanently" — bin attempt, fallback hard.
+let permMode = null;
+const permDesc = $('permDesc');
+$('permCancel').onclick = () => { $('permOverlay').classList.remove('show'); permMode = null; };
+$('permConfirm').onclick = async () => {
+  $('permOverlay').classList.remove('show');
+  const m = permMode; permMode = null;
+  if(!m) return;
+  try {
+    if(m.kind === 'one'){
+      const r = await serverFetch('/rm', { method:'POST', query:{ id: m.it.id, force: 1 } });
+      if(!r.ok) toast('删除失败');
+      else toast((await r.text()).trim() === 'binned' ? '已移入回收站' : '已彻底删除');
+    } else {
+      const r = await serverFetch('/rm-all', { method:'POST', query:{ force: 1 } });
+      toast(r.ok ? '已清空，已彻底删除' : '清空失败');
+    }
+  } catch { toast(m.kind === 'one' ? '删除失败' : '清空失败'); }
+  refresh();
+};
 async function revealItem(it){
   const res = await serverFetch('/reveal', { method:'POST', query:{ id: it.id } });
   if(!res.ok) toast('文件不存在');
@@ -2138,8 +2188,7 @@ $('clearConfirm').onclick = async () => {
   $('clearOverlay').classList.remove('show');
   try {
     const r = await serverFetch('/rm-all', {method:'POST'});
-    if(!r.ok){ toast('清空失败'); }
-    else {
+    if(r.ok){
       // Server answers "cleared:<n>:<binned>:<files>" — name the bin only
       // when files went there, "thorough" when files were hard-deleted, so
       // the toast never lies about disk space.
@@ -2149,6 +2198,21 @@ $('clearConfirm').onclick = async () => {
         if(m && +m[2] > 0) extra = +m[1] > 0 ? '，文件进回收站' : '，已彻底删除';
       } catch {}
       toast('已清空' + extra);
+    } else {
+      // 409 "binrefused:<binned>:<refused>": the binned ones are already
+      // gone (List pushed), the refused stay fully intact — confirm wipes
+      // only the remainder permanently.
+      let t = '';
+      try { t = (await r.text()).trim(); } catch {}
+      const m = /^binrefused:(\d+):(\d+)$/.exec(t);
+      if(r.status === 409 && m){
+        permMode = { kind: 'all' };
+        permDesc.textContent = +m[1] > 0
+          ? `其中 ${m[1]} 个已移入回收站，${m[2]} 个无法进入回收站，永久删除这 ${m[2]} 个吗？`
+          : `${m[2]} 个文件无法进入回收站，将永久删除，继续吗？`;
+        $('permOverlay').classList.add('show');
+      }
+      else toast('清空失败');
     }
   } catch { toast('清空失败'); }
   refresh();
