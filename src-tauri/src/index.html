@@ -126,7 +126,7 @@
     color: var(--sub); display: grid; place-items: center; cursor: pointer; transition: all .15s ease;
   }
   .st-x:hover { background: var(--card-subtle); color: var(--text); }
-  .st-body { padding: 16px 22px 6px; }
+  .st-body { padding: 16px 22px 18px; }
   .st-section { margin-bottom: 14px; }
   .st-section-title { margin: 0 0 7px; font-size: 12px; font-weight: 650; color: var(--sub); letter-spacing: .15px; }
   .st-panel { border: 1px solid var(--line); border-radius: 14px; background: var(--card-subtle); overflow: hidden; }
@@ -136,9 +136,11 @@
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
   }
   .st-path-row { display: flex; align-items: center; gap: 12px; }
+  .st-path-row .st-path { flex: 1; }
   .st-change {
     flex: none; border: 1px solid var(--line-strong); background: var(--card); color: var(--accent);
-    border-radius: 9px; padding: 7px 10px; font: 600 12px inherit; cursor: pointer; transition: all .15s ease;
+    border-radius: 9px; padding: 7px 10px; font: 600 12px inherit; text-align: center;
+    cursor: pointer; transition: all .15s ease;
   }
   .st-change:hover { border-color: var(--accent); background: var(--accent-bg); }
   .st-impact { display: flex; align-items: flex-start; gap: 7px; margin-top: 11px; font-size: 12px; color: var(--sub); line-height: 1.4; }
@@ -160,22 +162,26 @@
   .radio-row button.sel .dot::after { content: ''; position: absolute; inset: 2px; border-radius: 50%; background: var(--accent); }
   .st-option-title { display: block; margin-bottom: 3px; font-size: 13px; font-weight: 650; }
   .st-danger-section { padding-top: 4px; border-top: 1px solid var(--line); }
+  .st-section-title.danger { color: var(--danger); }
+  /* Pure #ff3b30 vibrates on black: soften the heading red in dark mode.
+     The button keeps the full danger red — the signal stays, the glare goes. */
+  @media (prefers-color-scheme: dark) {
+    .st-section-title.danger { color: #ff7a72; }
+  }
   .st-danger-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 13px; }
   .st-danger-copy { min-width: 0; }
   .st-danger-title { font-size: 13px; font-weight: 650; color: var(--text); }
   .st-danger-desc { margin-top: 3px; font-size: 11.5px; line-height: 1.35; color: var(--sub); }
   .st-danger-btn {
     flex: none; border: 1px solid rgba(255,59,48,.35); border-radius: 9px; padding: 7px 10px;
-    background: var(--card); color: var(--danger); font: 600 12px inherit; cursor: pointer; transition: all .15s ease;
+    background: var(--card); color: var(--danger); font: 600 12px inherit; text-align: center;
+    cursor: pointer; transition: all .15s ease;
   }
   .st-danger-btn:hover { border-color: var(--danger); background: var(--danger-bg); }
-  .st-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 22px 18px; }
-  .fw-hint.st-hint { flex: 1; margin: 0; text-align: right; }
   @media (max-width: 430px) {
     #settingsOverlay { padding: 12px; }
     .st-head { padding: 18px 18px 15px; }
-    .st-body { padding: 14px 18px 4px; }
-    .st-footer { padding: 8px 18px 15px; }
+    .st-body { padding: 14px 18px 16px; }
   }
 
   /* Primary connect entry (PC): a labeled pill, not a bare QR tile — a 28px
@@ -690,7 +696,7 @@
   .fw-btns { display: flex; gap: 10px; }
   .fw-btn {
     flex: 1; border: 0; border-radius: 12px; padding: 11px 0; font-size: 14px;
-    font-weight: 600; cursor: pointer; transition: all 0.15s ease;
+    font-weight: 600; text-align: center; cursor: pointer; transition: all 0.15s ease;
   }
   .fw-btn:active { transform: scale(0.97); }
   .fw-btn.repair { background: var(--accent); color: #fff; }
@@ -807,7 +813,7 @@
       <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
     </div>
     <div class="fw-title">清空全部内容？</div>
-    <div class="fw-desc">将删除全部文字与文件记录，收件箱内的文件移入回收站；过大或回收站拒收的文件会保留，此操作不可撤销。</div>
+    <div class="fw-desc" style="text-align:center">收件箱内的文件将移入回收站。</div>
     <div class="fw-btns">
       <button class="fw-btn quit" id="clearCancel">取消</button>
       <button class="fw-btn danger" id="clearConfirm">清空</button>
@@ -828,8 +834,8 @@
       <section class="st-section">
         <h2 class="st-section-title">收件箱位置</h2>
         <div class="st-panel st-location">
-          <div class="st-path-row"><div class="st-path" id="stPath" title="">…</div><button class="st-change" id="stChange">更改位置</button></div>
-          <div class="st-impact"><svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10" fill="currentColor"/><path d="M12 6.8v6.4m0 3.9h.01" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/></svg><span>更改后需重启应用生效。</span></div>
+          <div class="st-path-row"><div class="st-path" id="stPath">…</div><button class="st-change" id="stChange">更改位置</button></div>
+          <div class="st-impact"><svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10" fill="currentColor"/><path d="M12 6.8v6.4m0 3.9h.01" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/></svg><span>更改收件箱位置后需要重启应用以生效。</span></div>
         </div>
       </section>
       <section class="st-section">
@@ -840,13 +846,13 @@
         </div>
       </section>
       <section class="st-section st-danger-section">
+        <h2 class="st-section-title danger">危险区</h2>
         <div class="st-panel st-danger-row">
-          <div class="st-danger-copy"><div class="st-danger-title">删除全部文字与文件记录</div>
+          <div class="st-danger-copy"><div class="st-danger-title">删除全部文字与文件记录</div></div>
           <button class="st-danger-btn" id="clearBtn">清空</button>
         </div>
       </section>
     </div>
-    <footer class="st-footer"><div class="fw-hint st-hint" id="stHint"></div></footer>
   </div>
 </div>
 
@@ -2240,15 +2246,12 @@ $('settingsBtn').onclick = openSettings;
 $('stClose').onclick = () => { $('settingsOverlay').classList.remove('show'); };
 async function openSettings(){
   $('settingsOverlay').classList.add('show');
-  $('stHint').textContent = '';
   $('stPath').textContent = '…';
   try {
     const r = await serverFetch('/settings');
     if(!r.ok) throw 0;
     const s = await r.json();
     $('stPath').textContent = s.inbox_dir;
-    $('stPath').title = s.inbox_dir;
-    if(!s.is_default) $('stHint').textContent = '已使用自定义位置';
     paintCloseRadio(s.close_behavior || 'tray');
   } catch { $('stPath').textContent = '读取失败'; }
 }
@@ -2280,8 +2283,6 @@ $('stChange').onclick = async () => {
     if(!r.ok){ toast(await r.text() || '保存失败'); return; }
     const s = await r.json();
     $('stPath').textContent = s.inbox_dir;
-    $('stPath').title = s.inbox_dir;
-    $('stHint').textContent = '已保存，重启应用后生效';
   } catch { toast('保存失败'); }
 };
 $('clearConfirm').onclick = async () => {

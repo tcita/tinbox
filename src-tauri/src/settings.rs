@@ -141,10 +141,20 @@ pub fn load() {
     logf(&format!("settings: custom inbox_dir loaded: {}", path.display()));
 }
 
-/// Normalize + validate a candidate directory and persist it. Creates the
-/// directory (with a write probe, so a read-only or bogus location fails HERE
-/// with a message instead of failing uploads later). Does NOT move existing
-/// files and does NOT touch the running state — the caller restarts.
+/// Normalize + validate a candidate directory and persist it.
+///
+/// Safety first: the persisted directory becomes a landing zone that
+/// reconcile() adopts wholesale (every file becomes an entry, and /rm really
+/// deletes files) — so the chosen location is NEVER used directly. The
+/// effective inbox is always an `inbox` child inside it, meaning picking
+/// Desktop (or any lived-in folder, or even a drive root) cannot swallow the
+/// user's own files. A directory already named `inbox` is used as-is, so
+/// re-picking the current location never nests `inbox/inbox`.
+///
+/// Creates the directory (with a write probe, so a read-only or bogus
+/// location fails HERE with a message instead of failing uploads later).
+/// Does NOT move existing files and does NOT touch the running state — the
+/// caller restarts.
 pub fn save_inbox_dir(raw: &str) -> Result<PathBuf, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -157,27 +167,36 @@ pub fn save_inbox_dir(raw: &str) -> Result<PathBuf, String> {
     if path.is_file() {
         return Err("该路径已是一个文件，请选择目录".to_string());
     }
-    if let Err(e) = std::fs::create_dir_all(&path) {
-        return Err(format!("无法创建目录: {e}"));
-    }
-    // Write probe: create_dir_all succeeding does not prove writability
-    // (ACLs, read-only mounts). A probe file that cannot be removed is still
-    // proof enough of writability — leave no litter on the remove failure.
-    let probe = path.join(".tinbox_write_test");
-    if let Err(e) = std::fs::write(&probe, b"ok") {
-        return Err(format!("目录不可写: {e}"));
-    }
-    let _ = std::fs::remove_file(&probe);
     // Strip trailing separators for stable display + comparison, but never
     // reduce a root (C:\, \\) to nothing.
     let mut normalized = trimmed.to_string();
     while normalized.len() > 3 && (normalized.ends_with(['\\', '/'])) {
         normalized.pop();
     }
+    let base = PathBuf::from(&normalized);
+    let already_inbox = base
+        .file_name()
+        .map(|n| n.to_string_lossy().eq_ignore_ascii_case("inbox"))
+        .unwrap_or(false);
+    let final_path = if already_inbox {
+        base
+    } else {
+        base.join("inbox")
+    };
+    if let Err(e) = std::fs::create_dir_all(&final_path) {
+        return Err(format!("无法创建目录: {e}"));
+    }
+    // Write probe: create_dir_all succeeding does not prove writability
+    // (ACLs, read-only mounts). A probe file that cannot be removed is still
+    // proof enough of writability — leave no litter on the remove failure.
+    let probe = final_path.join(".tinbox_write_test");
+    if let Err(e) = std::fs::write(&probe, b"ok") {
+        return Err(format!("目录不可写: {e}"));
+    }
+    let _ = std::fs::remove_file(&probe);
     let mut file = read_settings_file();
-    file.inbox_dir = Some(normalized.clone());
+    file.inbox_dir = Some(final_path.to_string_lossy().into_owned());
     persist(&file)?;
-    let final_path = PathBuf::from(&normalized);
     *memo().lock().unwrap_or_else(|e| e.into_inner()) = Some(final_path.clone());
     logf(&format!("settings: inbox_dir set to {} (restart to take effect)", final_path.display()));
     Ok(final_path)
@@ -262,23 +281,6 @@ pub(crate) async fn set_inbox_dir(
     }
 }
 
-/// Open the data directory (log/index/settings) in Explorer. PC-only: a guest
-/// request must not pop windows on the PC (same guard as /open-dir).
-pub(crate) async fn open_data_dir(
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-) -> impl IntoResponse {
-    if from_by_peer(peer) != "owner" {
-        return (StatusCode::FORBIDDEN, "guest cannot open PC folders").into_response();
-    }
-    match open::that(crate::logger::data_root()) {
-        Ok(_) => (StatusCode::OK, "opened").into_response(),
-        Err(e) => {
-            logw(&format!("settings: could not open data directory: {e}"));
-            (StatusCode::INTERNAL_SERVER_ERROR, "open failed").into_response()
-        }
-    }
-}
-
 /// Open the native directory picker on the PC and return the chosen path
 /// (null when cancelled). Server-driven — not the webview's Tauri JS dialog —
 /// so a loopback desktop browser gets the same picker as the app window, and
@@ -297,7 +299,7 @@ pub(crate) async fn pick_dir(
         use tauri_plugin_dialog::DialogExt;
         app.dialog()
             .file()
-            .set_title("选择收件箱目录")
+            .set_title("选择收件箱位置（将创建 inbox 文件夹）")
             // Starting from the active inbox preserves the user's context;
             // without an explicit directory Windows commonly opens Downloads.
             .set_directory(effective_inbox_dir())
