@@ -1111,10 +1111,26 @@ pub(crate) async fn remove(
     let (label, binned) = match &entry.body {
         catalog::MsgBody::File { source, name, .. } => match source {
             // Every Remote file is a tinbox-owned inbox copy (a phone upload, or a
-            // PC file copied in on add): deleting the record bins the copy too.
+            // PC file copied in on add): deleting the record bins the copy too —
+            // unless it never landed (pending partials are transfer garbage,
+            // hard-deleted like everywhere else).
             catalog::Source::Remote { path } => {
-                let (detail, binned) = trash_inbox_file(path);
-                (format!("{name}: record removed ({detail})"), binned)
+                if entry.pending {
+                    let detail = match std::fs::remove_file(path) {
+                        Ok(()) => "inbox partial deleted",
+                        Err(e) => {
+                            logw(&format!(
+                                "remove: could not delete partial {}: {}",
+                                path, e
+                            ));
+                            "inbox partial left on disk (delete failed)"
+                        }
+                    };
+                    (format!("{name}: record removed ({detail})"), false)
+                } else {
+                    let (detail, binned) = trash_inbox_file(path);
+                    (format!("{name}: record removed ({detail})"), binned)
+                }
             }
             // Legacy zero-copy rows point at an original PC path tinbox does not
             // own: remove the record only.
@@ -1172,8 +1188,13 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
             catalog::MsgBody::File { source, .. } => {
                 files += 1;
                 if let catalog::Source::Remote { path } = source {
-                    // Same bin semantics as remove(); failures already logged.
-                    if trash_inbox_file(path).1 {
+                    // Landed copies go to the bin (failures already logged);
+                    // never-landed partials are hard-deleted, like everywhere.
+                    if e.pending {
+                        if std::fs::remove_file(path).is_err() {
+                            logw(&format!("remove-all: could not delete partial {}", path));
+                        }
+                    } else if trash_inbox_file(path).1 {
                         binned += 1;
                     }
                 }
@@ -1192,7 +1213,7 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
     ));
     (
         StatusCode::OK,
-        format!("cleared:{}:{}", all.len(), binned),
+        format!("cleared:{}:{}:{}", all.len(), binned, files),
     )
         .into_response()
 }

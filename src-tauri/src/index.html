@@ -1033,13 +1033,17 @@ async function copyFile(it){
 // context-menu action; the toast reports the outcome.
 async function delItem(it){
   const res = await serverFetch('/rm', { method:'POST', query:{ id: it.id } });
-  // Files land in the Recycle Bin (disk space returns only after emptying
-  // it) — but only when the server says so ("binned"); a fallback
-  // hard-delete reports plain "deleted" and stays silent like before.
-  // Texts vanish silently either way: the gone card is proof.
+  // Name the outcome only when bytes moved: "binned" (space returns after
+  // emptying the bin) vs fallback hard-delete ("deleted" — space freed now).
+  // Record-only removals (texts, legacy local rows) stay silent: the gone
+  // card is proof.
   if(!res.ok) toast('删除失败');
-  else {
-    try { if((await res.text()).trim() === 'binned') toast('已移入回收站'); }
+  else if(it.kind !== 'text' && it.source_kind !== 'local'){
+    try {
+      const t = (await res.text()).trim();
+      if(t === 'binned') toast('已移入回收站');
+      else if(t === 'deleted') toast('已彻底删除');
+    }
     catch {}
   }
   refresh();
@@ -2136,12 +2140,13 @@ $('clearConfirm').onclick = async () => {
     const r = await serverFetch('/rm-all', {method:'POST'});
     if(!r.ok){ toast('清空失败'); }
     else {
-      // Server answers "cleared:<n>:<binned>" — name the bin only when files
-      // actually went there, so the toast never lies about disk space.
+      // Server answers "cleared:<n>:<binned>:<files>" — name the bin only
+      // when files went there, "thorough" when files were hard-deleted, so
+      // the toast never lies about disk space.
       let extra = '';
       try {
-        const m = /^cleared:\d+:(\d+)$/.exec((await r.text()).trim());
-        if(m && +m[1] > 0) extra = '，文件进回收站';
+        const m = /^cleared:\d+:(\d+):(\d+)$/.exec((await r.text()).trim());
+        if(m && +m[2] > 0) extra = +m[1] > 0 ? '，文件进回收站' : '，已彻底删除';
       } catch {}
       toast('已清空' + extra);
     }
