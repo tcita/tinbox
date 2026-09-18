@@ -140,8 +140,9 @@
   .radio-row button.sel .dot { border-color: var(--accent); }
   .radio-row button.sel .dot::after { content: ''; position: absolute; inset: 2px; border-radius: 50%; background: var(--accent); }
   .st-option-title { display: block; margin-bottom: 3px; font-size: 13px; font-weight: 650; }
+  .st-option-desc { display: block; font-size: 12px; color: var(--sub); line-height: 1.4; }
   .st-danger-section { padding-top: 4px; border-top: 1px solid var(--line); }
-  .st-section-title.danger { color: #ff7a72; }
+  .st-danger-section .st-panel + .st-panel { margin-top: 8px; }
   .st-danger-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 13px; }
   .st-danger-copy { min-width: 0; }
   .st-danger-title { font-size: 13px; font-weight: 650; color: var(--text); }
@@ -816,15 +817,19 @@
       <section class="st-section">
         <h2 class="st-section-title">关闭窗口时</h2>
         <div class="st-panel radio-row" id="stCloseRadio">
-          <button data-v="tray"><span class="dot"></span><span class="st-option-title">最小化到托盘</span></button>
-          <button data-v="quit"><span class="dot"></span><span class="st-option-title">直接退出</span></button>
+          <button data-v="tray"><span class="dot"></span><span class="st-option-title">最小化到托盘</span><span class="st-option-desc">关闭窗口，服务继续运行，手机不断连</span></button>
+          <button data-v="quit"><span class="dot"></span><span class="st-option-title">直接退出</span><span class="st-option-desc">关闭即退出程序，手机需重新扫码连接</span></button>
         </div>
       </section>
       <section class="st-section st-danger-section">
-        <h2 class="st-section-title danger">危险区</h2>
+        <h2 class="st-section-title">高级操作</h2>
         <div class="st-panel st-danger-row">
           <div class="st-danger-copy"><div class="st-danger-title">删除全部文字与文件记录</div></div>
           <button class="st-danger-btn" id="clearBtn">清空</button>
+        </div>
+        <div class="st-panel st-danger-row">
+          <div class="st-danger-copy"><div class="st-danger-title">查看日志与配置文件</div></div>
+          <button class="st-change" id="stOpenData">打开文件夹</button>
         </div>
       </section>
     </div>
@@ -2219,6 +2224,12 @@ $('clearCancel').onclick = () => { $('clearOverlay').classList.remove('show'); }
 // it until the user quits via the tray and relaunches.
 $('settingsBtn').onclick = openSettings;
 $('stClose').onclick = () => { $('settingsOverlay').classList.remove('show'); };
+$('stOpenData').onclick = async () => {
+  try {
+    const r = await serverFetch('/settings/open-data-dir', { method:'POST' });
+    if(!r.ok) throw 0;
+  } catch { toast('打开失败'); }
+};
 async function openSettings(){
   $('settingsOverlay').classList.add('show');
   $('stPath').textContent = '…';

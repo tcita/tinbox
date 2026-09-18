@@ -281,6 +281,23 @@ pub(crate) async fn set_inbox_dir(
     }
 }
 
+/// Open the data directory (log/index/settings) in Explorer. PC-only: a guest
+/// request must not pop windows on the PC (same guard as /open-dir).
+pub(crate) async fn open_data_dir(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> impl IntoResponse {
+    if from_by_peer(peer) != "owner" {
+        return (StatusCode::FORBIDDEN, "guest cannot open PC folders").into_response();
+    }
+    match open::that(crate::logger::data_root()) {
+        Ok(_) => (StatusCode::OK, "opened").into_response(),
+        Err(e) => {
+            logw(&format!("settings: could not open data directory: {e}"));
+            (StatusCode::INTERNAL_SERVER_ERROR, "open failed").into_response()
+        }
+    }
+}
+
 /// Open the native directory picker on the PC and return the chosen path
 /// (null when cancelled). Server-driven — not the webview's Tauri JS dialog —
 /// so a loopback desktop browser gets the same picker as the app window, and
