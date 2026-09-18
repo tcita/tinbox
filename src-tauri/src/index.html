@@ -661,6 +661,9 @@
     border: 1px solid var(--line);
     animation: zoomIn 0.3s var(--ease-spring);
   }
+  /* The firewall card carries the longer two-step explanation; a touch wider
+     than the 360px default so the action line is not shredded by wrapping. */
+  #fwOverlay .fw-card { max-width: 400px; }
   .fw-icon {
     width: 54px; height: 54px; border-radius: 16px; display: inline-flex;
     align-items: center; justify-content: center; margin-bottom: 14px;
@@ -669,6 +672,8 @@
   .fw-card.danger .fw-icon { background: var(--danger-bg); color: var(--danger); }
   .fw-title { font-size: 17px; font-weight: 700; margin: 0 0 8px; letter-spacing: -0.3px; }
   .fw-desc { font-size: 13px; color: var(--sub); line-height: 1.5; margin: 0 0 22px; text-align: left; }
+  .fw-desc-b { display: block; margin-top: 6px; }
+  .fw-desc b { color: var(--text); font-weight: 600; }
   .fw-btns { display: flex; gap: 10px; }
   .fw-btn {
     flex: 1; border: 0; border-radius: 12px; padding: 11px 0; font-size: 14px;
@@ -683,6 +688,15 @@
   .fw-btn.quit:hover { background: var(--line); }
   .fw-btn:disabled { opacity: 0.5; pointer-events: none; }
   .fw-hint { font-size: 11.5px; color: var(--sub); margin-top: 12px; line-height: 1.4; }
+  /* "Applying rules" marker: shown only while the elevated script is running
+     (the fwrepair 'granted' window). Reuses the boot spinner geometry at a
+     smaller size — the same "working" vocabulary as the boot state. */
+  .fw-hint.busy::before {
+    content: ''; display: inline-block; width: 11px; height: 11px;
+    margin-right: 6px; vertical-align: -1px; border-radius: 50%;
+    border: 2px solid var(--line-strong); border-top-color: var(--accent);
+    animation: bootSpin 0.8s linear infinite;
+  }
 
   /* Home-screen web app gate (phone): same card geometry as the retired
    pairing overlay — one-message-one-action language. */
@@ -771,7 +785,7 @@
       <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
     </div>
     <div class="fw-title">允许局域网连接</div>
-    <div class="fw-desc">为保障局域网连接，请授权 tinbox 维护一条仅限自身的防火墙放行规则；点击“允许”并在 UAC 弹窗中再次确认即可。</div>
+    <div class="fw-desc">为保障局域网连接，请授权 tinbox 维护一条仅限自身的防火墙放行规则。<span class="fw-desc-b">点击“允许”后，会另行弹出一个独立的<b>“用户帐户控制”</b>窗口，请在其中<b>再次确认</b>。</span></div>
     <div class="fw-btns">
       <button class="fw-btn repair" id="fwRepair">允许</button>
       <button class="fw-btn quit" id="fwQuit">退出</button>
@@ -2539,6 +2553,10 @@ function connect(){
   // and the transfer mirrors so nothing stays stale.
   es.addEventListener('resync', () => { lastSeen = Date.now(); reconcile(); });
   es.addEventListener('fw', e => { lastSeen = Date.now(); applyFw(JSON.parse(e.data).needRepair); });
+  // UAC outcome for an in-flight repair (see applyFwPhase): the frontend
+  // cannot see the UAC prompt, so the backend reports "granted" once the
+  // elevated script proves it is running.
+  es.addEventListener('fwrepair', e => { lastSeen = Date.now(); applyFwPhase(JSON.parse(e.data).phase); });
   es.addEventListener('info', e => { lastSeen = Date.now(); applyInfo(JSON.parse(e.data)); });
   // Fresh pairing (QR scan / hand-typed URL): the one exact pairing moment —
   // unlike `info`, which is a sampled presence bit. Toast every time, even if
@@ -2637,6 +2655,7 @@ document.addEventListener('visibilitychange', () => {
 });
 
 let fwWasShown = false;
+let fwPhase = null;       // null | 'launched' | 'granted'
 // Firewall repair flag arrives as an SSE `fw` event (the server pushes only on
 // change); no /fw-status polling. The flag means the rule table is not the
 // canonical exactly-one-Allow-on-Any-profile: an applicable Block, a Block
@@ -2650,6 +2669,26 @@ let fwWasShown = false;
 // just dies with no UI to repair from. Hence repair-now, not
 // repair-on-failure. There is no dismiss: the fix is one UAC prompt, and
 // after it the all-profile Allow makes the issue permanent-impossible.
+function fwButtons(allow, quit, hint){
+  $('fwRepair').disabled = allow;
+  $('fwQuit').disabled = quit;
+  if(hint !== undefined) $('fwHint').textContent = hint;
+}
+function fwBusy(on){ $('fwHint').classList.toggle('busy', !!on); }
+// 'granted' is the one reliable proof the repair actually started (the
+// elevated script's STARTED marker; the launcher exit code cannot tell —
+// ShellExecute succeeds even on cancel). From then on 允许 stays disabled for
+// good: a second run would not fix what the first could not. 退出 is never
+// disabled — quitting is safe, since the elevated repair is an independent
+// process that finishes on its own. A cancelled prompt sends nothing, so 允许
+// stays disabled too; retrying means a relaunch.
+function applyFwPhase(phase){
+  if(!isOwner || !$('fwOverlay').classList.contains('show')) return;
+  if(phase !== 'granted') return;
+  fwPhase = 'granted';
+  fwBusy(true);
+  fwButtons(true, false, '已授权,正在应用规则…');
+}
 function applyFw(needRepair){
   // Owner-only overlay: the repair flow raises a UAC prompt on the PC and the
   // quit button kills the process — neither is a guest's business.
@@ -2666,29 +2705,36 @@ function applyFw(needRepair){
     serverFetch('/untop', {method:'POST'}).catch(()=>{});
     toast('网络访问已恢复');
   }
+  if(!show){
+    // Overlay gone: no repair is in flight any more.
+    fwPhase = null;
+    fwBusy(false);
+    $('fwHint').textContent = '';
+  }
   fwWasShown = show;
 }
 $('fwRepair').onclick = async () => {
-  $('fwRepair').disabled = true;
-  $('fwQuit').disabled = true;
-  $('fwHint').textContent = '请在弹窗中确认管理员授权(UAC)…';
+  // The click disables 允许 and it is never re-enabled by a timer: from here
+  // the only exits are the worker closing the overlay (success) or 退出.
+  fwBusy(false);
+  fwButtons(true, false, '请在“用户帐户控制”窗口中确认授权…');
   try {
     const r = await serverFetch('/repair', {method:'POST'});
     const txt = await r.text();
     if(txt.trim() === 'ok'){
       // The launcher is spawned — the UAC prompt (if any) is on screen now.
-      // The fix is confirmed by the fw worker within ~1s of the rules
-      // landing: applyFw(false) closes this overlay. If the UAC prompt is
-      // cancelled, nothing changes and clicking Allow retries.
-      $('fwHint').textContent = '已发起授权,确认后此弹窗会自动关闭。';
+      // 'granted' (elevated script really started) freezes 允许 for good.
+      if(fwPhase === null) fwPhase = 'launched';
     } else {
-      $('fwHint').textContent = '未获授权,请点击“允许”重试。';
+      // The request itself failed — no UAC prompt was raised, so a retry is
+      // meaningful: re-enable 允许.
+      fwPhase = null;
+      fwButtons(false, false, '未获授权,请点击“允许”重试。');
     }
   } catch(e) {
-    $('fwHint').textContent = '请求失败,请重试';
+    fwPhase = null;
+    fwButtons(false, false, '请求失败,请重试');
   }
-  $('fwRepair').disabled = false;
-  $('fwQuit').disabled = false;
 };
 $('fwQuit').onclick = () => { serverFetch('/quit', {method:'POST'}).catch(()=>{}); };
 

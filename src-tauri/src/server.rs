@@ -58,6 +58,13 @@ pub(crate) enum PushEvent {
     Progress { id: String, total: u64, sent: u64 },
     /// Firewall repair flag changed.
     Fw(bool),
+    /// Firewall repair phase. Currently only "granted" is sent: it means the
+    /// elevated script's STARTED marker proved UAC was accepted and the script
+    /// is running. The frontend cannot observe UAC itself, so it freezes the
+    /// overlay on "granted" (no duplicate UAC, no bail-out mid-apply). A
+    /// cancelled prompt sends nothing — the rules never changed and the log
+    /// (launcher exited, no "elevated script started") explains it.
+    FwRepair(&'static str),
     /// A LAN device connected/disconnected, or the server address changed.
     /// Consumers: the PC arrival toast + URL display, and
     /// the presence logs. There is no ambient online/offline UI on either end
@@ -742,6 +749,10 @@ fn push_event_to_sse(ev: PushEvent) -> Event {
         PushEvent::Fw(need) => Event::default()
             .event("fw")
             .json_data(serde_json::json!({ "needRepair": need }))
+            .unwrap(),
+        PushEvent::FwRepair(phase) => Event::default()
+            .event("fwrepair")
+            .json_data(serde_json::json!({ "phase": phase }))
             .unwrap(),
         PushEvent::Info { mobile_connected, url } => Event::default()
             .event("info")

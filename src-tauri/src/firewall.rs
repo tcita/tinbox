@@ -40,7 +40,7 @@
 // Only takes effect on Windows; a no-op on other platforms.
 use crate::logger::{loge, logf};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 
@@ -146,6 +146,14 @@ fn log_wifi_link_rate() {
 
 static PENDING_REPAIR: AtomicBool = AtomicBool::new(false);
 
+/// Per-process repair-attempt counter. Each attempt gets its own scratch files
+/// (`tinbox_fw_fix_<pid>_<seq>.ps1` / `.result`) so overlapping attempts can
+/// never clobber each other's script or result; combined with the named mutex
+/// that serializes the actual rule edit inside the elevated script, concurrent
+/// repairs are safe. Stale files from crashed runs are swept at startup.
+#[cfg_attr(not(windows), allow(dead_code))]
+static ATTEMPT_SEQ: AtomicU32 = AtomicU32::new(0);
+
 /// Entry point: run the firewall check in the background, without blocking
 /// setup/window creation (otherwise a cold powershell start can hang for
 /// seconds). A detected Block -> flag PENDING_REPAIR and bring the window to
@@ -159,11 +167,20 @@ pub fn ensure_background(app: AppHandle) {
             // Sweep stale repair scratch files first (exe-independent): a
             // UAC-denied click leaves the .ps1 behind — the elevated run
             // never starts, so nothing self-deletes it — and a crash can
-            // leave the result too. Anything present at startup is residue
-            // by definition (a fresh repair() deletes before launching).
-            for f in ["tinbox_fw_fix.ps1", "tinbox_fw_fix.result"] {
-                if std::fs::remove_file(data_dir().join(f)).is_ok() {
-                    logf(&format!("firewall: removed stale repair scratch file {f}"));
+            // leave the result too. Anything present at startup is residue by
+            // definition. Names are per-attempt (tinbox_fw_fix_<id>.ps1/.result),
+            // so match the shared prefix rather than one fixed pair.
+            if let Ok(rd) = std::fs::read_dir(data_dir()) {
+                for e in rd.flatten() {
+                    let name = e.file_name();
+                    if name.to_string_lossy().starts_with("tinbox_fw_fix") {
+                        if std::fs::remove_file(e.path()).is_ok() {
+                            logf(&format!(
+                                "firewall: removed stale repair scratch file {}",
+                                name.to_string_lossy()
+                            ));
+                        }
+                    }
                 }
             }
             let Some(exe) = exe_path() else {
@@ -422,28 +439,32 @@ pub fn need_repair() -> bool {
 pub fn repair() -> bool {
     #[cfg(windows)]
     {
-        // No click dedup on purpose: every click is a genuine request and
-        // spawns its own UAC — a cancelled prompt must be retry-able
-        // instantly, never gated by a cooldown. Stacked grants are safe: the
-        // script deletes the previous tinbox_Allow_Inbound before creating
-        // the new one, so N grants still converge to exactly one rule.
+        // Every click is a genuine request and spawns its own UAC — a cancelled
+        // prompt must be retry-able instantly, never gated by a cooldown. So
+        // concurrent attempts ARE possible (a retry while a first prompt is
+        // still up) and are made safe structurally rather than by rejecting
+        // them: each attempt owns uniquely-named scratch files, and the
+        // elevated script serializes the rule edit under a named mutex, so N
+        // attempts converge to exactly one canonical rule.
         let Some(exe) = exe_path() else {
             loge("firewall repair: could not get exe path");
             return false;
         };
-        // A stale result file from a previous attempt would let the watcher
-        // below report old news — remove it before launching.
-        let _ = std::fs::remove_file(result_path());
-        let started = repair_as_admin(&exe);
+        let id = format!(
+            "{}_{}",
+            std::process::id(),
+            ATTEMPT_SEQ.fetch_add(1, Ordering::SeqCst)
+        );
+        let started = repair_as_admin(&exe, &id);
         if started {
             // The elevated run is fire-and-forget, so its outcome is reported
-            // by watchers rather than a return value: the launcher's exit code
-            // (UAC granted vs denied) from repair_as_admin, and the result file
-            // the elevated script writes (OK / FAIL:<reason>) from this
-            // watcher. No separate rule re-check: the fw worker already
-            // re-judges the invariant within ~1s of the rules landing and logs
-            // the transition, and a second judge would only duplicate it.
-            std::thread::spawn(watch_repair_result);
+            // by watchers rather than a return value: the launcher watcher logs
+            // when the prompt was answered, and this watcher logs the elevated
+            // script's result file (STARTED / OK / FAIL:<reason>). No separate
+            // rule re-check: the fw worker already re-judges the invariant
+            // within ~1s of the rules landing and logs the transition, and a
+            // second judge would only duplicate it.
+            std::thread::spawn(move || watch_repair_result(id));
             logf("firewall repair: awaiting elevated script result (120s window)");
         }
         started
@@ -454,12 +475,13 @@ pub fn repair() -> bool {
     }
 }
 
-/// Result file the elevated repair script writes next to the .ps1 (OK or
-/// FAIL:<reason>, UTF-8 — localized Windows errors are non-ASCII, hence the
-/// explicit encoding on the write side and the BOM trim on the read side).
+/// Result file the elevated repair script writes next to the .ps1 (STARTED,
+/// then OK or FAIL:<reason>, UTF-8 — localized Windows errors are non-ASCII,
+/// hence the explicit encoding on the write side and the BOM trim on the read
+/// side). Per-attempt, so concurrent repairs never share it.
 #[cfg(windows)]
-fn result_path() -> PathBuf {
-    data_dir().join("tinbox_fw_fix.result")
+fn attempt_result_path(id: &str) -> PathBuf {
+    data_dir().join(format!("tinbox_fw_fix_{id}.result"))
 }
 
 /// Watcher for the elevated script's result: ShellExecute runas is
@@ -468,8 +490,9 @@ fn result_path() -> PathBuf {
 /// A missing file after 120s means the elevated run never reported back
 /// (UAC still sitting, dismissed, or the launch died silently).
 #[cfg(windows)]
-fn watch_repair_result() {
-    let path = result_path();
+fn watch_repair_result(id: String) {
+    let path = attempt_result_path(&id);
+    let mut granted = false;
     for _ in 0..120 {
         std::thread::sleep(std::time::Duration::from_secs(1));
         let Ok(bytes) = std::fs::read(&path) else {
@@ -482,6 +505,19 @@ fn watch_repair_result() {
         if s.is_empty() {
             continue;
         }
+        if s == "STARTED" {
+            // The elevated script is running — UAC was granted. This is the
+            // ground-truth "repair really started" signal the frontend freezes
+            // on. Keep polling for the final OK/FAIL.
+            if !granted {
+                granted = true;
+                logf("firewall repair: elevated script started (UAC granted)");
+                let _ = crate::server::notifier()
+                    .send(crate::server::PushEvent::FwRepair("granted"));
+            }
+            continue;
+        }
+        // A final result (OK / FAIL:<reason>): the script ran to completion.
         if s == "OK" {
             logf("firewall repair: elevated script reports OK — canonical rule written, awaiting worker 'ok' verdict");
         } else {
@@ -516,13 +552,14 @@ pub fn quit(app: &AppHandle) {
 /// The launcher is fire-and-forget (no -Wait): the /repair handler returns
 /// instantly (the UAC dialog may sit unanswered for minutes, and blocking on
 /// it once froze the overlay's buttons for 11 minutes). A detached thread
-/// polls the launcher's exit code purely to LOG whether UAC was granted or
-/// denied; the verdict on the rules belongs to the firewall worker, which
-/// re-judges the invariant within ~1s and closes the overlay via the SSE flag.
+/// polls the launcher's exit code purely to LOG when the prompt was answered
+/// (the code cannot say granted vs cancelled); the verdict on the rules
+/// belongs to the firewall worker, which re-judges the invariant within ~1s
+/// and closes the overlay via the SSE flag.
 #[cfg(windows)]
-fn repair_as_admin(exe: &str) -> bool {
+fn repair_as_admin(exe: &str, id: &str) -> bool {
     let dir = data_dir();
-    let ps1 = dir.join("tinbox_fw_fix.ps1");
+    let ps1 = dir.join(format!("tinbox_fw_fix_{id}.ps1"));
 
     // Self-contained script: restore the CANONICAL rule set — create the one
     // all-profile Allow, then wipe EVERY other inbound rule pointing at the
@@ -543,13 +580,31 @@ fn repair_as_admin(exe: &str) -> bool {
     // localized Windows errors are non-ASCII and WinPS 5.1 defaults to ANSI.
     // Note: Get-NetFirewallRule's -DisplayName cannot be combined with
     // -Direction/-Action (different parameter sets).
-    let res = result_path()
+    let res = attempt_result_path(id)
         .to_string_lossy()
         .replace('\'', "''");
     let script = format!(
         r#"$exe = '{exe}'
 $res = '{res}'
+# Proof the elevated run actually started (i.e. UAC was granted). ShellExecute
+# returns success even when the UAC prompt is cancelled, so the launcher exit
+# code cannot tell; the Rust watcher keys "granted" off this marker instead.
+Set-Content -LiteralPath $res -Value 'STARTED' -Encoding UTF8 -ErrorAction SilentlyContinue
+# Serialize the rule edit across concurrent repair attempts: two scripts racing
+# their create-then-delete-others would delete each other's fresh rule and can
+# leave ZERO rules — and the worker's 'none' verdict would then close the
+# overlay with the phone still blocked. A session-local named mutex makes each
+# attempt's edit atomic, so N attempts converge to exactly one canonical rule.
+# Bounded wait: if a previous holder is wedged, fail rather than edit
+# unsynchronized.
+$mtx = $null
+$held = $false
 try {{
+  $mtx = New-Object System.Threading.Mutex($false, 'TinboxFwRepair')
+  $held = $mtx.WaitOne(120000)
+}} catch {{ $held = $false }}
+try {{
+  if (-not $held) {{ throw 'could not acquire rule-edit mutex (timeout)' }}
   $new = New-NetFirewallRule -DisplayName '{RULE_ALLOW}' -Direction Inbound -Action Allow -Program $exe -Profile Any -ErrorAction Stop
   Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {{ $_.Direction -eq 'Inbound' -and $_.Name -ne $new.Name }} | ForEach-Object {{
     Remove-NetFirewallRule -Name $_.Name -ErrorAction SilentlyContinue
@@ -570,6 +625,8 @@ try {{
   $out = 'OK'
 }} catch {{
   $out = 'FAIL:' + $_.Exception.Message
+}} finally {{
+  if ($held) {{ try {{ $mtx.ReleaseMutex() }} catch {{}} }}
 }}
 Set-Content -LiteralPath $res -Value $out -Encoding UTF8 -ErrorAction SilentlyContinue
 Remove-Item $MyInvocation.MyCommand.Path -ErrorAction SilentlyContinue"#
@@ -583,12 +640,12 @@ Remove-Item $MyInvocation.MyCommand.Path -ErrorAction SilentlyContinue"#
     use std::process::{Command, Stdio};
     // Fire-and-forget at the handler level: the launcher's ONLY job is to
     // carry the runas verb (the UAC consent + the elevated run happen inside
-    // it). A detached thread polls the launcher's exit code to distinguish
-    // "UAC granted" from "UAC denied/cancelled" — the launcher blocks on the
-    // UAC prompt and exits right after, so this is the fast denial signal.
-    // It is NEVER waited on by the /repair handler: doing that once froze the
-    // overlay's buttons for 11 minutes while the prompt sat unanswered. The
-    // result file watcher separately reports what the elevated script did.
+    // it). A detached thread polls the launcher ONLY to learn when the prompt
+    // was answered — its exit code cannot say which answer, since ShellExecute
+    // returns success even on cancel; "granted" comes from the elevated
+    // script's STARTED marker instead. It is NEVER waited on by the /repair
+    // handler: doing that once froze the overlay's buttons for 11 minutes
+    // while the prompt sat unanswered.
     let launcher = format!(
         "$sh = New-Object -ComObject Shell.Application; \
          try {{ $sh.ShellExecute('powershell.exe', \
@@ -604,25 +661,22 @@ Remove-Item $MyInvocation.MyCommand.Path -ErrorAction SilentlyContinue"#
         .spawn()
     {
         Ok(mut child) => {
-            // The launcher blocks on the UAC prompt (ShellExecute's runas verb
-            // waits for the consent answer) and exits right after: 0 = granted
-            // (the elevated repair is now running), nonzero = denied/cancelled.
-            // Poll in a DETACHED thread, never the /repair handler, so a prompt
-            // left open for minutes cannot freeze the UI. Bounded: a prompt may
-            // sit unanswered indefinitely, and this thread must not leak.
+            // The launcher exits once the UAC prompt is answered, but its exit
+            // code does NOT say which answer — Shell.Application's ShellExecute
+            // returns success even when the user cancels. So this watcher only
+            // records WHEN it exited, for the log; the "granted" signal is the
+            // elevated script's STARTED marker (see watch_repair_result). A
+            // cancel is therefore explained by the log alone (launcher exited
+            // with no "elevated script started" line), with no frontend event.
+            // Detached, never the /repair handler, so a prompt left open cannot
+            // freeze the UI; the poll is bounded so it cannot leak.
             std::thread::spawn(move || {
                 use std::time::{Duration, Instant};
                 let deadline = Instant::now() + Duration::from_secs(180);
                 loop {
                     match child.try_wait() {
                         Ok(Some(status)) => {
-                            if status.success() {
-                                logf("firewall repair: UAC granted - elevated repair launched (result file to follow)");
-                            } else {
-                                logf(&format!(
-                                    "firewall repair: launcher exited ({status}) - UAC denied/cancelled"
-                                ));
-                            }
+                            logf(&format!("firewall repair: launcher exited ({status})"));
                             return;
                         }
                         Ok(None) => {
