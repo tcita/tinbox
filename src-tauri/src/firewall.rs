@@ -302,14 +302,6 @@ while ($true) {{
                 match rx.recv_timeout(Duration::from_secs(1)) {
                     Ok(line) => {
                         let state = line.trim().to_string();
-                        // Report only recognized verdicts: the child's stdout
-                        // can carry stray PowerShell error text (a transient
-                        // CIM hiccup when the repair hammers the same rule
-                        // store mid-pass) — consuming the one-shot on garbage
-                        // both wastes it and prints nonsense as "state".
-                        let recognized = state == "ok"
-                            || state == "none"
-                            || state.starts_with("dirty:");
                         match state.as_str() {
                             s if s.starts_with("dirty:") => {
                             let detail = &s["dirty:".len()..];
@@ -358,12 +350,6 @@ while ($true) {{
                         }
                         _ => {}
                         }
-                        // One-shot post-repair verdict: log the very next
-                        // RECOGNIZED verdict even when nothing changed, so
-                        // post-click silence always has an answer in the log.
-                        if recognized && LOG_NEXT_VERDICT.swap(false, Ordering::SeqCst) {
-                            logf(&format!("firewall worker: post-repair rule state={state}"));
-                        }
                     },
                     Err(mpsc::RecvTimeoutError::Timeout) => {}
                     Err(mpsc::RecvTimeoutError::Disconnected) => break, // child died
@@ -377,6 +363,10 @@ while ($true) {{
             if policy_dead {
                 return;
             }
+            // Not a policy retirement: the powershell child died on its own
+            // (crash, AV kill, engine fault). Say so — a silent respawn would
+            // be indistinguishable from a healthy worker in the log.
+            logf("firewall worker: powershell exited unexpectedly - respawning in 5s");
             std::thread::sleep(Duration::from_secs(5));
         }
     });
@@ -437,28 +427,23 @@ pub fn repair() -> bool {
         // instantly, never gated by a cooldown. Stacked grants are safe: the
         // script deletes the previous tinbox_Allow_Inbound before creating
         // the new one, so N grants still converge to exactly one rule.
-        let Some(exe) = exe_path() else { return false; };
+        let Some(exe) = exe_path() else {
+            loge("firewall repair: could not get exe path");
+            return false;
+        };
         // A stale result file from a previous attempt would let the watcher
         // below report old news — remove it before launching.
         let _ = std::fs::remove_file(result_path());
         let started = repair_as_admin(&exe);
         if started {
-            // Two one-shot diagnostics for the window after the click:
-            // the worker logs its very next verdict even when unchanged
-            // (post-repair silence is otherwise ambiguous), and the watcher
-            // below reports what the elevated script actually did.
-            LOG_NEXT_VERDICT.store(true, Ordering::SeqCst);
+            // The elevated run is fire-and-forget, so its outcome is reported
+            // by watchers rather than a return value: the launcher's exit code
+            // (UAC granted vs denied) from repair_as_admin, and the result file
+            // the elevated script writes (OK / FAIL:<reason>) from this
+            // watcher. No separate rule re-check: the fw worker already
+            // re-judges the invariant within ~1s of the rules landing and logs
+            // the transition, and a second judge would only duplicate it.
             std::thread::spawn(watch_repair_result);
-            // Belt and suspenders for the steady-dirty hole: the worker only
-            // emits on CHANGE, so "still dirty" prints nothing and the flag
-            // above never fires. This active re-check asks the rules directly
-            // at +5s/+30s regardless of worker liveness.
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                spot_check_rules("5s");
-                std::thread::sleep(std::time::Duration::from_secs(25));
-                spot_check_rules("30s");
-            });
             logf("firewall repair: awaiting elevated script result (120s window)");
         }
         started
@@ -469,70 +454,6 @@ pub fn repair() -> bool {
     }
 }
 
-/// One-shot flag: set by repair(), consumed by the fw worker on its next
-/// verdict line. The worker normally logs transitions only, so "still dirty"
-/// after a repair would print nothing — indistinguishable from a dead worker
-/// or a killed process. With this, the log always answers "what did the
-/// worker see after the click".
-static LOG_NEXT_VERDICT: AtomicBool = AtomicBool::new(false);
-
-/// Active one-shot re-check of the rule invariant, asked directly instead of
-/// through the worker's change-only pipe (which stays silent on steady-dirty).
-/// Same judgment as the worker: ok / dirty:block|shape / none / ps-failed.
-#[cfg(windows)]
-fn spot_check_rules(tag: &str) {
-    let Some(exe) = exe_path() else {
-        return;
-    };
-    let exe = exe.replace('\'', "''");
-    let ps = format!(
-        r#"$exe = '{exe}'
-$rules = @(Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {{ $_.Direction -eq 'Inbound' }})
-if ($rules.Count -eq 0) {{ 'none' }}
-elseif ($rules.Count -eq 1 -and $rules[0].Enabled -eq 'True' -and $rules[0].Action -eq 'Allow' -and $rules[0].Profile -eq 'Any' -and $rules[0].DisplayName -eq 'tinbox_Allow_Inbound') {{ 'ok' }}
-else {{
-  $detail = 'shape'
-  $active = @((Get-NetConnectionProfile -ErrorAction SilentlyContinue | ForEach-Object {{ $_.NetworkCategory }}) | ForEach-Object {{ if ($_ -eq 'DomainAuthenticated') {{ 'Domain' }} else {{ $_ }} }} | Sort-Object -Unique)
-  foreach ($r in $rules) {{
-    if ($r.Enabled -eq 'True' -and $r.Action -eq 'Block') {{
-      $applies = $false
-      if ($r.Profile -eq 'Any') {{ $applies = $true }}
-      else {{ foreach ($p in (($r.Profile -split ',') | ForEach-Object {{ $_.Trim() }})) {{ if ($active -contains $p) {{ $applies = $true }} }} }}
-      if ($applies) {{ $detail = 'block'; break }}
-    }}
-  }}
-  'dirty:' + $detail
-}}
-# The "after" picture: every inbound rule that could matter — all Program==exe
-# rules under ANY display name (the dialog's Query strays don't carry our
-# name), plus tinbox_/FileDrop_-named strays on other programs (path drift
-# after moving the exe). Same DisplayName|Action|Enabled|Profile|Program
-# shape as the worker's dump so the two are comparable line to line.
-$seen = @($rules | ForEach-Object {{ $_.Name }})
-$extra = @(Get-NetFirewallRule -Direction Inbound -ErrorAction SilentlyContinue | Where-Object {{ ($seen -notcontains $_.Name) -and ($_.DisplayName -like 'tinbox_*' -or $_.DisplayName -like 'FileDrop_*') }})
-$all = @($rules) + @($extra)
-$info = @($all | ForEach-Object {{ $p = ($_ | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue).Program; '{{0}}|{{1}}|{{2}}|{{3}}|{{4}}' -f $_.DisplayName,$_.Action,$_.Enabled,$_.Profile,$p }}) -join ' ;; '
-'rules:' + $info"#
-    );
-    match run_ps(&ps) {
-        Some((true, out)) => {
-            let mut state = "?";
-            let mut table = "(empty)";
-            for ln in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                if let Some(t) = ln.strip_prefix("rules:") {
-                    if !t.trim().is_empty() {
-                        table = t.trim();
-                    }
-                } else if state == "?" {
-                    state = ln;
-                }
-            }
-            logf(&format!("firewall repair: rule state {tag} after click={state}"));
-            logf(&format!("firewall repair: rule table {tag} after click=[{table}]"));
-        }
-        _ => logf(&format!("firewall repair: rule state {tag} after click=ps-failed")),
-    }
-}
 /// Result file the elevated repair script writes next to the .ps1 (OK or
 /// FAIL:<reason>, UTF-8 — localized Windows errors are non-ASCII, hence the
 /// explicit encoding on the write side and the BOM trim on the read side).
@@ -569,7 +490,7 @@ fn watch_repair_result() {
         let _ = std::fs::remove_file(&path);
         return;
     }
-    logf("firewall repair: no result file after 120s (UAC likely dismissed, or the elevated run never started)");
+    logf("firewall repair: no result file after 120s - elevated script never reported back");
 }
 
 /// Frontend "Quit" click: no network access means the app is pointless, just
@@ -592,16 +513,12 @@ pub fn quit(app: &AppHandle) {
 /// SW_HIDE is honored at process creation, so the elevated console is born
 /// hidden; the UAC consent prompt itself is unaffected.
 ///
-/// ShellExecute is fire-and-forget (no -Wait), so the launcher — itself a
-/// hidden powershell — is spawned and never waited on: the /repair handler
-/// must return instantly (the UAC dialog may sit unanswered for minutes, and
-/// blocking on it once froze the overlay's buttons for 11 minutes). A
-/// cancelled UAC simply changes nothing; the user retries. The verdict
-/// belongs to the firewall worker: it re-judges the invariant within ~1s and
-/// closes the overlay via the SSE flag.
-///
-/// Blocks the calling thread: but the frontend modal already covers the UI
-/// while the user waits for the repair, so blocking is fine.
+/// The launcher is fire-and-forget (no -Wait): the /repair handler returns
+/// instantly (the UAC dialog may sit unanswered for minutes, and blocking on
+/// it once froze the overlay's buttons for 11 minutes). A detached thread
+/// polls the launcher's exit code purely to LOG whether UAC was granted or
+/// denied; the verdict on the rules belongs to the firewall worker, which
+/// re-judges the invariant within ~1s and closes the overlay via the SSE flag.
 #[cfg(windows)]
 fn repair_as_admin(exe: &str) -> bool {
     let dir = data_dir();
@@ -664,14 +581,14 @@ Remove-Item $MyInvocation.MyCommand.Path -ErrorAction SilentlyContinue"#
 
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
-    // Fire-and-forget: the launcher's ONLY job is to carry the runas verb
-    // (the UAC consent + the elevated run happen inside it). It is spawned
-    // and never waited on — waiting here would block the /repair handler for
-    // as long as the UAC dialog sits unanswered, with both buttons disabled
-    // (the regression: an 11-minute hang). Confirmation belongs to the fw
-    // worker, which re-judges the invariant within ~1s of the rules landing
-    // and closes the overlay through the flag; a cancelled UAC simply means
-    // nothing changes and the user can retry.
+    // Fire-and-forget at the handler level: the launcher's ONLY job is to
+    // carry the runas verb (the UAC consent + the elevated run happen inside
+    // it). A detached thread polls the launcher's exit code to distinguish
+    // "UAC granted" from "UAC denied/cancelled" — the launcher blocks on the
+    // UAC prompt and exits right after, so this is the fast denial signal.
+    // It is NEVER waited on by the /repair handler: doing that once froze the
+    // overlay's buttons for 11 minutes while the prompt sat unanswered. The
+    // result file watcher separately reports what the elevated script did.
     let launcher = format!(
         "$sh = New-Object -ComObject Shell.Application; \
          try {{ $sh.ShellExecute('powershell.exe', \
@@ -686,9 +603,44 @@ Remove-Item $MyInvocation.MyCommand.Path -ErrorAction SilentlyContinue"#
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
     {
-        // The launcher outlives this call by design; dropping the Child does
-        // not kill it, and it exits on its own once ShellExecute returns.
-        Ok(_) => true,
+        Ok(mut child) => {
+            // The launcher blocks on the UAC prompt (ShellExecute's runas verb
+            // waits for the consent answer) and exits right after: 0 = granted
+            // (the elevated repair is now running), nonzero = denied/cancelled.
+            // Poll in a DETACHED thread, never the /repair handler, so a prompt
+            // left open for minutes cannot freeze the UI. Bounded: a prompt may
+            // sit unanswered indefinitely, and this thread must not leak.
+            std::thread::spawn(move || {
+                use std::time::{Duration, Instant};
+                let deadline = Instant::now() + Duration::from_secs(180);
+                loop {
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            if status.success() {
+                                logf("firewall repair: UAC granted - elevated repair launched (result file to follow)");
+                            } else {
+                                logf(&format!(
+                                    "firewall repair: launcher exited ({status}) - UAC denied/cancelled"
+                                ));
+                            }
+                            return;
+                        }
+                        Ok(None) => {
+                            if Instant::now() >= deadline {
+                                logf("firewall repair: launcher still alive after 180s - UAC prompt left open?");
+                                return;
+                            }
+                            std::thread::sleep(Duration::from_millis(500));
+                        }
+                        Err(e) => {
+                            loge(&format!("firewall repair: launcher wait failed: {e}"));
+                            return;
+                        }
+                    }
+                }
+            });
+            true
+        }
         Err(e) => {
             loge(&format!("firewall repair: could not launch powershell: {e}"));
             false
