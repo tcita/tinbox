@@ -5,8 +5,8 @@
 #   Windows dialog -> Cancel/Allow -> fw worker -> overlay -> repair
 #
 # Usage (auto-elevates when needed; output lands in the elevated console):
-#   powershell -ExecutionPolicy Bypass -File scripts\fw-clean.ps1
-#   powershell -ExecutionPolicy Bypass -File scripts\fw-clean.ps1 -Exe <path>
+#   powershell -ExecutionPolicy Bypass -File scripts\fw-clean-dev.ps1
+#   powershell -ExecutionPolicy Bypass -File scripts\fw-clean-dev.ps1 <path> [<path>...]
 # Close tinbox first if it is running, then relaunch to re-trigger the dialog.
 
 param(
@@ -14,8 +14,25 @@ param(
     # build paths; a [string]-constrained variable would collapse the array
     # into one space-joined string and the Program filter would match
     # nothing ("Removed 0" while rules exist).
+    #
+    # ValueFromRemainingArguments: the self-elevating relaunch passes the paths
+    # POSITIONALLY. Passing them as repeated -Exe <p> is a hard error
+    # ("parameter 'Exe' is specified more than once") that fires during
+    # parameter binding -- before the script body and its trap -- so the
+    # elevated window would flash red and close. Positional args bind here
+    # instead; a normal "-Exe <p>" invocation still works.
+    [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$Exe = @()
 )
+
+# Terminating errors pause here: a double-clicked console (and especially the
+# elevated child, which has no bat to fall back on) must never close before
+# the red text is readable.
+trap {
+    Write-Host ('[ERROR] ' + $_.Exception.Message) -ForegroundColor Red
+    Read-Host 'Press Enter to close'
+    break
+}
 
 # --- resolve the exe path(s) to clean up after ---
 # Both debug and release builds are cleaned: the running exe may be either,
@@ -38,9 +55,9 @@ if (-not $Exe) {
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
     Write-Host 'Relaunching elevated (confirm the UAC prompt)...'
-    Start-Process powershell.exe -ArgumentList @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`""
-    ) -Verb RunAs -Wait
+    $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
+    foreach ($e in $Exe) { $psArgs += "`"$e`"" }
+    Start-Process powershell.exe -ArgumentList $psArgs -Verb RunAs -Wait
     exit
 }
 

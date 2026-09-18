@@ -1,7 +1,0 @@
-
-Get-NetFirewallApplicationFilter -Program "tinbox.exe_path" | Get-NetFirewallRule | Select DisplayName,Direction,Action
-Get-NetFirewallRule -DisplayName "tinbox_Allow_Inbound","FileDrop_Allow_Inbound" -ErrorAction SilentlyContinue
-
-
-Get-NetFirewallApplicationFilter -Program "tinbox.exe_path" -ErrorAction SilentlyContinue | Get-NetFirewallRule | Remove-NetFirewallRule
-Remove-NetFirewallRule -DisplayName "tinbox_Allow_Inbound","FileDrop_Allow_Inbound" -ErrorAction SilentlyContinue
