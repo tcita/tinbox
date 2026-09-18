@@ -11,60 +11,39 @@
 <link rel="icon" href="/logo" type="image/svg+xml">
 <title>tinbox</title>
 <style>
+  /* tinbox is dark-only: no light theme, no system-following. One palette,
+     no theme state to keep in sync across the app page and the
+     server-rendered gate pages. */
   :root {
-    color-scheme: light dark;
-    --bg: #f2f2f7;
-    --bg-chat: #f8f9fb;
-    --card: #ffffff;
-    --card-subtle: #f8f9fa;
-    --text: #1d1d1f;
-    --sub: #86868b;
-    --line: rgba(0, 0, 0, 0.08);
-    --line-strong: rgba(0, 0, 0, 0.14);
-    --accent: #0071e3;
-    --accent-hover: #0077ed;
-    --accent-bg: rgba(0, 113, 227, 0.1);
+    color-scheme: dark;
+    --bg: #000000;
+    --bg-chat: #09090b;
+    --card: #1c1c1e;
+    --card-subtle: #242426;
+    --text: #f5f5f7;
+    --sub: #8e8e93;
+    --line: rgba(255, 255, 255, 0.1);
+    --line-strong: rgba(255, 255, 255, 0.18);
+    --accent: #0a84ff;
+    --accent-hover: #409cff;
+    --accent-bg: rgba(10, 132, 255, 0.15);
     --bubble-me: #2bb457;
     --bubble-me-text: #ffffff;
-    --bubble-them: #ffffff;
-    --bubble-them-text: #1d1d1f;
-    --bubble-them-border: rgba(0, 0, 0, 0.06);
-    --bubble-them-shadow: 0 1px 4px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.02);
+    --bubble-them: #1c1c1e;
+    --bubble-them-text: #f5f5f7;
+    --bubble-them-border: rgba(255, 255, 255, 0.08);
+    --bubble-them-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
     --danger: #ff3b30;
     --danger-bg: rgba(255, 59, 48, 0.1);
     --ok: #34c759;
     --ok-glow: rgba(52, 199, 89, 0.4);
-    --glass-bg: rgba(255, 255, 255, 0.82);
-    --glass-border: rgba(255, 255, 255, 0.6);
+    --glass-bg: rgba(28, 28, 30, 0.82);
+    --glass-border: rgba(255, 255, 255, 0.12);
     --radius-lg: 20px;
     --radius-md: 14px;
     --radius-sm: 8px;
     --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
     --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
-  }
-
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg: #000000;
-      --bg-chat: #09090b;
-      --card: #1c1c1e;
-      --card-subtle: #242426;
-      --text: #f5f5f7;
-      --sub: #8e8e93;
-      --line: rgba(255, 255, 255, 0.1);
-      --line-strong: rgba(255, 255, 255, 0.18);
-      --accent: #0a84ff;
-      --accent-hover: #409cff;
-      --accent-bg: rgba(10, 132, 255, 0.15);
-    --bubble-me: #2bb457;
-      --bubble-me-text: #ffffff;
-      --bubble-them: #1c1c1e;
-      --bubble-them-text: #f5f5f7;
-      --bubble-them-border: rgba(255, 255, 255, 0.08);
-      --bubble-them-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
-      --glass-bg: rgba(28, 28, 30, 0.82);
-      --glass-border: rgba(255, 255, 255, 0.12);
-    }
   }
 
   * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
@@ -162,22 +141,18 @@
   .radio-row button.sel .dot::after { content: ''; position: absolute; inset: 2px; border-radius: 50%; background: var(--accent); }
   .st-option-title { display: block; margin-bottom: 3px; font-size: 13px; font-weight: 650; }
   .st-danger-section { padding-top: 4px; border-top: 1px solid var(--line); }
-  .st-section-title.danger { color: var(--danger); }
-  /* Pure #ff3b30 vibrates on black: soften the heading red in dark mode.
-     The button keeps the full danger red — the signal stays, the glare goes. */
-  @media (prefers-color-scheme: dark) {
-    .st-section-title.danger { color: #ff7a72; }
-  }
+  .st-section-title.danger { color: #ff7a72; }
   .st-danger-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 13px; }
   .st-danger-copy { min-width: 0; }
   .st-danger-title { font-size: 13px; font-weight: 650; color: var(--text); }
-  .st-danger-desc { margin-top: 3px; font-size: 11.5px; line-height: 1.35; color: var(--sub); }
+  /* Soft red on black: full #ff3b30 vibrates against the dark card, so the
+     text button lives one step down. The filled 清空 button keeps full red. */
   .st-danger-btn {
-    flex: none; border: 1px solid rgba(255,59,48,.35); border-radius: 9px; padding: 7px 10px;
-    background: var(--card); color: var(--danger); font: 600 12px inherit; text-align: center;
+    flex: none; border: 1px solid rgba(255,122,114,.4); border-radius: 9px; padding: 7px 10px;
+    background: var(--card); color: #ff7a72; font: 600 12px inherit; text-align: center;
     cursor: pointer; transition: all .15s ease;
   }
-  .st-danger-btn:hover { border-color: var(--danger); background: var(--danger-bg); }
+  .st-danger-btn:hover { border-color: #ff7a72; background: rgba(255,122,114,.12); }
   @media (max-width: 430px) {
     #settingsOverlay { padding: 12px; }
     .st-head { padding: 18px 18px 15px; }
@@ -2729,7 +2704,7 @@ if(isOwner){
   document.querySelector('.brand').style.display = 'none';
   // The hidden brand leaves .head-actions the sole visible child of the
   // space-between bar — it would sit left with a dead void on the right.
-  // Split the entry from the tools instead: inbox/clear stay left, the
+  // Split the entry from the tools instead: inbox/settings stay left, the
   // connect pill docks right as a DIRECT child of the bar, so space-between
   // spreads the two groups (an auto margin inside .head-actions cannot work:
   // a sole flex item shrink-wraps, the free space lives in the parent).

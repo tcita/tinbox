@@ -87,24 +87,21 @@ fn cookie_carries_token(headers: &HeaderMap, tok: &str) -> bool {
 /// PC's loopback window never reaches this branch, so the text below is
 /// visitor-only.
 fn unpaired_page(glyph: &str, title: &str, heading: &str, body: &str) -> String {
+    // Dark-only, like the app page: no light variant, no media query.
     format!(
         "<!doctype html><html><head><meta charset=\"utf-8\">\
         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+        <meta name=\"color-scheme\" content=\"dark\">\
         <title>{title}</title><style>\
         body{{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;\
-        box-sizing:border-box;background:#f2f2f7;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}}\
-        @media (prefers-color-scheme: dark){{body{{background:#000000}}}}\
+        box-sizing:border-box;background:#000000;font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}}\
         .card{{max-width:380px;width:100%;box-sizing:border-box;text-align:center;padding:36px 32px 30px;\
-        background:#ffffff;border-radius:28px;border:1px solid rgba(0,0,0,0.04);\
-        box-shadow:0 16px 48px rgba(0,0,0,0.08)}}\
-        @media (prefers-color-scheme: dark){{.card{{background:#1c1c1e;border-color:rgba(255,255,255,0.08)}}}}\
-        .glyph{{font-size:44px;line-height:1;margin-bottom:12px;color:#1a1a1e}}\
-        @media (prefers-color-scheme: dark){{.glyph{{color:#ffffff}}}}\
+        background:#1c1c1e;border-radius:28px;border:1px solid rgba(255,255,255,0.08);\
+        box-shadow:0 16px 48px rgba(0,0,0,0.35)}}\
+        .glyph{{font-size:44px;line-height:1;margin-bottom:12px;color:#ffffff}}\
         .glyph svg{{width:44px;height:auto;display:inline-block;vertical-align:top}}\
-        h1{{font-size:20px;font-weight:700;letter-spacing:-0.4px;margin:0 0 6px;color:#1a1a1e}}\
-        @media (prefers-color-scheme: dark){{h1{{color:#ffffff}}}}\
-        p{{font-size:13px;line-height:1.65;margin:0;color:#86868b;text-align:left}}\
-        @media (prefers-color-scheme: dark){{p{{color:#8e8e93}}}}\
+        h1{{font-size:20px;font-weight:700;letter-spacing:-0.4px;margin:0 0 6px;color:#ffffff}}\
+        p{{font-size:13px;line-height:1.65;margin:0;color:#8e8e93;text-align:left}}\
         </style></head><body><div class=\"card\">\
         <div class=\"glyph\">{glyph}</div>\
         <h1>{heading}</h1>\
@@ -117,7 +114,7 @@ fn unpaired_page(glyph: &str, title: &str, heading: &str, body: &str) -> String 
 /// "Qr Code Scanner Phone Qr Code Smartphone", Objects Infographic Icons
 /// collection, CC0 License, uploader SVG Repo).
 /// Optimized for inline use: prolog/dimensions stripped, fill=currentColor so
-/// it follows the page's light/dark palette. Inline, not /logo: this page
+/// it follows the page's dark palette. Inline, not /logo: this page
 /// makes ZERO further requests by design, so it cannot reference any served
 /// asset. Kept as a file (like logo.svg) instead of a string literal so the
 /// 1.5KB of path data stays out of the source.
