@@ -11,7 +11,7 @@ mod server;
 mod settings;
 mod transfer;
 
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{window::Color, Manager, WebviewUrl, WebviewWindowBuilder};
 
 #[cfg(desktop)]
 use tauri::{
@@ -35,6 +35,11 @@ fn create_main_window<R: tauri::Runtime>(
     .inner_size(520.0, 720.0)
     .min_inner_size(360.0, 480.0)
     .center()
+    // Unpainted client area (WebView2 lags a window drag, exposing the host
+    // background at the edges) would otherwise show WebView2's default white.
+    // Paint it the app's own bg so a move never flashes white. Sets BOTH the
+    // window and the webview layers.
+    .background_color(Color(9, 9, 11, 255))
     // Keep Tauri's drag-drop handler ENABLED: it injects the real
     // `path` onto dropped File objects (that is what lets the frontend
     // send the path to /add-local, which copies it into Inbox locally
