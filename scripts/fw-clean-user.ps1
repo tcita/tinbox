@@ -1,13 +1,14 @@
-# User/test helper: remove ONLY the inbound firewall rules pointing at ONE
-# tinbox.exe — the copy next to the launching bat, or -Exe <path> — so a
-# portable install can be wiped without touching any other copy's rules.
+# User-side helper: remove ONLY the inbound firewall rules pointing at ONE
+# tinbox.exe — the copy one level above this scripts\ folder (i.e. next to the
+# scripts\ folder itself), or -Exe <path> — so a portable install can be wiped
+# without touching any other copy's rules.
 # It deliberately never deletes by bare DisplayName: that would nuke another
 # path's tinbox_Allow_Inbound (each copy owns only its own rules; see the
 # per-path isolation note in src-tauri/src/firewall.rs).
 #
 # Usage (auto-elevates when needed; output lands in the elevated console):
-#   fw-clean-here.bat ["path\to\tinbox.exe"]
-#   powershell -ExecutionPolicy Bypass -File scripts\fw-clean-here.ps1 -Exe <path>
+#   scripts\fw-clean-user.bat ["path\to\tinbox.exe"]
+#   powershell -ExecutionPolicy Bypass -File scripts\fw-clean-user.ps1 -Exe <path>
 # Close tinbox first if it is running, then relaunch to re-trigger the dialog.
 
 param(
@@ -25,8 +26,8 @@ trap {
 
 # --- resolve the single exe to clean up after ---
 # Default is the tinbox.exe in the PowerShell's current directory; the bat
-# shim always passes an explicit path (bat dir first, then cwd), so this
-# fallback only matters for direct ps1 runs.
+# shim always passes an explicit path (one level above the scripts\ folder),
+# so this fallback only matters for direct ps1 runs.
 if (-not $Exe) {
     $Exe = Join-Path (Get-Location) 'tinbox.exe'
 }
@@ -35,7 +36,7 @@ if (-not (Test-Path -LiteralPath $Exe)) {
     # without this the console (a right-click "Run as administrator" window,
     # whose cwd is System32) would flash closed before the error is readable.
     Write-Host "tinbox.exe not found: $Exe"
-    Write-Host 'Put this bat + scripts\ next to tinbox.exe, or pass -Exe <path>.'
+    Write-Host 'Put the scripts\ folder next to tinbox.exe, or pass -Exe <path>.'
     Read-Host 'Press Enter to close'
     exit 1
 }
