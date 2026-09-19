@@ -1918,16 +1918,14 @@ function checkUploadGone(items){
       if(row){
         // Our own row is no longer pending: the server has the whole file on
         // disk. That is completion, full stop. The HTTP response must not get a
-        // veto: measured on-wire on a bad link, the server sent the full 200
-        // and the phone's TCP acked it in 51ms, yet Safari never completed the
-        // XHR (readyState stuck at 3, onload never fired) — the browser, not
-        // the network. Settle success here, then drop that socket.
+        // veto: on iOS WebKit a large raw `send(File)` body had its 200
+        // delivered and TCP-acked yet the XHR never fired onload, so the ack
+        // cannot be trusted to decide. Settle success here, then drop the socket.
         if(!up.graduated){
           up.graduated = true;
           if(up.settle) up.settle(true, 'sse-graduated');
-          // Server has the file; drop the (possibly stuck) ack socket. On iOS
-          // the ack can be delivered yet WebKit never completes the XHR, so
-          // leaving it open would leak a reserved connection per upload.
+          // Server has the file; drop the ack socket so it cannot leak a
+          // reserved connection.
           up.ac.abort();
         }
         continue;
@@ -2136,14 +2134,18 @@ async function startUpload(f){
   // absent round-trip must not leave the sender staring at nothing after
   // picking a file (and it makes "card drew but upload stalled" debuggable).
   reapply();
-  // Raw body: the request body IS the file bytes (no FormData/multipart
-  // framing); the filename rides the query string. Pasted clipboard images
-  // (long-press 拷贝 on a card, then paste into the composer) often arrive
-  // with an EMPTY filename — Safari puts the image AND its URL on the
+  // Multipart body — do NOT switch this to a raw `xhr.send(File)` body. On
+  // iOS WebKit (Safari AND Chrome) a large raw upload's 200 response can be
+  // delivered and TCP-acked yet the XHR never reaches DONE, so onload never
+  // fires; the multipart FormData path does not show this. Pasted clipboard
+  // images (long-press 拷贝 on a card, then paste into the composer) often
+  // arrive with an EMPTY filename — Safari puts the image AND its URL on the
   // pasteboard, and the file half can be nameless. The server rejects those
-  // with a 400 ("bad filename") and the user only sees 传输失败, so name
-  // them here from the MIME type and the paste flow uploads like a file.
+  // with a 400 ("bad filename") and the user only sees 传输失败, so name them
+  // here from the MIME type so the paste flow uploads like a file.
   const upName = f.name || fallbackName(f);
+  const fd = new FormData();
+  fd.append('file', f, upName);
   // The abort handle is what checkUploadGone pulls when the pending row
   // vanishes mid-flight: aborting cancels the request mid-stream, so the
   // phone stops writing bytes into a socket the server is already tearing
@@ -2165,9 +2167,8 @@ async function startUpload(f){
     // all, so a failure was a silent hole with nothing to debug from. One
     // line per notable upload. `via` names what decided the outcome; `resp=no`
     // is the telling signal: the server row graduated (the file IS safe) but
-    // the HTTP ack never completed — exactly the iOS/bad-link case this
-    // SSE-truth completion exists for. Normal small successes stay quiet so
-    // the log holds signal.
+    // the HTTP ack never completed — the case the SSE-truth completion guards.
+    // Normal small successes stay quiet so the log holds signal.
     const now = Date.now();
     const sendMs = up.sentAt ? up.sentAt - upT0 : 0;
     if(!ok || !up.respDone || up.size >= 4 * 1024 * 1024 || sendMs > 10000){
@@ -2201,10 +2202,10 @@ async function startUpload(f){
     let idleT = 0, respT = 0;
     const settle = (v, via) => { if(!done){ done = true; if(!up.via) up.via = via || '?'; clearTimeout(idleT); clearTimeout(respT); resolve(v); } };
     // Let checkUploadGone settle this upload on the SERVER's truth (its row
-    // graduating, or vanishing). The HTTP response is only a fast-path ack:
-    // measured on-wire, the server sent the full 200, the phone's TCP acked it
-    // 51ms later, yet Safari never completed the XHR. The response must never
-    // define completion.
+    // graduating, or vanishing). The HTTP response is a fast-path ack only:
+    // it has stalled before (a raw `send(File)` body on iOS WebKit had the 200
+    // delivered and TCP-acked yet never fired onload), so it must never define
+    // completion.
     up.settle = settle;
     const xhr = new XMLHttpRequest();
     // Do not rely on a later `onabort` dispatch to close the Promise: the
@@ -2270,8 +2271,8 @@ async function startUpload(f){
     xhr.onerror = () => { const wasDone = done; up.respDone = true; settle(false, 'net-error'); if(wasDone) lateLog('onerror'); };
     xhr.onabort = () => { settle(false, 'abort'); };
     xhr.ontimeout = () => { const wasDone = done; up.respDone = true; settle(false, 'timeout'); if(wasDone) lateLog('ontimeout'); };
-    xhr.open('POST', '/upload' + qs({ size: f.size || 0, name: upName }));
-    try { xhr.send(f); } catch(e) { settle(false, 'send-threw'); }
+    xhr.open('POST', '/upload' + qs({ size: f.size || 0 }));
+    try { xhr.send(fd); } catch(e) { settle(false, 'send-threw'); }
   });
   // Failure is judged here, all causes alike — network death, idle-timeout
   // abort, self-abort, HTTP error statuses. finish() drops the card.

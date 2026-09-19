@@ -19,7 +19,7 @@ use crate::presence::{
 };
 use crate::transfer::{cancel, dl_status, download, remove, remove_all, serve_poster, upload, view};
 use axum::{
-    extract::{connect_info::ConnectInfo, Request, State},
+    extract::{connect_info::ConnectInfo, DefaultBodyLimit, Request, State},
     http::{header, StatusCode},
     middleware::{from_fn, Next},
     response::{Html, IntoResponse, Json, Response, sse::{Event, Sse, KeepAlive}},
@@ -230,6 +230,33 @@ async fn bind_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
     socket.listen(1024)
 }
 
+/// Build fingerprint for the startup banner: how a session's log identifies
+/// the exact build it ran, so "I forgot to rebuild" is visible at a glance
+/// (an unchanged line means the same binary). FNV-1a over the embedded transfer
+/// page (stable across runs, unlike the randomized std hasher) plus the running
+/// exe's mtime/size (any Rust change moves them).
+fn build_fingerprint() -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in include_str!("index.html").as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let (mtime, len) = std::env::current_exe()
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| {
+            let t = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            (t, m.len())
+        })
+        .unwrap_or((0, 0));
+    format!("page={h:016x} exe-mtime={mtime} exe-len={len}")
+}
+
 /// Start axum on a separate thread; once the port is bound, send the actual
 /// port back through a channel (so Tauri setup can wait, then build the window
 /// URL). The app_handle goes into the Router state for handlers like /repair
@@ -256,6 +283,7 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 exe,
                 crate::logger::data_root().display()
             ));
+            logf(&format!("build: {}", build_fingerprint()));
 
             // User settings first: the inbox directory override must be known
             // before inbox_dir() is touched anywhere below.
@@ -290,15 +318,17 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
             let app = Router::new()
                 .route("/", get(index))
                 .route("/list", get(list))
-                // /upload takes the raw file bytes as its body and streams them
+                // /upload is exempt from the body cap: it streams the body
             // straight to disk (see upload()), so RSS stays flat however big
             // the push is, and a full disk fails the write cleanly (row +
-            // partial file are dropped on the error path). No body-cap
-            // exemption needed: the handler consumes `Body` as a stream and
-            // never buffers it, while every other POST buffers through the
-            // Json extractor — those keep axum's default 2MB limit so an
-            // unbounded body cannot spike RSS.
-            .route("/upload", post(upload))
+            // partial file are dropped on the error path). Every other POST
+            // buffers through the Json extractor, which reads the WHOLE body
+            // into memory before deserializing — those keep axum's default
+            // 2MB limit so an unbounded body cannot spike RSS.
+            .route(
+                "/upload",
+                post(upload).layer(DefaultBodyLimit::disable()),
+            )
                 .route("/add-local", post(add_local))
                 .route("/send-text", post(send_text))
                 .route("/log", post(client_log))

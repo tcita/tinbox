@@ -12,7 +12,7 @@ use crate::server::from_by_peer;
 use crate::server::{notifier, safe_name, IdParam, PushEvent};
 use axum::{
     body::Body,
-    extract::{ConnectInfo, Query},
+    extract::{ConnectInfo, Multipart, Query},
     http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::IntoResponse,
     Json,
@@ -125,14 +125,10 @@ fn push_progress(
 }
 
 /// Upload query: the sender's declared file size (drives the pending row's
-/// total for the shared ring) plus the filename (percent-encoded by the
-/// sender, sanitized by safe_name on arrival). The body itself is the raw
-/// file bytes — one request carries exactly one file. Absent size -> total
-/// unknown until the body lands; absent/empty name -> 400.
+/// total for the shared ring). Absent -> total unknown until the body lands.
 #[derive(serde::Deserialize)]
 pub(crate) struct UpQuery {
     pub(crate) size: Option<u64>,
-    pub(crate) name: Option<String>,
 }
 
 /// [LIVENESS/death] Seconds an upload body may go silent before the upload
@@ -147,191 +143,210 @@ pub(crate) struct UpQuery {
 /// alarm; a live stream rebuilds its counter on the next chunk).
 const UPLOAD_SILENCE_SECS: u64 = 5;
 
+/// POST /upload — multipart/form-data, one `file` field.
+///
+/// KEEP THIS MULTIPART; do NOT "simplify" it to a raw body (`xhr.send(File)`
+/// with the filename in ?name=). That was tried and reverted: on iOS WebKit
+/// (Safari AND Chrome) a large raw upload's 200 response can be delivered and
+/// TCP-acked yet the XHR never reaches DONE, so onload never fires and the
+/// client's completion hangs. The multipart path is unaffected. The frontend
+/// startUpload carries the same warning.
 pub(crate) async fn upload(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Query(q): Query<UpQuery>,
-    body: Body,
+    mut multipart: Multipart,
 ) -> impl IntoResponse {
     // The sender follows the peer, exactly like /send-text: LAN pushes are
     // "guest", the desktop's own paste-to-send (no real path to /add-local)
     // is "owner" and must not be misattributed to a guest device.
     let from = from_by_peer(peer);
-    // Raw body: one request carries exactly one file (the frontend sends one
-    // request per file — see uploadFiles), and the body IS the file bytes.
-    // The filename rides the query string (percent-encoded by URLSearchParams
-    // on the way in). No multipart framing means no "multipart read" failure
-    // class: a broken body surfaces as a stream error or a size mismatch.
-    // Early rejections happen before any pending row exists, so the access
-    // log's error line is the only trace — log the reason here or the next
-    // silent 400 is undebuggable.
-    let filename = safe_name(q.name.as_deref().unwrap_or(""));
-    if filename.is_empty() {
-        logw(&format!("upload rejected: empty filename from {peer} (?size={:?})", q.size));
-        return (StatusCode::BAD_REQUEST, "bad filename").into_response();
-    }
-    // Write to inbox under a SENTINEL name, not the final one:
-    // `pending__{id}__{filename}` until the whole body is on disk, then a
-    // same-volume rename strips the prefix (atomic — same directory). The
-    // sentinel makes a partial file self-identifying, independent of the
-    // catalog index: after a crash + index loss, reconcile kills anything
-    // wearing `pending__` instead of adopting a truncated file as
-    // complete. The prefix cannot collide with a user's filename — `{id}`
-    // is a server-generated nanosecond stamp, unknowable in advance. The
-    // catalog id matches the inner `{id}__` prefix.
-    let id = catalog::new_id();
-    let stored = catalog::inbox_dir().join(format!("pending__{id}__{filename}"));
-    let final_path = catalog::inbox_dir().join(format!("{id}__{filename}"));
-    // Register the row as `pending` the moment the request lands, and seed a
-    // shared byte counter, so BOTH ends render a progress ring immediately.
-    // The sender reports its declared total via ?size=.
-    let size = q.size.unwrap_or(0);
-    catalog::add_remote_pending(from, &id, &stored, &filename, size);
-    let _ = notifier().send(PushEvent::List(catalog::all_items()));
-    {
-        let mut map = dl_lock();
-        let e = map.entry(id.clone()).or_default();
-        e.total = size;
-        e.sent = 0;
-        touch_entry(e);
-    }
-    // Stream the body straight to disk instead of buffering it whole in
-    // memory: a phone can send multi-GB videos, and buffering those would
-    // spike RSS to the file size. The 512 KiB BufWriter coalesces the
-    // small chunks the HTTP layer delivers (like LocalSend's save path).
-    let file = match tokio::fs::File::create(&stored).await {
-        Ok(f) => tokio::io::BufWriter::with_capacity(512 * 1024, f),
-        Err(e) => {
-            loge(&format!("upload create failed {}: {}", filename, e));
-            catalog::remove(&id);
-            dl_lock().remove(&id);
-            let _ = notifier().send(PushEvent::List(catalog::all_items()));
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}"))
-                .into_response();
-        }
-    };
-    let mut file = file;
-    let mut total: u64 = 0;
-    // Upload-direction twin of the download `Measured` wrapper below:
-    // when the body lands, log MB/s socket->disk for >= 4 MB pushes, so
-    // either direction can prove whether the code or the WiFi is the
-    // ceiling. (Create time excluded — pure body time.)
-    let t0 = tokio::time::Instant::now();
-    let mut stream = body.into_data_stream();
-    let write_result: Result<(), String> = loop {
-        // The PC (receiver) asked to stop this upload (/cancel): drop it as a
-        // failure so the row + partial file are cleaned up below. Noticed per
-        // chunk, so latency is one body chunk once the flag is set.
-        if cancel_lock().contains(&id) {
-            break Err("cancelled by peer".to_string());
-        }
-        // [LIVENESS/death] A peer that dies without a FIN (WiFi drop, phone
-        // crash) leaves this await pending forever — hyper has no body read
-        // timeout. Wrap each chunk in a silence timeout so a dead push
-        // tears down on its own; the Err arm below then drops the pending
-        // row + partial file. This works here because the handler
-        // actively awaits the body — unlike the download body stream,
-        // which backpressure stops polling, so its cleanup rides the
-        // monitor's prune instead.
-        match tokio::time::timeout(
-            Duration::from_secs(UPLOAD_SILENCE_SECS),
-            stream.next(),
-        )
-        .await
-        {
-            Ok(Some(Ok(chunk))) => {
-                let n = chunk.len() as u64;
-                total += n;
-                if let Err(e) = file.write_all(&chunk).await {
-                    break Err(format!("write: {e}"));
-                }
-                // Count received bytes and push ~1/s, mirroring download
-                // progress, so the ring on both ends tracks this counter.
-                let mut map = dl_lock();
-                if let Some(e) = map.get_mut(&id) {
-                    e.sent += n;
-                    touch_entry(e);
-                }
-                push_progress(&mut map, &id, now_ms(), false);
-            }
-            Ok(Some(Err(e))) => break Err(format!("read: {e}")),
+    loop {
+        let mut field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            // Early rejections happen before any pending row exists, so the
+            // access log's error line is the only trace — log the reason here
+            // or the next silent 400 is undebuggable (e.g. pasted clipboard
+            // images once arrived with empty filenames).
             Ok(None) => {
-                break match file.flush().await {
-                    Ok(()) => Ok(()),
-                    Err(e) => Err(format!("flush: {e}")),
-                }
+                logw(&format!("upload rejected: no file field from {peer} (?size={:?})", q.size));
+                return (StatusCode::BAD_REQUEST, "no file field").into_response();
             }
-            Err(_) => {
-                logf(&format!("upload stalled {id} after {total} bytes"));
-                break Err("peer stalled".to_string());
+            Err(e) => {
+                logw(&format!("upload rejected: multipart read from {peer}: {e}"));
+                return (StatusCode::BAD_REQUEST, format!("read: {e}")).into_response();
             }
+        };
+        if field.name() != Some("file") {
+            continue;
         }
-    };
-    let write_result = match write_result {
-        // Declared-size check (?size=, always sent by our own page): the
-        // body looked complete (clean FIN) but carried fewer — or more —
-        // bytes than the sender's File.size. Graduate nothing: the Err
-        // arm below drops the row + partial file and logs both numbers,
-        // so a truncation surfaces as "传输失败" instead of a
-        // normal-looking but short card. size == 0 means unknown (old
-        // client), skip the check rather than fail everything.
-        Ok(()) if size > 0 && total != size => Err(format!(
-            "size mismatch: got {total} expected {size}"
-        )),
-        Ok(()) => match tokio::fs::rename(&stored, &final_path).await {
-            Ok(()) => Ok(()),
-            // Graduation failed (file locked by AV/backup): the bytes may
-            // be complete, but the sentinel is still on — serving it as
-            // ready would survive this session only to be killed by the
-            // next reconcile. Fail the upload instead; the cleanup below
-            // deletes the file, and even a lost delete race leaves the
-            // sentinel on for the next reconcile to finish.
-            Err(e) => Err(format!("promote: {e}")),
-        },
-        other => other,
-    };
-    match write_result {
-        Ok(()) => {
-            catalog::mark_remote_ready(&id, &final_path);
-            crate::poster::request(&id, &final_path, &filename);
-            logf(&format!("upload done: {} ({} bytes) -> inbox", filename, total));
-            if total >= 4 * 1024 * 1024 {
-                let secs = t0.elapsed().as_secs_f64();
-                if secs > 0.0 {
-                    logf(&format!(
-                        "ul {}: {:.1} MB in {:.2}s = {:.1} MB/s",
-                        filename,
-                        total as f64 / (1024.0 * 1024.0),
-                        secs,
-                        total as f64 / secs / (1024.0 * 1024.0)
-                    ));
-                }
+        let filename = safe_name(field.file_name().unwrap_or("unnamed"));
+        if filename.is_empty() {
+            logw(&format!("upload rejected: empty filename from {peer} (?size={:?})", q.size));
+            return (StatusCode::BAD_REQUEST, "bad filename").into_response();
+        }
+        // Write to inbox under a SENTINEL name, not the final one:
+        // `pending__{id}__{filename}` until the whole body is on disk, then a
+        // same-volume rename strips the prefix (atomic — same directory). The
+        // sentinel makes a partial file self-identifying, independent of the
+        // catalog index: after a crash + index loss, reconcile kills anything
+        // wearing `pending__` instead of adopting a truncated file as
+        // complete. The prefix cannot collide with a user's filename — `{id}`
+        // is a server-generated nanosecond stamp, unknowable in advance. The
+        // catalog id matches the inner `{id}__` prefix.
+        let id = catalog::new_id();
+        let stored = catalog::inbox_dir().join(format!("pending__{id}__{filename}"));
+        let final_path = catalog::inbox_dir().join(format!("{id}__{filename}"));
+        // Register the row as `pending` the moment the request lands, and seed a
+        // shared byte counter, so BOTH ends render a progress ring immediately.
+        // The sender reports its declared total via ?size=.
+        let size = q.size.unwrap_or(0);
+        catalog::add_remote_pending(from, &id, &stored, &filename, size);
+        let _ = notifier().send(PushEvent::List(catalog::all_items()));
+        {
+            let mut map = dl_lock();
+            let e = map.entry(id.clone()).or_default();
+            e.total = size;
+            e.sent = 0;
+            touch_entry(e);
+        }
+        // Stream the body straight to disk instead of buffering it whole in
+        // memory: a phone can send multi-GB videos, and buffering those would
+        // spike RSS to the file size. The 512 KiB BufWriter coalesces the
+        // small chunks the HTTP layer delivers (like LocalSend's save path).
+        let file = match tokio::fs::File::create(&stored).await {
+            Ok(f) => tokio::io::BufWriter::with_capacity(512 * 1024, f),
+            Err(e) => {
+                loge(&format!("upload create failed {}: {}", filename, e));
+                catalog::remove(&id);
+                dl_lock().remove(&id);
+                let _ = notifier().send(PushEvent::List(catalog::all_items()));
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}"))
+                    .into_response();
             }
-            // Final tick (sent == total) closes the ring on both ends.
+        };
+        let mut file = file;
+        let mut total: u64 = 0;
+        // Upload-direction twin of the download `Measured` wrapper below:
+        // when the body lands, log MB/s socket->disk for >= 4 MB pushes, so
+        // either direction can prove whether the code or the WiFi is the
+        // ceiling. (Create time excluded — pure body time.)
+        let t0 = tokio::time::Instant::now();
+        let write_result: Result<(), String> = loop {
+            // The PC (receiver) asked to stop this upload (/cancel): drop it as a
+            // failure so the row + partial file are cleaned up below. Noticed per
+            // chunk, so latency is one body chunk once the flag is set.
+            if cancel_lock().contains(&id) {
+                break Err("cancelled by peer".to_string());
+            }
+            // [LIVENESS/death] A peer that dies without a FIN (WiFi drop, phone
+            // crash) leaves this await pending forever — hyper has no body read
+            // timeout. Wrap each chunk in a silence timeout so a dead push
+            // tears down on its own; the Err arm below then drops the pending
+            // row + partial file. This works here because the handler
+            // actively awaits the body — unlike the download body stream,
+            // which backpressure stops polling, so its cleanup rides the
+            // monitor's prune instead.
+            match tokio::time::timeout(
+                Duration::from_secs(UPLOAD_SILENCE_SECS),
+                field.next(),
+            )
+            .await
             {
-                let mut map = dl_lock();
-                if let Some(e) = map.get_mut(&id) {
-                    e.sent = e.total.max(e.sent);
-                    touch_entry(e);
+                Ok(Some(Ok(chunk))) => {
+                    let n = chunk.len() as u64;
+                    total += n;
+                    if let Err(e) = file.write_all(&chunk).await {
+                        break Err(format!("write: {e}"));
+                    }
+                    // Count received bytes and push ~1/s, mirroring download
+                    // progress, so the ring on both ends tracks this counter.
+                    let mut map = dl_lock();
+                    if let Some(e) = map.get_mut(&id) {
+                        e.sent += n;
+                        touch_entry(e);
+                    }
+                    push_progress(&mut map, &id, now_ms(), false);
                 }
-                push_progress(&mut map, &id, now_ms(), true);
+                Ok(Some(Err(e))) => break Err(format!("read: {e}")),
+                Ok(None) => {
+                    break match file.flush().await {
+                        Ok(()) => Ok(()),
+                        Err(e) => Err(format!("flush: {e}")),
+                    }
+                }
+                Err(_) => {
+                    logf(&format!("upload stalled {id} after {total} bytes"));
+                    break Err("peer stalled".to_string());
+                }
             }
-            let _ = notifier().send(PushEvent::List(catalog::all_items()));
-            return (StatusCode::OK, format!("uploaded: {filename}")).into_response();
-        }
-        Err(e) => {
-            // Aborted or failed mid-transfer: drop the pending row and the
-            // partial file; do NOT leave the entry in the catalog. The
-            // unlink targets the sentinel-named file, so even if THIS
-            // delete fails (locked), the name still reads "partial" and
-            // the next startup's reconcile finishes the job — a residue
-            // can never be mistaken for a complete file.
-            drop(file);
-            catalog::remove(&id);
-            let _ = std::fs::remove_file(&stored);
-            dl_lock().remove(&id);
-            let _ = notifier().send(PushEvent::List(catalog::all_items()));
-            logw(&format!("upload failed {} after {} bytes: {}", filename, total, e));
-            return (StatusCode::BAD_REQUEST, e).into_response();
+        };
+        let write_result = match write_result {
+            // Declared-size check (?size=, always sent by our own page): the
+            // body looked complete (clean FIN) but carried fewer — or more —
+            // bytes than the sender's File.size. Graduate nothing: the Err
+            // arm below drops the row + partial file and logs both numbers,
+            // so a truncation surfaces as "传输失败" instead of a
+            // normal-looking but short card. size == 0 means unknown (old
+            // client), skip the check rather than fail everything.
+            Ok(()) if size > 0 && total != size => Err(format!(
+                "size mismatch: got {total} expected {size}"
+            )),
+            Ok(()) => match tokio::fs::rename(&stored, &final_path).await {
+                Ok(()) => Ok(()),
+                // Graduation failed (file locked by AV/backup): the bytes may
+                // be complete, but the sentinel is still on — serving it as
+                // ready would survive this session only to be killed by the
+                // next reconcile. Fail the upload instead; the cleanup below
+                // deletes the file, and even a lost delete race leaves the
+                // sentinel on for the next reconcile to finish.
+                Err(e) => Err(format!("promote: {e}")),
+            },
+            other => other,
+        };
+        match write_result {
+            Ok(()) => {
+                catalog::mark_remote_ready(&id, &final_path);
+                crate::poster::request(&id, &final_path, &filename);
+                logf(&format!("upload done: {} ({} bytes) -> inbox", filename, total));
+                if total >= 4 * 1024 * 1024 {
+                    let secs = t0.elapsed().as_secs_f64();
+                    if secs > 0.0 {
+                        logf(&format!(
+                            "ul {}: {:.1} MB in {:.2}s = {:.1} MB/s",
+                            filename,
+                            total as f64 / (1024.0 * 1024.0),
+                            secs,
+                            total as f64 / secs / (1024.0 * 1024.0)
+                        ));
+                    }
+                }
+                // Final tick (sent == total) closes the ring on both ends.
+                {
+                    let mut map = dl_lock();
+                    if let Some(e) = map.get_mut(&id) {
+                        e.sent = e.total.max(e.sent);
+                        touch_entry(e);
+                    }
+                    push_progress(&mut map, &id, now_ms(), true);
+                }
+                let _ = notifier().send(PushEvent::List(catalog::all_items()));
+                return (StatusCode::OK, format!("uploaded: {filename}")).into_response();
+            }
+            Err(e) => {
+                // Aborted or failed mid-transfer: drop the pending row and the
+                // partial file; do NOT leave the entry in the catalog. The
+                // unlink targets the sentinel-named file, so even if THIS
+                // delete fails (locked), the name still reads "partial" and
+                // the next startup's reconcile finishes the job — a residue
+                // can never be mistaken for a complete file.
+                drop(file);
+                catalog::remove(&id);
+                let _ = std::fs::remove_file(&stored);
+                dl_lock().remove(&id);
+                let _ = notifier().send(PushEvent::List(catalog::all_items()));
+                logw(&format!("upload failed {} after {} bytes: {}", filename, total, e));
+                return (StatusCode::BAD_REQUEST, e).into_response();
+            }
         }
     }
 }
