@@ -129,6 +129,10 @@ fn push_progress(
 #[derive(serde::Deserialize)]
 pub(crate) struct UpQuery {
     pub(crate) size: Option<u64>,
+    /// Client-generated row id (see catalog::valid_client_id). Adopted as the
+    /// row's id so the sender's optimistic card IS this row — no merge by
+    /// name+size, no possible second card. Absent (older client) -> server id.
+    pub(crate) cid: Option<String>,
 }
 
 /// [LIVENESS/death] Seconds an upload body may go silent before the upload
@@ -193,7 +197,22 @@ pub(crate) async fn upload(
         // complete. The prefix cannot collide with a user's filename — `{id}`
         // is a server-generated nanosecond stamp, unknowable in advance. The
         // catalog id matches the inner `{id}__` prefix.
-        let id = catalog::new_id();
+        // Row id: the sender's own id when it sent a valid one (its optimistic
+        // card already wears it — one identity, no merge), else a server id.
+        // Reject, never repair: a malformed id would ride into a filename, and
+        // a duplicate would clobber an existing file on the graduation rename.
+        let id = match q.cid.as_deref() {
+            Some(c) if catalog::valid_client_id(c) => c.to_string(),
+            Some(c) => {
+                logw(&format!("upload rejected: bad client id {c:?} from {peer}"));
+                return (StatusCode::BAD_REQUEST, "bad cid").into_response();
+            }
+            None => catalog::new_id(),
+        };
+        if catalog::find(&id).is_some() {
+            logw(&format!("upload rejected: duplicate client id {id} from {peer}"));
+            return (StatusCode::CONFLICT, "duplicate cid").into_response();
+        }
         let stored = catalog::inbox_dir().join(format!("pending__{id}__{filename}"));
         let final_path = catalog::inbox_dir().join(format!("{id}__{filename}"));
         // Register the row as `pending` the moment the request lands, and seed a
@@ -360,7 +379,10 @@ pub(crate) async fn upload(
 /// like a failed upload, so even a mid-copy process death leaves a residue
 /// that self-identifies (reconcile kills the sentinel; the original never
 /// left the source disk, so nothing is lost).
-pub(crate) async fn copy_into_inbox(src: &Path) -> std::io::Result<(String, PathBuf, String)> {
+pub(crate) async fn copy_into_inbox(
+    src: &Path,
+    cid: Option<&str>,
+) -> std::io::Result<(String, PathBuf, String)> {
     let safe = safe_name(
         src.file_name()
             .and_then(|n| n.to_str())
@@ -372,7 +394,14 @@ pub(crate) async fn copy_into_inbox(src: &Path) -> std::io::Result<(String, Path
             "bad file name",
         ));
     }
-    let id = catalog::new_id();
+    // Adopt the client's id when it is valid and free (the sender's optimistic
+    // card already wears it), else a server id. Never fail the copy over it:
+    // /add-local's optimistic batch is dropped on its own response, so a
+    // fallback id only means a card that does not silently adopt.
+    let id = match cid {
+        Some(c) if catalog::valid_client_id(c) && catalog::find(c).is_none() => c.to_string(),
+        _ => catalog::new_id(),
+    };
     let stored = catalog::inbox_dir().join(format!("pending__{id}__{safe}"));
     let final_path = catalog::inbox_dir().join(format!("{id}__{safe}"));
     let size = tokio::fs::metadata(src).await.map(|m| m.len()).unwrap_or(0);

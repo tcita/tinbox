@@ -168,6 +168,8 @@ fn presence_evidence() -> String {
 pub(crate) async fn monitor_loop() {
     let mut prev_online: Option<bool> = None;
     let mut prev_repair: Option<bool> = None;
+    let mut prev_url: Option<String> = None;
+    let mut url_tick: u32 = 0;
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         // Report transitions only, so a cold start with no device stays quiet
@@ -188,6 +190,26 @@ pub(crate) async fn monitor_loop() {
                     let _ = notifier().send(PushEvent::Info { mobile_connected: false, url });
                 }
             }
+        }
+        // Network change: the advertised pairing URL's LAN IP moved (WiFi <->
+        // hotspot, cable <-> WiFi, a new subnet), which invalidates the QR the
+        // phone already scanned. The server cannot reach a phone now on another
+        // network, so the only useful signal is to the PC: re-push `info` with
+        // the new url so the page can flag its connect button and tell the user
+        // to rescan. Sampled every 5s — collect_ips enumerates adapters, so
+        // 1 Hz would be a needless syscall. Clones: the url is moved into
+        // prev_url after the (possibly) borrowed comparison.
+        url_tick += 1;
+        if url_tick % 5 == 0 {
+            let url = current_url();
+            if prev_url.as_deref().is_some_and(|p| p != url) {
+                logf(&format!("network changed: pairing URL is now {url}"));
+                let _ = notifier().send(PushEvent::Info {
+                    mobile_connected: online,
+                    url: url.clone(),
+                });
+            }
+            prev_url = Some(url);
         }
         // Firewall repair flag transitions.
         let repair = crate::firewall::need_repair();

@@ -168,6 +168,7 @@
      buttons beside it (lift on hover, squash on press). A real <button>, so
      it tabs like everything else the div never did. */
   #connectBtn {
+    position: relative;
     display: flex; align-items: center; gap: 7px;
     height: 32px; padding: 0 13px 0 11px; border-radius: 10px;
     border: 1px solid var(--line); background: var(--card); color: var(--text);
@@ -178,6 +179,16 @@
   #connectBtn svg { color: var(--accent); flex: none; }
   #connectBtn:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
   #connectBtn:active { transform: scale(0.95); }
+  /* Network changed: the scanned QR is stale. A red "!" on the connect button
+     pulls the eye to the one action that fixes it. */
+  .qr-alert {
+    display: none; position: absolute; top: -5px; right: -5px;
+    width: 15px; height: 15px; border-radius: 50%;
+    background: var(--danger); color: #fff;
+    font-size: 11px; font-weight: 800; line-height: 15px; text-align: center;
+    box-shadow: 0 0 0 2px var(--card);
+  }
+  #connectBtn.alert .qr-alert { display: block; }
   /* Group divider: the connect entry is pairing, the rest are tools — the
      line says so without spending a label. */
   .head-sep { width: 1px; height: 20px; background: var(--line); margin: 0 1px; flex: none; }
@@ -228,6 +239,14 @@
   .ql-hint {
     margin-top: 10px; font-size: 11px; color: var(--sub); line-height: 1.4;
   }
+  /* Shown only after a detected network change (see applyInfo): this code is
+     fresh, but the phone that scanned the old one is now stranded. */
+  .ql-warn {
+    display: none; margin-top: 12px; max-width: 260px;
+    font-size: 12.5px; font-weight: 600; line-height: 1.5; color: var(--danger);
+    background: var(--danger-bg); border-radius: 10px; padding: 9px 13px;
+  }
+  #qrLightbox.net-changed .ql-warn { display: block; }
 
   /* Chat Area: #chat is a dumb scroller; the column lives in #chatInner so a
      ResizeObserver on the inner sees every content growth (image decode,
@@ -700,11 +719,11 @@
 
   /* Home-screen web app gate (phone): same card geometry as the retired
    pairing overlay — one-message-one-action language. */
-#webAppGate {
+#webAppGate, #offlineGate {
   position: fixed; inset: 0; z-index: 90; background: var(--bg);
   display: none; align-items: center; justify-content: center; padding: 20px;
 }
-#webAppGate.show { display: flex; }
+#webAppGate.show, #offlineGate.show { display: flex; }
 
 /* Context Menu */
   .ctx-menu {
@@ -743,6 +762,7 @@
     <button id="connectBtn" title="扫码连接设备">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg>
       <span>连接手机</span>
+      <span class="qr-alert" aria-hidden="true">!</span>
     </button>
     <span class="head-sep"></span>
     <button id="inboxBtn" title="打开收件箱">
@@ -870,6 +890,17 @@
   </div>
 </div>
 
+<!-- Offline gate (guest): a sustained SSE outage means this page's origin is
+     gone — the PC changed networks, so its LAN IP moved and this page can never
+     discover the new one. It cannot auto-recover; say so and point at the QR. -->
+<div id="offlineGate">
+  <div class="g-card">
+    <div class="g-radar"><span style="font-size:44px;line-height:1">📡</span></div>
+    <div class="g-title">连接已断开</div>
+    <div class="g-desc" id="offlineDesc">正在尝试重连…</div>
+  </div>
+</div>
+
 <!-- QR Lightbox (PC): enlarge the header QR for scanning -->
 <div id="qrLightbox">
   <div class="ql-card">
@@ -877,8 +908,9 @@
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
     </button>
     <div class="ql-title">扫码连接设备</div>
-    <img class="ql-qr" src="/qr" alt="QR code">
+    <img class="ql-qr" id="qrImg" src="/qr" alt="QR code">
     <div><div class="ql-url" id="qlUrl">…</div></div>
+    <div class="ql-warn">网络已变化，请让手机重新扫描这张二维码</div>
     <div class="ql-hint">请保持手机与电脑在同一 Wi-Fi</div>
   </div>
 </div>
@@ -1232,6 +1264,14 @@ function itemSig(it){
   return it.kind === 'text'
     ? ['text', it.from, it.ts, it.text].join('|')
      : ['file', it.from, it.ts, it.name, it.size, it.pending ? 1 : 0,
+        // `local` in the sig forces a rebuild the moment the local card hands
+        // off to the server row (same id). Without it a same-second handoff
+        // would KEEP the node and its closures would capture the local object
+        // forever — with it, the row's node is rebuilt with the row's `it`.
+        it.local ? 1 : 0,
+        // `queued` likewise: the caption must flip 等待中… → 发送中… when the
+        // serial queue reaches this card.
+        it.queued ? 1 : 0,
         it.poster ? 1 : 0,
         it.media ? [it.media.dur_ms, it.media.w, it.media.h].join(',') : ''].join('|');
 }
@@ -1335,9 +1375,11 @@ function buildMsg(it, animate){
         // on the owner end); a pending from="owner" row is a LOCAL copy into
         // the inbox — 导入 on the owner end, and guests show nothing at all
         // (they receive nothing; their card appears when the copy graduates). The percent
-        // lives in the corner ring on the copying end.
+        // lives in the corner ring on the copying end. A local card still
+        // waiting its serial turn (queued) says so instead of claiming to send.
         info.querySelector('.fc-size').textContent +=
-          ' · ' + (it.from === 'owner' ? '导入中…' : (mine ? '发送中…' : '接收中…'));
+          ' · ' + (it.queued ? '等待中…'
+            : (it.from === 'owner' ? '导入中…' : (mine ? '发送中…' : '接收中…')));
       }
       card.appendChild(info);
 
@@ -1561,32 +1603,35 @@ async function openDefault(it){
 // tools do not badge the sender's file with "downloaded at HH:MM" either —
 // receipt is the receiver's own UI to confirm. The download-done fact lives
 // in the server log only.
-// Optimistic cards (client-side only — the server has no rows for them).
-// A picked file paints immediately ("Uploading…" on the phone, "复制中…" on
-// the PC) before the server round-trips; each real pending row covers exactly
-// one card, counted per name|size — the same file picked twice keeps its twin
-// until the second row lands. PC entries match by name only: an add-local
-// path carries no size until the server stats it. Failure drops the card —
-// the batch summary toast is the signal. Both merge only on their own side.
+// Local cards (client-side only — no server row for them yet).
+// A picked file paints immediately ("Uploading…" on the phone, "复制中…" on the
+// PC) before the server round-trips. Each carries an id the client GENERATES
+// and sends to the server (?cid= / add-local cid), which adopts it as the row
+// id — so card and row are the SAME identity from pick to graduation and the
+// view needs no name+size matching at all: a local card is hidden the instant
+// an item with its own id appears. That shared identity is also why a card can
+// never be re-derived into a phantom twin when a transfer signal stalls (the
+// old coverage model's failure mode). Failure drops the card; the batch
+// summary toast is the signal. Local cards merge only on their own side.
 const optUploads = [];
-let optSeq = 0;
-// Match key for optimistic coverage (a real pending row hides one card).
-const optKey = (from, name, size) => from + '|' + name + '|' + (from === 'owner' ? '' : size);
+let cidSeq = 0;
+// Filename-safe (catalog::valid_client_id mirrors this): [a-z0-9-], 6..48, no
+// leading/trailing dash. Date.now in base36 keeps it unique per pick.
+function newCid(){
+  const rnd = Math.random().toString(36).slice(2, 6).padEnd(4, '0');
+  return 'c-' + Date.now().toString(36) + '-' + (++cidSeq).toString(36) + '-' + rnd;
+}
 function withOptimistic(serverItems){
-  const out = serverItems.slice();
+  let out = serverItems;
   if(optUploads.length){
-    const counts = {};
-    for(const it of serverItems){
-      if(!it.pending) continue;
-      const k = optKey(it.from, it.name, it.size);
-      counts[k] = (counts[k] || 0) + 1;
-    }
+    const have = new Set(serverItems.map(i => i.id));
+    out = serverItems.slice();
     for(const o of optUploads){
       if((o.from === 'owner') !== isOwner) continue;
-      const k = optKey(o.from, o.name, o.size);
-      if(counts[k] > 0){ counts[k]--; continue; }   // a real row already covers it
+      if(have.has(o.id)) continue;   // the server row with this very id exists
       out.push({ id: o.id, ts: String((o.at / 1000) | 0), from: o.from, kind: 'file',
-        name: o.name, size: o.size, source_kind: 'remote', pending: true, text: '' });
+        name: o.name, size: o.size, source_kind: 'remote', pending: true, text: '',
+        local: true, queued: !!o.queued });
     }
   }
   return out;
@@ -1671,30 +1716,23 @@ function senderCornerState(id){
   if(isOwner) return null;
   const it = itemById(id);
   if(!it || it.kind !== 'file' || !it.pending || it.from !== me) return null;
-  let sent = -1;
-  for(const up of inFlightUploads){
-    if(up.name === it.name && up.size === it.size && typeof up.sent === 'number'){
-      if(up.sent > sent) sent = up.sent;
-    }
-  }
-  if(sent < 0) return null;
+  // id match, not name+size: the card IS the in-flight upload (same cid), so
+  // two picks of the same file can never share one ring.
+  const up = inFlightUploads.find(u => u.id === id);
+  if(!up || typeof up.sent !== 'number' || up.sent < 0) return null;
   const total = it.size || 0;
   if(total <= 0) return { pct: 0, done: false };
-  return { pct: Math.min(sent, total) / total * 100, done: false };
+  return { pct: Math.min(up.sent, total) / total * 100, done: false };
 }
 
-// Repaint every card sharing one upload's name+size pair (the optimistic card
-// before the server row lands, the server row after — sometimes both during
-// handoff). Throttled to ~7/s: progress events fire per chunk.
+// Repaint one upload's card. The card id IS the upload id, so there is exactly
+// one — no name+size scan, no second paint during a pending→ready handoff.
+// Throttled to ~7/s: progress events fire per chunk.
 function paintSenderPair(up, force){
   const now = Date.now();
   if(!force && now - (up.lastPaint || 0) < 150) return;
   up.lastPaint = now;
-  for(const it of curItems){
-    if(it.kind === 'file' && it.pending && it.name === up.name && it.size === up.size){
-      paintCorner(it.id);
-    }
-  }
+  paintCorner(up.id);
 }
 
 // Outgoing pull aggregate (PC): max served percent across this card's fresh
@@ -1883,70 +1921,57 @@ function transferClick(it){
 // server's pending row + partial file die at once instead of waiting out the
 // 5s silence timeout. Both ends converge on the next List push: the card
 // vanishes on PC and phone alike — i.e. the failure path, not a delete.
-// Optimistic-only cards (opt-*) have no server row yet: local abort alone,
-// the writer (if it ever lands) dies on the broken socket / timeout.
+// A card whose row has not been seen yet: local abort alone, the writer (if it
+// ever lands) dies on the broken socket / timeout.
 async function cancelOwnUpload(it){
+  let seen = false;
   for(const up of [...inFlightUploads]){
-    if(up.name === it.name && up.size === it.size){
+    if(up.id === it.id){
+      seen = seen || up.seen;
       try { up.ac.abort(); } catch {}
     }
   }
   for(let i = optUploads.length - 1; i >= 0; i--){
-    const o = optUploads[i];
-    if(o.name === it.name && o.size === it.size && o.from === it.from) optUploads.splice(i, 1);
+    if(optUploads[i].id === it.id) optUploads.splice(i, 1);
   }
-  if(!String(it.id).startsWith('opt-')){
+  // /cancel only once the server has a row for this very id; before that the
+  // local abort alone is enough (the writer, if it ever lands, dies on the
+  // broken socket / timeout).
+  if(seen){
     try { await serverFetch('/cancel', { method:'POST', query:{ id: it.id } }); } catch {}
   }
   reapply();
 }
 function checkUploadGone(items){
   for(const up of inFlightUploads){
-    const mine = items.filter(i => i.from === 'guest'
-      && i.name === up.name && i.size === up.size);
-    const pend = mine.find(i => i.pending);
-    if(pend){
-      // The server registered THIS upload's row. Key the transfer to its id:
-      // names are ambiguous (older copies of the same file share name+size),
-      // ids are not. Everything below is decided on that one row.
+    // The row wears the upload's OWN id (the cid the server adopted): names
+    // are ambiguous (older copies of the same file share name+size), ids are
+    // not, so exactly one row can ever match and nothing is inferred.
+    const row = items.find(i => i.id === up.id);
+    if(row){
       up.seen = true;
-      up.serverId = pend.id;
-      continue;
-    }
-    if(up.serverId){
-      const row = items.find(i => i.id === up.serverId);
-      if(row){
-        // Our own row is no longer pending: the server has the whole file on
-        // disk. That is completion, full stop. The HTTP response must not get a
-        // veto: on iOS WebKit a large raw `send(File)` body had its 200
-        // delivered and TCP-acked yet the XHR never fired onload, so the ack
-        // cannot be trusted to decide. Settle success here, then drop the socket.
-        if(!up.graduated){
-          up.graduated = true;
-          if(up.settle) up.settle(true, 'sse-graduated');
-          // Server has the file; drop the ack socket so it cannot leak a
-          // reserved connection.
-          up.ac.abort();
-        }
-        continue;
+      if(!row.pending && !up.graduated){
+        // Our row is no longer pending: the server has the whole file on disk.
+        // That is completion, full stop. The HTTP response must not get a veto:
+        // on iOS WebKit a large raw `send(File)` body had its 200 delivered and
+        // TCP-acked yet the XHR never fired onload, so the ack cannot be
+        // trusted to decide. Settle success here, then drop the ack socket so
+        // it cannot leak a reserved connection.
+        up.graduated = true;
+        if(up.settle) up.settle(true, 'sse-graduated');
+        up.ac.abort();
       }
-      // Our own row vanished without graduating: the server tore the push
-      // down (sender abort from another tab, PC clear-all, or a reaped dead
-      // push). Stop streaming; the abort settles the upload as failure.
-      up.serverId = null;
-      up.seen = false;
-      up.via = up.via || 'sse-gone';
-      up.ac.abort();
       continue;
     }
-    // No row of ours seen yet: keep the legacy name+size bookkeeping so a push
-    // torn down before we ever keyed its row still stops streaming.
-    if(!mine.length && up.seen){
+    // Our own row vanished without graduating: the server tore the push down
+    // (sender abort from another tab, PC clear-all, or a reaped dead push).
+    // Stop streaming; the abort settles the upload as failure. Before the row
+    // was ever seen there is nothing to conclude — the ack or the backstop
+    // decides.
+    if(up.seen){
       up.seen = false;
       up.via = up.via || 'sse-gone';
       up.ac.abort();
-    } else {
-      up.seen = mine.length > 0;
     }
   }
 }
@@ -2110,8 +2135,21 @@ async function uploadFiles(files){
   // in-flight entry. A failure skips to the next file, never aborts the
   // queue; one summary toast covers the whole batch.
   const queue = [...files].sort((a, b) => (a.size || 0) - (b.size || 0));
+  // Paint EVERY card before the first byte moves, then transfer serially. The
+  // serial part is deliberate (above); the queue being invisible is not — cards
+  // used to appear one at a time, each only when its OWN transfer began, so a
+  // 20-photo pick was a 20-step stutter with no hint of what remained. Now the
+  // whole batch is on screen at pick instant and only the progress ring walks
+  // down it (a card still awaiting its turn reads 等待中…, see buildMsg).
+  const opts = queue.map(f => {
+    const o = { id: newCid(), name: f.name || fallbackName(f), size: f.size || 0,
+      from: isOwner ? 'owner' : 'guest', at: Date.now(), queued: true };
+    optUploads.push(o);
+    return o;
+  });
+  reapply();
   let ok = 0;
-  for(const f of queue) if(await startUpload(f)) ok++;
+  for(let i = 0; i < queue.length; i++) if(await startUpload(queue[i], opts[i])) ok++;
   reapply();
   // Failure-only toasts: the new card in the timeline IS the success
   // confirmation (plus the ring closing). A toast only when something
@@ -2124,15 +2162,13 @@ function fallbackName(f){
   const m = /^image\/([a-z0-9]+)/i.exec(f.type || '');
   return 'pasted-image.' + (m ? m[1].toLowerCase() : 'bin');
 }
-async function startUpload(f){
-  const opt = { id: 'opt-' + (++optSeq), name: f.name || fallbackName(f), size: f.size || 0, from: isOwner ? 'owner' : 'guest', at: Date.now() };
-  // Draw the sending side's card immediately ("Uploading…") before the server
-  // round-trips; withOptimistic() replaces it with the server's pending row as
-  // soon as that arrives.
-  optUploads.push(opt);
-  // Paint the optimistic card NOW, not on the next server list push: a slow or
-  // absent round-trip must not leave the sender staring at nothing after
-  // picking a file (and it makes "card drew but upload stalled" debuggable).
+async function startUpload(f, opt){
+  // The card was painted by uploadFiles with its whole batch, already wearing
+  // the id the server adopts as its row id — see withOptimistic. `opt` is that
+  // very entry: its turn has come, so drop the queued caption; the ring below
+  // owns the card from here.
+  const cid = opt.id;
+  opt.queued = false;
   reapply();
   // Multipart body — do NOT switch this to a raw `xhr.send(File)` body. On
   // iOS WebKit (Safari AND Chrome) a large raw upload's 200 response can be
@@ -2151,18 +2187,18 @@ async function startUpload(f){
   // phone stops writing bytes into a socket the server is already tearing
   // down.
   const ac = new AbortController();
-  const up = { ac, name: upName, size: f.size || 0, seen: false, sent: 0, lastPaint: 0,
-    sentAt: 0, serverId: null, graduated: false, settle: null,
+  const up = { ac, id: cid, name: upName, size: f.size || 0, seen: false, sent: 0, lastPaint: 0,
+    sentAt: 0, graduated: false, settle: null,
     via: '', httpStatus: 0, respDone: false, lateLogged: false };
   inFlightUploads.push(up);
   const upT0 = Date.now();
-  // Success and failure both drop the optimistic card: success is replaced
-  // by the server's real row, failure by the batch summary toast.
+  // Success and failure both drop the local card: success because the server
+  // row with this same id now exists (the view already hides the local one),
+  // failure into the batch summary toast.
   const finish = (ok) => {
     const i = inFlightUploads.indexOf(up);
     if(i >= 0) inFlightUploads.splice(i, 1);
-    const j = optUploads.indexOf(opt);
-    if(j >= 0) optUploads.splice(j, 1);
+    for(let j = optUploads.length - 1; j >= 0; j--) if(optUploads[j].id === cid) optUploads.splice(j, 1);
     // Client diagnostics — transfers used to leave NO client-side trace at
     // all, so a failure was a silent hole with nothing to debug from. One
     // line per notable upload. `via` names what decided the outcome; `resp=no`
@@ -2271,7 +2307,7 @@ async function startUpload(f){
     xhr.onerror = () => { const wasDone = done; up.respDone = true; settle(false, 'net-error'); if(wasDone) lateLog('onerror'); };
     xhr.onabort = () => { settle(false, 'abort'); };
     xhr.ontimeout = () => { const wasDone = done; up.respDone = true; settle(false, 'timeout'); if(wasDone) lateLog('ontimeout'); };
-    xhr.open('POST', '/upload' + qs({ size: f.size || 0 }));
+    xhr.open('POST', '/upload' + qs({ size: f.size || 0, cid }));
     try { xhr.send(fd); } catch(e) { settle(false, 'send-threw'); }
   });
   // Failure is judged here, all causes alike — network death, idle-timeout
@@ -2443,8 +2479,12 @@ async function addLocalPaths(paths){
   // flicker when the list push wins the race. Basename only: the size is
   // unknowable on this side until the server stats it.
   const base = p => p.split(/[\\/]/).pop() || p;
-  const batch = 'b' + (++optSeq);
-  for(const p of fresh) optUploads.push({ id: 'opt-' + (++optSeq), name: base(p), size: 0, from: 'owner', at: Date.now(), batch });
+  const batch = 'b' + (++cidSeq);
+  // One cid per picked path; the server adopts each path's first resulting file
+  // (a folder's inner files get fresh server ids), so a single-file drop
+  // upgrades its card in place instead of flashing a second one.
+  const entries = fresh.map(p => ({ path: p, cid: newCid() }));
+  for(const e of entries) optUploads.push({ id: e.cid, name: base(e.path), size: 0, from: 'owner', at: Date.now(), batch });
   reapply();
   const dropBatch = () => {
     for(let i = optUploads.length - 1; i >= 0; i--) if(optUploads[i].batch === batch) optUploads.splice(i, 1);
@@ -2466,14 +2506,14 @@ async function addLocalPaths(paths){
   // did. Still loud after: a real failure toasts twice as hard.
   let r;
   try {
-    r = await serverFetch('/add-local', { method:'POST', body:{ paths: fresh } });
+    r = await serverFetch('/add-local', { method:'POST', body:{ paths: entries } });
   } catch {
     // The one observable trace of this bug class: count every silent retry
     // in the server log, so the stale-socket phenomenon goes from folklore
     // to a measurable frequency (the pool's own internals emit no events).
     reportClientError('add-local: first attempt failed to fetch (likely stale pooled socket), retrying');
     try {
-      r = await serverFetch('/add-local', { method:'POST', body:{ paths: fresh } });
+      r = await serverFetch('/add-local', { method:'POST', body:{ paths: entries } });
     } catch {
       failBatch();
       toast('添加失败');
@@ -2606,6 +2646,7 @@ let everOnline = false;
 // arriving under a live page) is a "newly paired" worth announcing — without
 // this, every rebuilt window re-toasts for a phone that never left.
 let seenInfo = false;
+let qrUrl = null;   // the URL we last advertised; a change means the QR is stale
 function applyInfo(d){
   if(!isOwner || !d) return;
   const online = !!d.mobileConnected;
@@ -2614,6 +2655,15 @@ function applyInfo(d){
   if(online) everOnline = true;
   if(d.url){
     $('qlUrl').textContent = d.url;
+    // A changed pairing URL means the network moved (WiFi <-> hotspot, a new
+    // subnet) and any QR the phone already scanned is dead. The phone cannot be
+    // told — it is on the old network now — so flag the PC's connect button and
+    // let the lightbox carry the "rescan" instruction. Cleared on lightbox close.
+    if(qrUrl !== null && qrUrl !== d.url){
+      $('connectBtn').classList.add('alert');
+      $('qrLightbox').classList.add('net-changed');
+    }
+    qrUrl = d.url;
   }
 }
 
@@ -2738,6 +2788,7 @@ function reconcile(){
 // EventSource will never notice on its own. Force a fresh connection; its
 // `open` replays state. The same tick expires stale rings (see
 // pruneIdleRings) — no extra timer, one 1s loop covers both.
+let downSince = 0;
 setInterval(() => {
   if(pairExpired) return;
   if(!esDown && lastSeen && Date.now() - lastSeen > 3000){
@@ -2745,6 +2796,25 @@ setInterval(() => {
     lastSeen = Date.now();
     try { es.close(); } catch {}
     connect();
+  }
+  // Guest only: a sustained SSE outage means this page's origin is gone (the PC
+  // changed networks, so its LAN IP moved) and this page can never discover the
+  // new one. Tell the user to rescan instead of retrying silently. A brief blip
+  // never reaches the threshold, and a reconnect clears it.
+  if(!isOwner){
+    if(esDown){ if(!downSince) downSince = Date.now(); } else { downSince = 0; }
+    const show = !!downSince && Date.now() - downSince > 8000;
+    if(show){
+      // The page cannot tell a transient outage from a network change — both
+      // simply fail every request — so never assert "the network changed".
+      // navigator.onLine only separates "no network at all" from the rest, and
+      // even a healthy LAN with no internet can read online, so it is a hint,
+      // not a verdict.
+      $('offlineDesc').textContent = (navigator.onLine === false)
+        ? '手机当前没有网络连接，请检查 Wi-Fi。'
+        : '正在尝试重连。若长时间无反应，请确认手机与电脑在同一 Wi-Fi，并在电脑上打开“连接手机”重新扫码。';
+    }
+    $('offlineGate').classList.toggle('show', show);
   }
   pruneIdleRings();
 }, 1000);
@@ -2845,8 +2915,17 @@ $('fwQuit').onclick = () => { serverFetch('/quit', {method:'POST'}).catch(()=>{}
 // Closing is explicit — the card's ✕ button or the Escape key; the backdrop
 // does not swallow clicks (no accidental dismissal when a stray click lands
 // beside the card).
-function openQrLightbox(){ $('qrLightbox').classList.add('show'); }
-function closeQrLightbox(){ $('qrLightbox').classList.remove('show'); }
+function openQrLightbox(){
+  // The QR <img> is fetched at page load; a network change makes it stale, so
+  // always re-request it cache-busted. The button badge has done its job.
+  $('qrImg').src = '/qr?r=' + Date.now();
+  $('connectBtn').classList.remove('alert');
+  $('qrLightbox').classList.add('show');
+}
+function closeQrLightbox(){
+  $('qrLightbox').classList.remove('show');
+  $('qrLightbox').classList.remove('net-changed');   // acknowledged
+}
 $('connectBtn').onclick = openQrLightbox;
 $('qlClose').onclick = closeQrLightbox;
 document.addEventListener('keydown', e => {

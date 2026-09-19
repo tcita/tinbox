@@ -497,9 +497,21 @@ async fn send_text(
     (StatusCode::OK, "sent").into_response()
 }
 
+/// One dropped/picked path plus the id the client's optimistic card already
+/// wears (see catalog::valid_client_id). A folder expands server-side into
+/// several rows and only its first file consumes the cid: the client painted
+/// one card per picked path, and the rest get fresh server ids. The batch card
+/// is dropped when this response lands either way, so nothing hangs.
+#[derive(serde::Deserialize)]
+struct AddLocalEntry {
+    path: String,
+    #[serde(default)]
+    cid: Option<String>,
+}
+
 #[derive(serde::Deserialize)]
 struct AddLocalPayload {
-    paths: Vec<String>,
+    paths: Vec<AddLocalEntry>,
 }
 
 /// After the PC side's plus button picks real paths via the Tauri dialog, POST
@@ -527,22 +539,28 @@ async fn add_local(
     // Canonical inbox path, so a re-drag of a file already inside inbox is skipped.
     let inbox_canon = std::fs::canonicalize(&inbox).unwrap_or_else(|_| inbox.clone());
 
-    // Expand directories into a flat file list.
-    let mut files: Vec<PathBuf> = Vec::new();
-    for raw in payload.paths {
-        let p = PathBuf::from(raw);
+    // Expand directories into a flat file list; only each path's FIRST file
+    // carries that path's client id (one optimistic card was painted per path).
+    let mut files: Vec<(PathBuf, Option<String>)> = Vec::new();
+    for entry in payload.paths {
+        let p = PathBuf::from(&entry.path);
+        let mut found: Vec<PathBuf> = Vec::new();
         if p.is_dir() {
-            catalog::collect_files(&p, &mut files);
+            catalog::collect_files(&p, &mut found);
         } else if p.is_file() {
-            files.push(p);
+            found.push(p);
         } else {
             logw(&format!("add-local: skipped (not a file/dir): {}", p.display()));
+            continue;
+        }
+        for (i, f) in found.into_iter().enumerate() {
+            files.push((f, if i == 0 { entry.cid.clone() } else { None }));
         }
     }
 
     let mut added = 0usize;
     let mut attempted = 0usize;
-    for src in files {
+    for (src, cid) in files {
         // Re-adding a path that already lives in inbox would copy inbox into
         // itself; skip it.
         let Ok(canon) = std::fs::canonicalize(&src) else {
@@ -554,7 +572,7 @@ async fn add_local(
             continue;
         }
         attempted += 1;
-        match crate::transfer::copy_into_inbox(&canon).await {
+        match crate::transfer::copy_into_inbox(&canon, cid.as_deref()).await {
             Ok((_id, dest, _safe)) => {
                 added += 1;
                 // copy_into_inbox registered the pending row, graduated it

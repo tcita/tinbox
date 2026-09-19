@@ -159,6 +159,22 @@ pub fn new_id() -> String {
     format!("{nanos}-{c}")
 }
 
+/// A client-supplied upload id, adopted verbatim as the catalog row id so the
+/// sender's optimistic card and the server's row share ONE identity from pick
+/// to graduation (see the frontend's withOptimistic). The id becomes a
+/// filename (`pending__{id}__{name}` / `{id}__{name}`), so the charset is
+/// deliberately tiny and closed: `[a-z0-9-]`, 6..=48 bytes, no leading or
+/// trailing `-`. `-` is the only separator, so `__` (the sentinel marker) can
+/// never appear; the server-generated `new_id()` shape (`digits-digits`) also
+/// satisfies every rule, so both id kinds stay interchangeable in the catalog.
+pub fn valid_client_id(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() < 6 || b.len() > 48 { return false; }
+    if b[0] == b'-' || b[b.len() - 1] == b'-' { return false; }
+    b.iter()
+        .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+}
+
 /// Current second-resolution timestamp string (message send time).
 pub fn now_ts() -> String {
     SystemTime::now()
@@ -701,4 +717,34 @@ pub fn all_items() -> Vec<MsgItem> {
     let mut v = cat_lock();
     v.sort_by(|a, b| a.ts.cmp(&b.ts));
     v.iter().map(|e| e.to_item()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_id_accepts_frontend_shape_and_server_ids() {
+        // The exact shape index.html's newCid() emits.
+        assert!(valid_client_id("c-m1abcdefg-1-9z4q"));
+        // Server shape (nanos-counter): also filename-safe, so both kinds are
+        // interchangeable in the catalog.
+        assert!(valid_client_id("1789000000000000000-0"));
+        assert!(valid_client_id("abc123"));
+    }
+
+    #[test]
+    fn client_id_rejects_unsafe_or_ambiguous() {
+        assert!(!valid_client_id(""), "empty");
+        assert!(!valid_client_id("abc"), "too short");
+        assert!(!valid_client_id("abcde"), "5 bytes is short");
+        assert!(!valid_client_id(&"a".repeat(49)), "too long");
+        assert!(!valid_client_id("-abcde"), "leading dash");
+        assert!(!valid_client_id("abcde-"), "trailing dash");
+        assert!(!valid_client_id("a__b"), "underscores are the sentinel sep");
+        assert!(!valid_client_id("abc/def"), "path separator");
+        assert!(!valid_client_id("abc\\def"), "path separator");
+        assert!(!valid_client_id("ABC123"), "uppercase");
+        assert!(!valid_client_id("abc.def"), "dot");
+    }
 }
