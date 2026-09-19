@@ -247,6 +247,16 @@
     background: var(--danger-bg); border-radius: 10px; padding: 9px 13px;
   }
   #qrLightbox.net-changed .ql-warn { display: block; }
+  /* No LAN address: there is nothing a code could point at, so the QR and the
+     address are hidden and this explains why (see applyInfo). */
+  .ql-nolan {
+    display: none; margin-top: 12px; max-width: 260px;
+    font-size: 12.5px; font-weight: 600; line-height: 1.5; color: var(--text);
+    background: var(--accent-bg); border-radius: 10px; padding: 9px 13px;
+  }
+  #qrLightbox.no-lan .ql-nolan { display: block; }
+  #qrLightbox.no-lan .ql-qr,
+  #qrLightbox.no-lan .ql-url { display: none; }
 
   /* Chat Area: #chat is a dumb scroller; the column lives in #chatInner so a
      ResizeObserver on the inner sees every content growth (image decode,
@@ -911,6 +921,7 @@
     <img class="ql-qr" id="qrImg" src="/qr" alt="QR code">
     <div><div class="ql-url" id="qlUrl">…</div></div>
     <div class="ql-warn">网络已变化，请让手机重新扫描这张二维码</div>
+    <div class="ql-nolan">当前没有可用的局域网地址。请先让电脑连上 Wi-Fi，再让手机连接同一个 Wi-Fi。</div>
     <div class="ql-hint">请保持手机与电脑在同一 Wi-Fi</div>
   </div>
 </div>
@@ -2646,7 +2657,8 @@ let everOnline = false;
 // arriving under a live page) is a "newly paired" worth announcing — without
 // this, every rebuilt window re-toasts for a phone that never left.
 let seenInfo = false;
-let qrUrl = null;   // the URL we last advertised; a change means the QR is stale
+let qrUrl = null;      // the URL we last advertised; a change means the QR is stale
+let lanUsable = true;  // false = no LAN address, so there is no code to show
 function applyInfo(d){
   if(!isOwner || !d) return;
   const online = !!d.mobileConnected;
@@ -2658,13 +2670,29 @@ function applyInfo(d){
     // A changed pairing URL means the network moved (WiFi <-> hotspot, a new
     // subnet) and any QR the phone already scanned is dead. The phone cannot be
     // told — it is on the old network now — so flag the PC's connect button and
-    // let the lightbox carry the "rescan" instruction. Cleared on lightbox close.
-    if(qrUrl !== null && qrUrl !== d.url){
+    // let the lightbox carry the "rescan" instruction. Cleared on lightbox
+    // close. Only for a USABLE url: with no LAN address there is nothing to
+    // rescan to, and the no-LAN message below supersedes.
+    if(qrUrl !== null && qrUrl !== d.url && d.usable !== false){
       $('connectBtn').classList.add('alert');
       $('qrLightbox').classList.add('net-changed');
     }
     qrUrl = d.url;
   }
+  // No LAN address: never offer a code that scans to 127.0.0.1. Hide the QR and
+  // the address, show the explanation, and drop any "rescan" state (there is
+  // nothing to rescan to).
+  const usable = d.usable !== false;
+  $('qrLightbox').classList.toggle('no-lan', !usable);
+  if(!usable){
+    $('qrImg').removeAttribute('src');
+    $('qrLightbox').classList.remove('net-changed');
+    $('connectBtn').classList.remove('alert');
+  } else if(!lanUsable && $('qrLightbox').classList.contains('show')){
+    // The network came back while the lightbox was open: load the fresh code.
+    $('qrImg').src = '/qr?r=' + Date.now();
+  }
+  lanUsable = usable;
 }
 
 // Single SSE push channel: named events carry the actual state, so the page
@@ -2917,8 +2945,11 @@ $('fwQuit').onclick = () => { serverFetch('/quit', {method:'POST'}).catch(()=>{}
 // beside the card).
 function openQrLightbox(){
   // The QR <img> is fetched at page load; a network change makes it stale, so
-  // always re-request it cache-busted. The button badge has done its job.
-  $('qrImg').src = '/qr?r=' + Date.now();
+  // always re-request it cache-busted. The button badge has done its job. With
+  // no LAN address there is nothing to fetch — the lightbox explains instead
+  // (see applyInfo / .ql-nolan).
+  if(lanUsable) $('qrImg').src = '/qr?r=' + Date.now();
+  else $('qrImg').removeAttribute('src');
   $('connectBtn').classList.remove('alert');
   $('qrLightbox').classList.add('show');
 }

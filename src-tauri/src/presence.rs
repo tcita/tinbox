@@ -4,7 +4,7 @@
 // page's push channel.
 
 use crate::logger::{logf, logw};
-use crate::server::{current_url, notifier, PushEvent};
+use crate::server::{current_url, notifier, refresh_url, PushEvent};
 use crate::transfer::dl_lock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -169,7 +169,6 @@ pub(crate) async fn monitor_loop() {
     let mut prev_online: Option<bool> = None;
     let mut prev_repair: Option<bool> = None;
     let mut prev_url: Option<String> = None;
-    let mut url_tick: u32 = 0;
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
         // Report transitions only, so a cold start with no device stays quiet
@@ -196,21 +195,33 @@ pub(crate) async fn monitor_loop() {
         // phone already scanned. The server cannot reach a phone now on another
         // network, so the only useful signal is to the PC: re-push `info` with
         // the new url so the page can flag its connect button and tell the user
-        // to rescan. Sampled every 5s — collect_ips enumerates adapters, so
-        // 1 Hz would be a needless syscall. Clones: the url is moved into
-        // prev_url after the (possibly) borrowed comparison.
-        url_tick += 1;
-        if url_tick % 5 == 0 {
-            let url = current_url();
-            if prev_url.as_deref().is_some_and(|p| p != url) {
+        // to rescan. Sampled every tick: once warm, refresh_url() is just the
+        // adapter enumeration (the gateway probes and the PowerShell adapter
+        // query are cached 30-60s), and the 1s beat is the difference between
+        // "the new QR is already rendered when you open it" and "you opened it
+        // into a blank box".
+        let url = refresh_url();
+        let changed = prev_url.as_deref().is_some_and(|p| p != url);
+        if changed {
+            if crate::server::lan_usable() {
                 logf(&format!("network changed: pairing URL is now {url}"));
-                let _ = notifier().send(PushEvent::Info {
-                    mobile_connected: online,
-                    url: url.clone(),
-                });
+            } else {
+                logw(&format!(
+                    "network changed: no LAN address available; pairing URL {url} is unusable (QR withheld)"
+                ));
             }
-            prev_url = Some(url);
+            let _ = notifier().send(PushEvent::Info {
+                mobile_connected: online,
+                url: url.clone(),
+            });
         }
+        // Pre-render on the first sample and on every change, so the QR the user
+        // opens next is already an in-memory PNG (netinfo::refresh_qr) instead
+        // of a request that must probe the new gateway first.
+        if changed || prev_url.is_none() {
+            crate::netinfo::refresh_qr();
+        }
+        prev_url = Some(url);
         // Firewall repair flag transitions.
         let repair = crate::firewall::need_repair();
         if prev_repair != Some(repair) {

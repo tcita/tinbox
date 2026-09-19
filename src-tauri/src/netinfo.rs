@@ -40,20 +40,26 @@ pub(crate) fn note_foreign_subnet(peer: &SocketAddr) {
     ));
 }
 
-/// Return a QR code PNG whose content is http://<best-LAN-IP>:<port>. The IP
-/// is picked by the scoring in collect_ips (gateway-in-subnet evidence), which
-/// stays correct even with TUN-mode VPNs or virtual adapters active. The page
-/// shows it via <img src="/qr">; the phone scans it to open this page.
-pub(crate) async fn qr() -> impl IntoResponse {
-    // One URL builder for the whole app: current_url() assembles the pairing
-    // URL (server.rs), so the QR payload and the displayed address can never
-    // drift apart on an IP/port change.
-    let url = crate::server::current_url();
+/// Cached QR PNG for the last URL the monitor rendered. Opening the lightbox
+/// used to go blank for seconds after a network switch: the handler computed
+/// current_url() inline, and the first collect_ips() past a switch probes the
+/// new gateway (up to ~2s) and re-queries adapters through PowerShell. The
+/// monitor now renders the PNG when it sees the URL change (see
+/// presence::monitor_loop), so that open is an in-memory copy.
+static QR_CACHE: OnceLock<Mutex<(String, Vec<u8>)>> = OnceLock::new();
+
+fn qr_cache() -> &'static Mutex<(String, Vec<u8>)> {
+    QR_CACHE.get_or_init(|| Mutex::new((String::new(), Vec::new())))
+}
+
+/// Render the QR PNG for `url`. Cheap (encode + rasterize, a few ms) — the
+/// expensive half of the old path was assembling the URL, not drawing it.
+fn render_qr(url: &str) -> Option<Vec<u8>> {
     let qr = match qrcode::QrCode::new(url.as_bytes()) {
         Ok(q) => q,
         Err(e) => {
             loge(&format!("QR generation failed: {}  url={}", e, url));
-            return (StatusCode::INTERNAL_SERVER_ERROR, "qr error").into_response();
+            return None;
         }
     };
     let modules = qr.width();
@@ -75,12 +81,54 @@ pub(crate) async fn qr() -> impl IntoResponse {
         }
     }
     let mut buf = std::io::Cursor::new(Vec::new());
-    if img
-        .write_to(&mut buf, image::ImageFormat::Png)
-        .is_err()
-    {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "encode error").into_response();
+    if img.write_to(&mut buf, image::ImageFormat::Png).is_err() {
+        loge(&format!("QR encode failed  url={url}"));
+        return None;
     }
+    Some(buf.into_inner())
+}
+
+/// Pre-render the QR for the current URL into the cache. Called by the monitor
+/// when the URL changes, so the user's next lightbox open is instant.
+/// `render_qr` logs its own failures; a stale/empty cache just falls back to
+/// an on-demand render in `qr()`.
+pub(crate) fn refresh_qr() {
+    if !crate::server::lan_usable() {
+        // No LAN address: whatever we could draw would encode 127.0.0.1 and
+        // scan to nothing. Drop any previous code so nothing stale survives;
+        // qr() refuses outright.
+        *qr_cache().lock().unwrap_or_else(|e| e.into_inner()) = (String::new(), Vec::new());
+        return;
+    }
+    let url = crate::server::current_url();
+    if let Some(bytes) = render_qr(&url) {
+        *qr_cache().lock().unwrap_or_else(|e| e.into_inner()) = (url, bytes);
+    }
+}
+
+pub(crate) async fn qr() -> impl IntoResponse {
+    if !crate::server::lan_usable() {
+        // No LAN address — the UI hides the QR and explains instead. Never hand
+        // out a code that points at 127.0.0.1.
+        return (StatusCode::NOT_FOUND, "no LAN address").into_response();
+    }
+    // Cached copy first, but only while it still matches the current URL: the
+    // snapshot is updated by the monitor the moment it sees a change, so a
+    // cache for a superseded URL is never served. Compute on demand for a cold
+    // start or a failed pre-render. (current_url() is read before the QR lock,
+    // so the two locks are never held together.)
+    let cur = crate::server::current_url();
+    let cached = {
+        let g = qr_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if g.1.is_empty() || g.0 != cur { None } else { Some(g.1.clone()) }
+    };
+    let bytes = match cached {
+        Some(b) => b,
+        None => match render_qr(&cur) {
+            Some(b) => b,
+            None => return (StatusCode::INTERNAL_SERVER_ERROR, "qr error").into_response(),
+        },
+    };
     (
         StatusCode::OK,
         [
@@ -89,7 +137,7 @@ pub(crate) async fn qr() -> impl IntoResponse {
             // so a cached copy scanned after a restart 403s forever.
             (header::CACHE_CONTROL, "no-store"),
         ],
-        buf.into_inner(),
+        bytes,
     )
         .into_response()
 }
@@ -126,7 +174,7 @@ pub(crate) fn collect_ips() -> Vec<String> {
     let mut real: Vec<(String, Ipv4Addr)> = Vec::new();
     let mut dropped_virtual: Vec<String> = Vec::new();
     for (name, v4) in &cands {
-        let desc = facts.get(name).map(|(d, _)| d.as_str()).unwrap_or("");
+        let desc = facts.get(name).map(|f| f.desc.as_str()).unwrap_or("");
         if virtual_adapter(name) || virtual_adapter(desc) {
             dropped_virtual.push(format!("{name} {v4}"));
         } else {
@@ -158,64 +206,94 @@ pub(crate) fn collect_ips() -> Vec<String> {
         return out;
     }
 
-    // Filter 2: gateway reachability, probed with the candidate's own
-    // address as source so the answer is per-interface, not whatever the
-    // default route happens to pick. No gateway configured -> cannot probe,
-    // kept last. A failed probe only demotes the adapter in the ordering; it
-    // never drops it from the list (false negatives are common with a VPN TUN
-    // active, and any real IP beats a virtual one).
+    // Filter 2: gateway reachability, probed with the candidate's own address
+    // as source so the answer is per-interface, not whatever the default route
+    // happens to pick. A failed probe only demotes the adapter; it never drops
+    // it (false negatives are common with a VPN TUN active, and any real IP
+    // beats a virtual one).
     let probes: Vec<(Ipv4Addr, Ipv4Addr)> = real
         .iter()
         .filter_map(|(name, v4)| {
             facts
                 .get(name)
-                .and_then(|(_, gw)| gw.as_deref())
+                .and_then(|f| f.gateway.as_deref())
                 .and_then(|g| g.parse::<Ipv4Addr>().ok())
                 .map(|g| (*v4, g))
         })
         .collect();
     let probed = probe_gateways(&probes);
 
-    let mut alive: Vec<Ipv4Addr> = Vec::new();
-    let mut unprobed: Vec<Ipv4Addr> = Vec::new();
-    let mut dead: Vec<(Ipv4Addr, String)> = Vec::new();
-    for (name, v4) in real {
-        let gw = facts
-            .get(&name)
-            .and_then(|(_, gw)| gw.as_deref())
-            .and_then(|g| g.parse::<Ipv4Addr>().ok());
-        match gw {
-            Some(g) if probed.get(&(v4, g)) == Some(&true) => alive.push(v4),
-            Some(g) => dead.push((v4, format!("{v4} (gateway {g} unreachable)"))),
-            None => unprobed.push(v4),
-        }
+    // Order the survivors. Only two keys mean anything, and neither is a guess
+    // about the phone's network:
+    //   1. wireless   — the app's copy promises "同一 Wi-Fi", so prefer the
+    //                   interface the user was told to use.
+    //   2. gateway ok — measured evidence the interface is on a live network
+    //                   (an unplugged NIC's gateway times out).
+    // When those tie (a machine on two live Wi-Fis, or two live wired segments)
+    // nothing can know which one the phone is on, so the remaining key is pure
+    // determinism — the adapter name. It implies no preference; it only
+    // guarantees "same adapter set -> same order", which the 1s URL comparison
+    // needs to avoid phantom network-change reports. There is deliberately no
+    // IP-value or interface-metric key: neither improves the chance of picking
+    // the phone's network, so neither earns a place.
+    struct Cand {
+        name: String,
+        v4: Ipv4Addr,
+        wireless: bool,
+        rank: u8, // 0 = gateway ok, 1 = no gateway to probe, 2 = gateway dead
     }
-    alive.sort_by_key(|v| v.octets());
-    unprobed.sort_by_key(|v| v.octets());
-    dead.sort_by_key(|(v, _)| v.octets());
-    let ips: Vec<String> = alive
-        .iter()
-        .chain(&unprobed)
-        .chain(dead.iter().map(|(v, _)| v))
-        .map(ToString::to_string)
+    let mut cands: Vec<Cand> = real
+        .into_iter()
+        .map(|(name, v4)| {
+            let fact = facts.get(&name);
+            let gw = fact
+                .and_then(|f| f.gateway.as_deref())
+                .and_then(|g| g.parse::<Ipv4Addr>().ok());
+            let rank = match gw {
+                Some(g) if probed.get(&(v4, g)) == Some(&true) => 0,
+                Some(_) => 2,
+                None => 1,
+            };
+            Cand {
+                name,
+                v4,
+                wireless: fact.map(|f| f.wireless).unwrap_or(false),
+                rank,
+            }
+        })
         .collect();
+    // Wireless first (so !wireless sorts last), then reachable, then the name.
+    cands.sort_by(|a, b| (!a.wireless, a.rank, &a.name).cmp(&(!b.wireless, b.rank, &b.name)));
+    let ips: Vec<String> = cands.iter().map(|c| c.v4.to_string()).collect();
 
-    // Log whenever any bucket changes, not just the winner: a new virtual
+    // Log whenever this decision changes, not just the winner: a new virtual
     // adapter appearing or a candidate flipping to dead is diagnostic noise
     // worth one line, while steady-state checks stay silent.
     let best = ips.first().cloned().unwrap_or_default();
-    let signature = format!("{best}|{alive:?}|{unprobed:?}|{dead:?}|{dropped_virtual:?}");
+    let signature = format!(
+        "{best}|{:?}|{dropped_virtual:?}",
+        cands
+            .iter()
+            .map(|c| (c.v4, c.wireless, c.rank))
+            .collect::<Vec<_>>()
+    );
     {
         let mut last = LAST_DECISION.lock().unwrap_or_else(|e| e.into_inner());
         if *last != signature {
-            let list = |v: &[Ipv4Addr]| {
-                v.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
-            };
+            let list = cands
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{} {}/{}",
+                        c.v4,
+                        if c.wireless { "wifi" } else { "wired" },
+                        ["alive", "no-gateway", "dead"][c.rank as usize],
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
             logf(&format!(
-                "LAN IP selection: using {best}; alive [{}]; no gateway [{}]; dead [{}]; virtual [{}]",
-                list(&alive),
-                list(&unprobed),
-                dead.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>().join(", "),
+                "LAN IP selection: using {best}; candidates [{list}]; virtual [{}]",
                 dropped_virtual.join(", "),
             ));
             *last = signature;
@@ -323,15 +401,22 @@ fn gateway_reachable(_src: Ipv4Addr, _gw: Ipv4Addr) -> bool {
     false
 }
 
-/// Adapter metadata used for filtering: interface name -> (description,
-/// default gateway if any). Gathered by one powershell call, cached 30s —
-/// `info` events fire on connect and on phone transitions, so the query must
-/// not spawn a process each time.
-#[cfg(windows)]
-type AdapterFacts = std::collections::HashMap<String, (String, Option<String>)>;
+/// Adapter metadata used for filtering and for ordering the QR candidates.
+/// Gathered by one powershell call, cached 30s — `info` events fire on connect
+/// and on phone transitions, so the query must not spawn a process each time.
+#[derive(Clone, Default)]
+struct AdapterFact {
+    /// InterfaceDescription ("Intel(R) Wi-Fi 6 AX201 …"); the virtual-adapter
+    /// keyword filter reads it.
+    desc: String,
+    /// Default gateway, when the interface has one (else it cannot be probed).
+    gateway: Option<String>,
+    /// 802.11/Wi-Fi family — see the ordering in collect_ips (the app tells
+    /// users "同一 Wi-Fi", so the wireless interface wins).
+    wireless: bool,
+}
 
-#[cfg(not(windows))]
-type AdapterFacts = std::collections::HashMap<String, (String, Option<String>)>;
+type AdapterFacts = std::collections::HashMap<String, AdapterFact>;
 
 static ADAPTER_FACTS: OnceLock<Mutex<(u64, AdapterFacts)>> = OnceLock::new();
 static LAST_DECISION: Mutex<String> = Mutex::new(String::new());
@@ -351,31 +436,33 @@ fn adapter_facts() -> AdapterFacts {
     facts
 }
 
-/// One read-only powershell query: for every adapter, its name, description,
-/// IPv4 addresses and default gateway, tab-separated per address.
+/// One read-only powershell query: for every Up adapter, its name, description,
+/// IPv4 addresses, default gateway and wireless flag, tab-separated per address.
 #[cfg(windows)]
 fn gather_adapter_facts() -> AdapterFacts {
     let ps = r#"Get-NetAdapter | Where-Object Status -eq 'Up' | ForEach-Object {
   $n = $_.Name; $d = $_.InterfaceDescription; $i = $_.ifIndex
+  $w = if (("$d $n" -match 'Wi-?Fi|WLAN|Wireless|802\.11') -or ($_.PhysicalMediaType -match '802\.11|Wireless')) { '1' } else { '0' }
   Get-NetIPAddress -InterfaceIndex $i -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {
     $g = (Get-NetRoute -InterfaceIndex $i -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1).NextHop
-    "{0}`t{1}`t{2}`t{3}" -f $n, $d, $_.IPAddress, $g
+    "{0}`t{1}`t{2}`t{3}`t{4}" -f $n, $d, $_.IPAddress, $g, $w
   }
 }"#;
     let mut map = AdapterFacts::new();
     if let Some((true, out)) = crate::firewall::run_ps(ps) {
         for line in out.lines() {
             let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() != 4 {
+            if parts.len() != 5 {
                 continue;
             }
             let gw = parts[3].trim();
             map.insert(
                 parts[0].trim().to_string(),
-                (
-                    parts[1].trim().to_string(),
-                    if gw.is_empty() { None } else { Some(gw.to_string()) },
-                ),
+                AdapterFact {
+                    desc: parts[1].trim().to_string(),
+                    gateway: if gw.is_empty() { None } else { Some(gw.to_string()) },
+                    wireless: parts[4].trim() == "1",
+                },
             );
         }
     }

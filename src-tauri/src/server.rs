@@ -30,7 +30,7 @@ use axum::{
 use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
 use tokio_stream::{wrappers::BroadcastStream, StreamExt as _};
@@ -374,9 +374,10 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 }
             };
             let _ = BOUND_PORT.set(actual);
-            // IP encoded in the QR code: take the first (WiFi segment
-            // preferred). If the phone cannot connect, compare this IP with the
-            // machine's actual subnet.
+            // IP encoded in the QR code: take the first candidate. The ordering
+            // (wireless first, then gateway-reachable, then name) lives in
+            // netinfo::collect_ips. If the phone cannot connect, compare this IP
+            // with the machine's actual subnet.
             let ips = collect_ips();
             let ip = ips.first().cloned().unwrap_or_else(|| "127.0.0.1".to_string());
             logf(&format!(
@@ -780,7 +781,7 @@ fn info_event() -> Event {
         .retry(Duration::from_secs(1))
         .event("info")
         .json_data(serde_json::json!({
-            "mobileConnected": online, "url": url
+            "mobileConnected": online, "url": url, "usable": lan_usable()
         }))
         .unwrap()
 }
@@ -803,7 +804,8 @@ fn push_event_to_sse(ev: PushEvent) -> Event {
         PushEvent::Info { mobile_connected, url } => Event::default()
             .event("info")
             .json_data(serde_json::json!({
-                "mobileConnected": mobile_connected, "url": url
+                "mobileConnected": mobile_connected, "url": url,
+                "usable": lan_usable()
             }))
             .unwrap(),
         PushEvent::Resync => Event::default().event("resync").data("1"),
@@ -811,19 +813,68 @@ fn push_event_to_sse(ev: PushEvent) -> Event {
     }
 }
 
-/// The full pairing URL (best LAN IP + bound port + token): shown on the PC
-/// (header, lightbox) and pushed in `info` events. The URL carries the
-/// pairing token, so scanning the QR and copy-pasting the address elsewhere
-/// are one and the same gesture. This is the ONE place the URL is assembled —
-/// netinfo's /qr route reuses it so the QR and the displayed address can never
-/// drift apart.
-pub(crate) fn current_url() -> String {
-    let ip = collect_ips()
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "127.0.0.1".to_string());
+/// Last sampled pairing URL, plus whether it points at a real LAN address.
+/// `usable == false` means no private LAN IP exists (Wi-Fi off and nothing else
+/// up): the URL degrades to 127.0.0.1, which no phone can reach, so the UI must
+/// say so and hide the QR rather than offer a code that scans to nothing.
+/// Request paths (`/qr`, the `info` replay on connect) read this snapshot; only
+/// the monitor recomputes, so a handler never pays collect_ips()'s ICMP gateway
+/// probes or its PowerShell adapter query — the reason /qr went blank for
+/// seconds right after a network switch.
+static URL_SNAP: OnceLock<Mutex<(String, bool)>> = OnceLock::new();
+
+fn url_snap() -> &'static Mutex<(String, bool)> {
+    URL_SNAP.get_or_init(|| Mutex::new((String::new(), true)))
+}
+
+/// Recompute the pairing URL (best LAN IP + bound port + token) and store it
+/// with its usability. Expensive — collect_ips() enumerates adapters and may
+/// probe gateways (up to ~2s on the first call after a switch). Only the
+/// monitor may call this on a schedule; everything else reads `current_url()`.
+pub(crate) fn refresh_url() -> String {
+    let ip = collect_ips().first().cloned();
+    let usable = ip.is_some();
     let port = BOUND_PORT.get().copied().unwrap_or(PORT);
-    format!("http://{}:{}/?t={}", ip, port, request_token())
+    let url = format!(
+        "http://{}:{}/?t={}",
+        ip.unwrap_or_else(|| "127.0.0.1".to_string()),
+        port,
+        request_token()
+    );
+    *url_snap().lock().unwrap_or_else(|e| e.into_inner()) = (url.clone(), usable);
+    url
+}
+
+/// The full pairing URL as last sampled: shown on the PC (header, lightbox) and
+/// pushed in `info` events. The URL carries the pairing token, so scanning the
+/// QR and copy-pasting the address elsewhere are one and the same gesture. This
+/// is the ONE place the URL is assembled — netinfo's /qr route reuses it so the
+/// QR and the displayed address can never drift apart. Computed once on the
+/// very first call (before the monitor's first sample), so a cold start still
+/// paints a QR.
+pub(crate) fn current_url() -> String {
+    {
+        let g = url_snap().lock().unwrap_or_else(|e| e.into_inner());
+        if !g.0.is_empty() {
+            return g.0.clone();
+        }
+    }
+    refresh_url()
+}
+
+/// Whether the last sampled URL points at a real LAN address. Read together
+/// with `current_url()` — both come from the same sample, so the UI never sees
+/// a URL and a usability flag from different moments.
+pub(crate) fn lan_usable() -> bool {
+    if url_snap()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .0
+        .is_empty()
+    {
+        refresh_url();
+    }
+    url_snap().lock().unwrap_or_else(|e| e.into_inner()).1
 }
 
 /// Return the embedded app logo (header brand and
