@@ -1904,16 +1904,51 @@ function checkUploadGone(items){
   for(const up of inFlightUploads){
     const mine = items.filter(i => i.from === 'guest'
       && i.name === up.name && i.size === up.size);
-    if(mine.some(i => i.pending)){ up.seen = true; continue; }
-    if(!mine.length && up.seen){
-      // Pending row vanished mid-flight (self-abort from another tab, PC
-      // clear-all, or a reaped dead push): abort locally so we stop
-      // streaming into the socket the server already tore down. The failure
-      // toast is the same "Transfer failed" whichever path wins the race.
+    const pend = mine.find(i => i.pending);
+    if(pend){
+      // The server registered THIS upload's row. Key the transfer to its id:
+      // names are ambiguous (older copies of the same file share name+size),
+      // ids are not. Everything below is decided on that one row.
+      up.seen = true;
+      up.serverId = pend.id;
+      continue;
+    }
+    if(up.serverId){
+      const row = items.find(i => i.id === up.serverId);
+      if(row){
+        // Our own row is no longer pending: the server has the whole file on
+        // disk. That is completion, full stop. The HTTP response must not get a
+        // veto: measured on-wire on a bad link, the server sent the full 200
+        // and the phone's TCP acked it in 51ms, yet Safari never completed the
+        // XHR (readyState stuck at 3, onload never fired) — the browser, not
+        // the network. Settle success here, then drop that socket.
+        if(!up.graduated){
+          up.graduated = true;
+          if(up.settle) up.settle(true, 'sse-graduated');
+          // Server has the file; drop the (possibly stuck) ack socket. On iOS
+          // the ack can be delivered yet WebKit never completes the XHR, so
+          // leaving it open would leak a reserved connection per upload.
+          up.ac.abort();
+        }
+        continue;
+      }
+      // Our own row vanished without graduating: the server tore the push
+      // down (sender abort from another tab, PC clear-all, or a reaped dead
+      // push). Stop streaming; the abort settles the upload as failure.
+      up.serverId = null;
       up.seen = false;
+      up.via = up.via || 'sse-gone';
+      up.ac.abort();
+      continue;
+    }
+    // No row of ours seen yet: keep the legacy name+size bookkeeping so a push
+    // torn down before we ever keyed its row still stops streaming.
+    if(!mine.length && up.seen){
+      up.seen = false;
+      up.via = up.via || 'sse-gone';
       up.ac.abort();
     } else {
-      up.seen = mine.length > 0; // completed (row kept) or not seen yet
+      up.seen = mine.length > 0;
     }
   }
 }
@@ -2097,20 +2132,28 @@ async function startUpload(f){
   // round-trips; withOptimistic() replaces it with the server's pending row as
   // soon as that arrives.
   optUploads.push(opt);
-  const fd = new FormData();
-  // Pasted clipboard images (long-press 拷贝 on a card, then paste into the
-  // composer) often arrive with an EMPTY filename — Safari puts the image AND
-  // its URL on the pasteboard, and the file half can be nameless. The server
-  // rejects those with a 400 ("bad filename") and the user only sees 传输失败.
-  // Name them here from the MIME type so the paste flow uploads like a file.
-  fd.append('file', f, f.name || fallbackName(f));
+  // Paint the optimistic card NOW, not on the next server list push: a slow or
+  // absent round-trip must not leave the sender staring at nothing after
+  // picking a file (and it makes "card drew but upload stalled" debuggable).
+  reapply();
+  // Raw body: the request body IS the file bytes (no FormData/multipart
+  // framing); the filename rides the query string. Pasted clipboard images
+  // (long-press 拷贝 on a card, then paste into the composer) often arrive
+  // with an EMPTY filename — Safari puts the image AND its URL on the
+  // pasteboard, and the file half can be nameless. The server rejects those
+  // with a 400 ("bad filename") and the user only sees 传输失败, so name
+  // them here from the MIME type and the paste flow uploads like a file.
+  const upName = f.name || fallbackName(f);
   // The abort handle is what checkUploadGone pulls when the pending row
   // vanishes mid-flight: aborting cancels the request mid-stream, so the
   // phone stops writing bytes into a socket the server is already tearing
   // down.
   const ac = new AbortController();
-  const up = { ac, name: f.name, size: f.size || 0, seen: false, sent: 0, lastPaint: 0 };
+  const up = { ac, name: upName, size: f.size || 0, seen: false, sent: 0, lastPaint: 0,
+    sentAt: 0, serverId: null, graduated: false, settle: null,
+    via: '', httpStatus: 0, respDone: false, lateLogged: false };
   inFlightUploads.push(up);
+  const upT0 = Date.now();
   // Success and failure both drop the optimistic card: success is replaced
   // by the server's real row, failure by the batch summary toast.
   const finish = (ok) => {
@@ -2118,6 +2161,24 @@ async function startUpload(f){
     if(i >= 0) inFlightUploads.splice(i, 1);
     const j = optUploads.indexOf(opt);
     if(j >= 0) optUploads.splice(j, 1);
+    // Client diagnostics — transfers used to leave NO client-side trace at
+    // all, so a failure was a silent hole with nothing to debug from. One
+    // line per notable upload. `via` names what decided the outcome; `resp=no`
+    // is the telling signal: the server row graduated (the file IS safe) but
+    // the HTTP ack never completed — exactly the iOS/bad-link case this
+    // SSE-truth completion exists for. Normal small successes stay quiet so
+    // the log holds signal.
+    const now = Date.now();
+    const sendMs = up.sentAt ? up.sentAt - upT0 : 0;
+    if(!ok || !up.respDone || up.size >= 4 * 1024 * 1024 || sendMs > 10000){
+      clientLog('upload ' + (ok ? 'ok' : 'fail')
+        + ' via=' + (up.via || '?')
+        + ' send=' + sendMs + 'ms total=' + (now - upT0) + 'ms'
+        + ' bytes=' + up.size
+        + ' http=' + (up.httpStatus || 'none')
+        + ' resp=' + (up.respDone ? 'yes' : 'no')
+        + ' ' + upName);
+    }
     reapply();
   };
   // One boolean for every cause: a torn-down socket wins the race before the
@@ -2138,20 +2199,27 @@ async function startUpload(f){
   const ok = await new Promise((resolve) => {
     let done = false;
     let idleT = 0, respT = 0;
-    const settle = (v) => { if(!done){ done = true; clearTimeout(idleT); clearTimeout(respT); resolve(v); } };
+    const settle = (v, via) => { if(!done){ done = true; if(!up.via) up.via = via || '?'; clearTimeout(idleT); clearTimeout(respT); resolve(v); } };
+    // Let checkUploadGone settle this upload on the SERVER's truth (its row
+    // graduating, or vanishing). The HTTP response is only a fast-path ack:
+    // measured on-wire, the server sent the full 200, the phone's TCP acked it
+    // 51ms later, yet Safari never completed the XHR. The response must never
+    // define completion.
+    up.settle = settle;
     const xhr = new XMLHttpRequest();
     // Do not rely on a later `onabort` dispatch to close the Promise: the
     // watchdog exists precisely so a browser/WebView edge case cannot leave
     // the optimistic card alive forever.
-    const failAndAbort = () => {
+    const failAndAbort = (reason) => {
+      if(done) return;   // already settled (e.g. graduated via the SSE list)
       try { xhr.abort(); } catch {}
-      settle(false);
+      settle(false, reason);
     };
     // Sender self-abort (cancelOwnUpload) rides the same abort handle.
-    ac.signal.addEventListener('abort', failAndAbort, { once: true });
+    ac.signal.addEventListener('abort', () => failAndAbort('signal-abort'), { once: true });
     const armIdle = () => {
       clearTimeout(idleT);
-      idleT = setTimeout(failAndAbort, 8000);
+      idleT = setTimeout(() => failAndAbort('idle-timeout'), 8000);
     };
     armIdle();
     // Sender truth for this end's ring: handed-to-socket bytes. Throttled —
@@ -2166,22 +2234,44 @@ async function startUpload(f){
       }
     };
     xhr.upload.onload = () => {
-      // Body fully sent; the server answers immediately after receipt, so the
-      // wait from here is bounded — 8s without a status is death, not slowness.
+      up.sentAt = Date.now();
       up.sent = up.size;
       paintSenderPair(up, true);
       clearTimeout(idleT);
-      respT = setTimeout(() => { responseTimedOut = true; failAndAbort(); }, 8000);
+      // Body is out. From here the server's list owns completion (the row
+      // graduates) and the response is only a fast-path ack — so this timer is
+      // a last-resort backstop for "neither the response nor the list push ever
+      // arrived", not a normal-path failure. Graduation normally wins first.
+      respT = setTimeout(() => {
+        if(up.graduated){ settle(true, 'sse-graduated'); return; }
+        responseTimedOut = true;
+        failAndAbort('resp-timeout');
+      }, 15000);
+    };
+    // A response that completes AFTER the SSE already settled this upload is
+    // logged on its own: "did the HTTP ack ever come back?" is exactly the
+    // question a Chrome-vs-Safari / weak-link comparison needs answered, and
+    // it is invisible otherwise once the transfer was already decided.
+    const lateLog = (ev, status) => {
+      if(up.lateLogged) return;
+      up.lateLogged = true;
+      clientLog('upload resp-late ' + ev + ' http=' + (status || 'none')
+        + ' after=' + (up.sentAt ? (Date.now() - up.sentAt) : -1) + 'ms ' + upName);
     };
     xhr.onload = () => {
+      const wasDone = done;
+      up.respDone = true;
+      up.httpStatus = xhr.status;
       if(xhr.status === 403) pairExpiredNow();
-      settle(xhr.status >= 200 && xhr.status < 300);
+      const good = xhr.status >= 200 && xhr.status < 300;
+      settle(good, good ? 'resp-2xx' : 'resp-' + xhr.status);
+      if(wasDone) lateLog('onload', xhr.status);
     };
-    xhr.onerror = () => settle(false);
-    xhr.onabort = () => settle(false);
-    xhr.ontimeout = () => settle(false);
-    xhr.open('POST', '/upload' + qs({ size: f.size || 0 }));
-    try { xhr.send(fd); } catch { settle(false); }
+    xhr.onerror = () => { const wasDone = done; up.respDone = true; settle(false, 'net-error'); if(wasDone) lateLog('onerror'); };
+    xhr.onabort = () => { settle(false, 'abort'); };
+    xhr.ontimeout = () => { const wasDone = done; up.respDone = true; settle(false, 'timeout'); if(wasDone) lateLog('ontimeout'); };
+    xhr.open('POST', '/upload' + qs({ size: f.size || 0, name: upName }));
+    try { xhr.send(f); } catch(e) { settle(false, 'send-threw'); }
   });
   // Failure is judged here, all causes alike — network death, idle-timeout
   // abort, self-abort, HTTP error statuses. finish() drops the card.
@@ -2311,13 +2401,24 @@ $('clearConfirm').onclick = async () => {
 // the dropped one.
 $('plus').onclick = () => {
   if(isOwner){ pickLocal(); return; }
-  try { $('fileInput').showPicker(); }
-  catch { $('fileInput').click(); }
+  // Diagnostics: the guest picker path was a black box — a tap that opens no
+  // sheet, or a change that delivers no files, left no client-side trace.
+  try {
+    $('fileInput').showPicker();
+    clientLog('picker showPicker() returned without throwing');
+  } catch(e) {
+    clientLog('picker showPicker() threw ' + ((e && e.name) || e) + '; fallback click()');
+    $('fileInput').click();
+  }
 };
 $('fileInput').addEventListener('change', e => {
-  if(e.target.files.length) uploadFiles([...e.target.files]);
+  const files = [...e.target.files];
+  clientLog('picker change n=' + files.length
+    + (files.length ? ' ' + files.slice(0, 5).map(f => (f.name || '(noname)') + '/' + f.size).join(', ') : ''));
+  if(files.length) uploadFiles(files);
   e.target.value = '';
 });
+$('fileInput').addEventListener('cancel', () => clientLog('picker canceled (dismissed, no file)'));
 
 // Send real PC paths to /add-local (the plus button and PC drag-and-drop; the
 // webview exposes the dropped file's path via the non-standard File.path). The
@@ -2466,10 +2567,10 @@ window.addEventListener('drop', e => {
   dragCounter = 0;
   dOverlay.classList.remove('active');
   // Phone: every drop is swallowed, composer included. Drops of in-page
-  // images carry broken file entries (multipart that never parses — the log
-  // proves it: "upload rejected: multipart read"), so even the deliberate
-  // composer-drop misfires into a 传输失败 toast. Uploads ride the
-  // plus-button picker, full stop.
+  // images carry broken file entries whose bytes never arrive (the old
+  // multipart endpoint proved it: unparseable bodies), so even the
+  // deliberate composer-drop misfires into a 传输失败 toast. Uploads ride
+  // the plus-button picker, full stop.
   if(!isOwner) return;
   const files = [...e.dataTransfer.files];
   if(!files.length) return;
@@ -2639,6 +2740,7 @@ function reconcile(){
 setInterval(() => {
   if(pairExpired) return;
   if(!esDown && lastSeen && Date.now() - lastSeen > 3000){
+    clientLog('sse watchdog reconnect (silent ' + (Date.now() - lastSeen) + 'ms)');
     lastSeen = Date.now();
     try { es.close(); } catch {}
     connect();
@@ -2799,6 +2901,11 @@ function reportClientError(msg){
     }, 1000);
   });
 }
+// General client-side diagnostics over the same channel: a bounded, one-line
+// POST to /log, so the PC's single log file covers what the phone saw too.
+// Used by the transfer path (which previously logged nothing client-side) and
+// the SSE watchdog; never per chunk/byte.
+function clientLog(msg){ reportClientError(msg); }
 window.addEventListener('error', e => {
   reportClientError((e.message || 'unknown error') + ' @' + (e.filename || '') + ':' + (e.lineno || ''));
 });

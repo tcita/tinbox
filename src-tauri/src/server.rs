@@ -19,7 +19,7 @@ use crate::presence::{
 };
 use crate::transfer::{cancel, dl_status, download, remove, remove_all, serve_poster, upload, view};
 use axum::{
-    extract::{connect_info::ConnectInfo, DefaultBodyLimit, Request, State},
+    extract::{connect_info::ConnectInfo, Request, State},
     http::{header, StatusCode},
     middleware::{from_fn, Next},
     response::{Html, IntoResponse, Json, Response, sse::{Event, Sse, KeepAlive}},
@@ -290,17 +290,15 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
             let app = Router::new()
                 .route("/", get(index))
                 .route("/list", get(list))
-                // /upload is exempt from the body cap: it streams the body
+                // /upload takes the raw file bytes as its body and streams them
             // straight to disk (see upload()), so RSS stays flat however big
             // the push is, and a full disk fails the write cleanly (row +
-            // partial file are dropped on the error path). Every other POST
-            // buffers through the Json extractor, which reads the WHOLE body
-            // into memory before deserializing — those keep axum's default
-            // 2MB limit so an unbounded body cannot spike RSS.
-            .route(
-                "/upload",
-                post(upload).layer(DefaultBodyLimit::disable()),
-            )
+            // partial file are dropped on the error path). No body-cap
+            // exemption needed: the handler consumes `Body` as a stream and
+            // never buffers it, while every other POST buffers through the
+            // Json extractor — those keep axum's default 2MB limit so an
+            // unbounded body cannot spike RSS.
+            .route("/upload", post(upload))
                 .route("/add-local", post(add_local))
                 .route("/send-text", post(send_text))
                 .route("/log", post(client_log))
