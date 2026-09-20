@@ -247,16 +247,34 @@
     background: var(--danger-bg); border-radius: 10px; padding: 9px 13px;
   }
   #qrLightbox.net-changed .ql-warn { display: block; }
-  /* No LAN address: there is nothing a code could point at, so the QR and the
-     address are hidden and this explains why (see applyInfo). */
+  /* No LAN address: nothing a code could point at, so the QR, the address and
+     the "扫码连接设备" title are hidden; this empty state explains why instead.
+     No action button: the monitor pushes a fresh `info` within ~1s of the
+     network returning and applyInfo auto-loads the QR (see its no-lan/auto-load
+     branches), so the state heals itself — the copy only sets that expectation.
+     Reuses the offlineGate visual language (.g-radar/.g-title/.g-desc). Copy
+     names Wi-Fi only on purpose: Wi-Fi is the blessed path, other links merely
+     happen to work and would drag in edge cases we refuse to design for. */
   .ql-nolan {
-    display: none; margin-top: 12px; max-width: 260px;
-    font-size: 12.5px; font-weight: 600; line-height: 1.5; color: var(--text);
-    background: var(--accent-bg); border-radius: 10px; padding: 9px 13px;
+    display: none; flex-direction: column; align-items: center;
+    max-width: 300px; margin: 2px auto 0; padding: 6px 4px;
   }
-  #qrLightbox.no-lan .ql-nolan { display: block; }
+  #qrLightbox.no-lan .ql-nolan { display: flex; }
+  #qrLightbox.no-lan .ql-title,
   #qrLightbox.no-lan .ql-qr,
-  #qrLightbox.no-lan .ql-url { display: none; }
+  #qrLightbox.no-lan .ql-url,
+  #qrLightbox.no-lan .ql-hint { display: none; }
+  .ql-nolan-icon {
+    width: 72px; height: 72px; border-radius: 50%; display: flex;
+    align-items: center; justify-content: center; margin-bottom: 16px;
+    background: var(--accent-bg); color: var(--accent);
+  }
+  .ql-nolan-icon svg { width: 34px; height: 34px; }
+  .ql-nolan-title {
+    font-size: 18px; font-weight: 700; letter-spacing: -0.4px;
+    margin: 0 0 8px; color: var(--text);
+  }
+  .ql-nolan-desc { font-size: 13px; line-height: 1.6; color: var(--sub); margin: 0; }
 
   /* Chat Area: #chat is a dumb scroller; the column lives in #chatInner so a
      ResizeObserver on the inner sees every content growth (image decode,
@@ -920,8 +938,20 @@
     <div class="ql-title">扫码连接设备</div>
     <img class="ql-qr" id="qrImg" src="/qr" alt="QR code">
     <div><div class="ql-url" id="qlUrl">…</div></div>
-    <div class="ql-warn">网络已变化，请让手机重新扫描这张二维码</div>
-    <div class="ql-nolan">当前没有可用的局域网地址。请先让电脑连上 Wi-Fi，再让手机连接同一个 Wi-Fi。</div>
+    <div class="ql-warn">网络已变化，请用手机重新扫码</div>
+    <div class="ql-nolan">
+      <div class="ql-nolan-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M1.42 9a16 16 0 0 1 21.16 0"/>
+          <path d="M5 12.55a11 11 0 0 1 14.08 0"/>
+          <path d="M8.53 16.11a6 6 0 0 1 6.95 0"/>
+          <line x1="12" y1="20" x2="12.01" y2="20"/>
+          <line x1="2" y1="2" x2="22" y2="22"/>
+        </svg>
+      </div>
+      <div class="ql-nolan-title">未连接到局域网</div>
+      <div class="ql-nolan-desc">请先把电脑连接到 <span style="white-space:nowrap">Wi-Fi</span>。<br>网络恢复后二维码会自动加载。</div>
+    </div>
     <div class="ql-hint">请保持手机与电脑在同一 Wi-Fi</div>
   </div>
 </div>
@@ -2657,40 +2687,57 @@ let everOnline = false;
 // arriving under a live page) is a "newly paired" worth announcing — without
 // this, every rebuilt window re-toasts for a phone that never left.
 let seenInfo = false;
-let qrUrl = null;      // the URL we last advertised; a change means the QR is stale
+let qrUrl = null;      // last USABLE url this lifecycle (kept across no-network gaps); a differing new one = stale code
 let lanUsable = true;  // false = no LAN address, so there is no code to show
 function applyInfo(d){
   if(!isOwner || !d) return;
   const online = !!d.mobileConnected;
-  if(seenInfo && online && !everOnline){ toast('已配对,可以传输了'); $('qrLightbox').classList.remove('show'); }
+  if(seenInfo && online && !everOnline){
+    toast('已配对,可以传输了');
+    // The phone just arrived: dismiss the card if it is open. closeQrLightbox
+    // is guarded, so a card that is already closed is left alone — a device
+    // pairing must not silently retire an unread cue the user never looked at.
+    closeQrLightbox();
+  }
   seenInfo = true;
   if(online) everOnline = true;
-  if(d.url){
-    $('qlUrl').textContent = d.url;
-    // A changed pairing URL means the network moved (WiFi <-> hotspot, a new
-    // subnet) and any QR the phone already scanned is dead. The phone cannot be
-    // told — it is on the old network now — so flag the PC's connect button and
-    // let the lightbox carry the "rescan" instruction. Cleared on lightbox
-    // close. Only for a USABLE url: with no LAN address there is nothing to
-    // rescan to, and the no-LAN message below supersedes.
-    if(qrUrl !== null && qrUrl !== d.url && d.usable !== false){
-      $('connectBtn').classList.add('alert');
-      $('qrLightbox').classList.add('net-changed');
-    }
-    qrUrl = d.url;
-  }
-  // No LAN address: never offer a code that scans to 127.0.0.1. Hide the QR and
-  // the address, show the explanation, and drop any "rescan" state (there is
-  // nothing to rescan to).
+
   const usable = d.usable !== false;
+  const wasUsable = lanUsable;
+  // Within this app lifecycle, remember the last USABLE url and never forget it
+  // across a no-network gap: a real network switch is A -> none -> B, so the
+  // comparison has to survive the gap or the cue never fires. "Usable url
+  // differs from the previous usable url" == a second, different code was drawn
+  // -> the phone's old one is dead -> "rescan" (warning text + button dot).
+  // Returning to the SAME url after a drop is a reconnect, not a change, so it
+  // stays quiet. qrUrl only ever holds a usable url, so the no-LAN 127.0.0.1
+  // placeholder can never masquerade as a previous code.
+  const urlChanged = !!d.url && usable && qrUrl !== null && qrUrl !== d.url;
+  const recovered = usable && !wasUsable;
+
+  if(d.url) $('qlUrl').textContent = d.url;
+  if(usable && d.url) qrUrl = d.url;
+
+  // Two states drive the card: usable (show the current code) / no LAN (show
+  // the explanation). The unread cue is ONE entity with two surfaces — the
+  // button dot while the card is closed, the warning text while it is open —
+  // set together here and cleared together when the card closes or on no LAN.
   $('qrLightbox').classList.toggle('no-lan', !usable);
   if(!usable){
     $('qrImg').removeAttribute('src');
     $('qrLightbox').classList.remove('net-changed');
     $('connectBtn').classList.remove('alert');
-  } else if(!lanUsable && $('qrLightbox').classList.contains('show')){
-    // The network came back while the lightbox was open: load the fresh code.
-    $('qrImg').src = '/qr?r=' + Date.now();
+  } else {
+    if(urlChanged){
+      $('connectBtn').classList.add('alert');
+      $('qrLightbox').classList.add('net-changed');
+    }
+    // The card's image must never disagree with the state: when an OPEN card is
+    // looking at a superseded code — a usable change (A->B) or a recovery
+    // (none->LAN) — swap in the fresh one now. A closed card fetches on open.
+    if((urlChanged || recovered) && $('qrLightbox').classList.contains('show')){
+      $('qrImg').src = '/qr?r=' + Date.now();
+    }
   }
   lanUsable = usable;
 }
@@ -2743,7 +2790,14 @@ function connect(){
   // the phone never left (a scan is always worth confirming), and dismiss the
   // QR lightbox — its job is done, no ✕ click needed. Latch everOnline so the
   // presence flip that follows the scan doesn't double-toast.
-  es.addEventListener('paired', () => { lastSeen = Date.now(); everOnline = true; toast('已配对,可以传输了'); $('qrLightbox').classList.remove('show'); });
+  es.addEventListener('paired', () => {
+    lastSeen = Date.now(); everOnline = true;
+    toast('已配对,可以传输了');
+    // Dismiss the card if it is open (the scan just used it). closeQrLightbox
+    // is guarded, so a card that is already closed is untouched: pairing never
+    // retires an unread cue the user has not looked at.
+    closeQrLightbox();
+  });
 }
 // Home-screen web app contexts refuse service: since iOS 26 the add-to-Home-
 // Screen flow installs every site as a web app by default (the "Open as Web
@@ -2945,17 +2999,24 @@ $('fwQuit').onclick = () => { serverFetch('/quit', {method:'POST'}).catch(()=>{}
 // beside the card).
 function openQrLightbox(){
   // The QR <img> is fetched at page load; a network change makes it stale, so
-  // always re-request it cache-busted. The button badge has done its job. With
-  // no LAN address there is nothing to fetch — the lightbox explains instead
-  // (see applyInfo / .ql-nolan).
+  // always re-request it cache-busted. The dot is deliberately NOT cleared
+  // here: the unread cue is one entity (dot while closed, warning while open)
+  // that clears only when the card is CLOSED, so opening just swaps one surface
+  // for the other. With no LAN address there is nothing to fetch — the lightbox
+  // explains instead (see applyInfo / .ql-nolan).
   if(lanUsable) $('qrImg').src = '/qr?r=' + Date.now();
   else $('qrImg').removeAttribute('src');
-  $('connectBtn').classList.remove('alert');
   $('qrLightbox').classList.add('show');
 }
 function closeQrLightbox(){
+  // Guarded: the Escape handler calls this unconditionally, and a stray close
+  // must never dismiss a change the user has not actually looked at.
+  if(!$('qrLightbox').classList.contains('show')) return;
   $('qrLightbox').classList.remove('show');
-  $('qrLightbox').classList.remove('net-changed');   // acknowledged
+  // Closing the card is the one "seen" event: retire the whole unread cue —
+  // the in-card warning and the button dot go together.
+  $('qrLightbox').classList.remove('net-changed');
+  $('connectBtn').classList.remove('alert');
 }
 $('connectBtn').onclick = openQrLightbox;
 $('qlClose').onclick = closeQrLightbox;
