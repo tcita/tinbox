@@ -152,15 +152,14 @@ pub(crate) async fn qr() -> impl IntoResponse {
 /// and produces false "dead"s, and any real IP is still a better QR target
 /// than a vswitch address.
 pub(crate) fn collect_ips() -> Vec<String> {
-    // All private IPv4s with their interface names, deduplicated.
+    // All private IPv4s with their interface names, deduplicated. Only
+    // adapters that are actually connected are considered (see
+    // local_private_v4): this is what stops a disconnected Wi-Fi adapter's
+    // stale DHCP address from keeping the QR alive.
     let mut cands: Vec<(String, Ipv4Addr)> = Vec::new();
-    if let Ok(ifaces) = local_ip_address::list_afinet_netifas() {
-        for (name, ip) in ifaces {
-            if let IpAddr::V4(v4) = ip {
-                if is_private(v4) && !cands.iter().any(|(_, v)| *v == v4) {
-                    cands.push((name, v4));
-                }
-            }
+    for (name, v4) in local_private_v4() {
+        if !cands.iter().any(|(_, v)| *v == v4) {
+            cands.push((name, v4));
         }
     }
     if cands.is_empty() {
@@ -173,23 +172,28 @@ pub(crate) fn collect_ips() -> Vec<String> {
     // when facts are missing; description matching adds the adapter's type.
     let mut real: Vec<(String, Ipv4Addr)> = Vec::new();
     let mut dropped_virtual: Vec<String> = Vec::new();
+    let mut virtual_ips: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::new();
     for (name, v4) in &cands {
         let desc = facts.get(name).map(|f| f.desc.as_str()).unwrap_or("");
         if virtual_adapter(name) || virtual_adapter(desc) {
             dropped_virtual.push(format!("{name} {v4}"));
+            virtual_ips.insert(*v4);
         } else {
             real.push((name.clone(), *v4));
         }
     }
 
-    // Nothing real survived (an all-virtual machine). Still never emit a
-    // vswitch address - fall back to the machine's default-route private IP, or
-    // nothing at all. A blank/unreachable QR is honest; a vswitch IP is always
-    // a lie.
+    // Nothing real survived (an all-virtual machine). Never emit a vswitch/TUN
+    // address: the fallback probes the machine's default-route IP, and with a
+    // VPN TUN up that route IS the tunnel (`xray` etc.), so an unguarded
+    // local_ip() would hand back exactly the lie this branch exists to avoid —
+    // a QR for 172.18.x.x no phone can reach. Reject anything already seen on a
+    // virtual adapter; a real adapter our enumeration happened to miss is not in
+    // virtual_ips and still gets rescued. A blank/unreachable QR is honest.
     if real.is_empty() {
         let mut out: Vec<String> = Vec::new();
         if let Ok(IpAddr::V4(v4)) = local_ip_address::local_ip() {
-            if is_private(v4) {
+            if is_private(v4) && !virtual_ips.contains(&v4) {
                 out.push(v4.to_string());
             }
         }
@@ -322,6 +326,107 @@ fn virtual_adapter(s: &str) -> bool {
     KW.iter().any(|k| l.contains(k))
 }
 
+/// Private IPv4 candidates for the QR, preferring a status-filtered Windows
+/// enumeration and falling back to the crate only when that fails.
+///
+/// The `local-ip-address` crate's `list_afinet_netifas()` walks every adapter
+/// and unicast address from `GetAdaptersAddresses` WITHOUT consulting
+/// `OperStatus`, so a media-disconnected adapter whose DHCP address Windows has
+/// not yet released (`ipconfig` says "Media disconnected", but the address
+/// still rides the adapter struct) reads as a live LAN address. tinbox would
+/// then keep advertising a QR for a network that is gone, and the monitor sees
+/// no change so it never logs `network changed`. See `connected_private_v4`.
+fn local_private_v4() -> Vec<(String, Ipv4Addr)> {
+    #[cfg(windows)]
+    if let Some(v) = connected_private_v4() {
+        return v;
+    }
+    local_ip_address::list_afinet_netifas()
+        .map(|ifaces| {
+            ifaces
+                .into_iter()
+                .filter_map(|(name, ip)| match ip {
+                    IpAddr::V4(v4) if is_private(v4) => Some((name, v4)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Enumerate private IPv4 addresses but keep ONLY adapters whose `OperStatus`
+/// is Up, so a disconnected interface (stale DHCP address, cable/Wi-Fi down)
+/// cannot masquerade as a reachable LAN. Returns `None` on any API failure so
+/// `local_private_v4` can fall back to the crate.
+#[cfg(windows)]
+fn connected_private_v4() -> Option<Vec<(String, Ipv4Addr)>> {
+    use windows::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, GAA_FLAG_SKIP_ANYCAST,
+        GAA_FLAG_SKIP_MULTICAST, GET_ADAPTERS_ADDRESSES_FLAGS,
+    };
+    use windows::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+    use windows::Win32::Networking::WinSock::{AF_INET, SOCKADDR_IN};
+    const ERROR_SUCCESS: u32 = 0;
+    const ERROR_BUFFER_OVERFLOW: u32 = 111;
+    // Vec<u64> not Vec<u8>: the buffer is reinterpreted as IP_ADAPTER_ADDRESSES_LH,
+    // which holds pointers/u64 and needs 8-byte alignment that a u8 Vec cannot
+    // promise (a misaligned deref is UB).
+    let mut size: u32 = 15_000;
+    let mut buf: Vec<u64>;
+    loop {
+        buf = vec![0u64; (size as usize).div_ceil(8)];
+        let ret = unsafe {
+            GetAdaptersAddresses(
+                AF_INET.0 as u32,
+                GET_ADAPTERS_ADDRESSES_FLAGS(GAA_FLAG_SKIP_ANYCAST.0 | GAA_FLAG_SKIP_MULTICAST.0),
+                None,
+                Some(buf.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>()),
+                &mut size,
+            )
+        };
+        match ret {
+            ERROR_SUCCESS => break,
+            ERROR_BUFFER_OVERFLOW => continue,
+            _ => return None,
+        }
+    }
+    let mut out: Vec<(String, Ipv4Addr)> = Vec::new();
+    unsafe {
+        let mut adapter = buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+        while !adapter.is_null() {
+            let a = &*adapter;
+            if a.OperStatus == IfOperStatusUp && a.FriendlyName.0 != std::ptr::null_mut() {
+                let name = pwstr_to_string(a.FriendlyName);
+                let mut u = a.FirstUnicastAddress;
+                while !u.is_null() {
+                    let ua = &*u;
+                    let sa = ua.Address.lpSockaddr;
+                    if !sa.is_null() && (*sa).sa_family == AF_INET {
+                        let sin = &*sa.cast::<SOCKADDR_IN>();
+                        let v4 = Ipv4Addr::from(sin.sin_addr.S_un.S_addr.to_ne_bytes());
+                        if is_private(v4) && !out.iter().any(|(_, v): &(String, Ipv4Addr)| *v == v4) {
+                            out.push((name.clone(), v4));
+                        }
+                    }
+                    u = ua.Next;
+                }
+            }
+            adapter = a.Next;
+        }
+    }
+    Some(out)
+}
+
+/// Decode a NUL-terminated wide string returned by Win32.
+#[cfg(windows)]
+unsafe fn pwstr_to_string(p: windows::core::PWSTR) -> String {
+    let mut len = 0usize;
+    while *p.0.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(p.0, len))
+}
+
 /// Probe several (source address, gateway) pairs concurrently; each answer
 /// is cached for 60s because collect_ips runs on every `info` event / connect
 /// replay and a probe costs up to ~2s of ping timeout (1s per attempt, two attempts).
@@ -368,7 +473,9 @@ fn probe_gateways(
 /// (transient WiFi blip, or a VPN TUN capturing the packet) is otherwise a
 /// false "dead" that misorders multi-adapter machines. Exit code 0 means at
 /// least one reply came back.
-/// Each real probe (60s cache miss) logs target, verdict and latency.
+/// Logging is change-or-failure only: a steady `alive` would be one line a
+/// minute of idle noise, so it stays silent. First probe, any `no reply`,
+/// and dead->alive recovery still log.
 #[cfg(windows)]
 fn gateway_reachable(src: Ipv4Addr, gw: Ipv4Addr) -> bool {
     use std::os::windows::process::CommandExt;
@@ -386,11 +493,24 @@ fn gateway_reachable(src: Ipv4Addr, gw: Ipv4Addr) -> bool {
             break;
         }
     }
-    logf(&format!(
-        "gateway probe from {src} to {gw}: {} in {}ms",
-        if ok { "alive" } else { "no reply" },
-        started.elapsed().as_millis()
-    ));
+    // Last logged verdict per (src, gateway): steady `alive` repeats are
+    // suppressed, so an idle machine stays silent. Failures always log
+    // (each 60s miss while dead is evidence, not noise); recovery logs via
+    // the verdict change.
+    static LAST_VERDICT: OnceLock<Mutex<std::collections::HashMap<(Ipv4Addr, Ipv4Addr), bool>>> =
+        OnceLock::new();
+    let prev = LAST_VERDICT
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert((src, gw), ok);
+    if prev != Some(ok) || !ok {
+        logf(&format!(
+            "gateway probe from {src} to {gw}: {} in {}ms",
+            if ok { "alive" } else { "no reply" },
+            started.elapsed().as_millis()
+        ));
+    }
     ok
 }
 
