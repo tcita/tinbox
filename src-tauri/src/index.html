@@ -256,7 +256,7 @@
      No action button: the monitor pushes a fresh `info` within ~1s of the
      network returning and applyInfo auto-loads the QR (see its no-lan/auto-load
      branches), so the state heals itself — the copy only sets that expectation.
-     Reuses the offlineGate visual language (.g-radar/.g-title/.g-desc). Copy
+     Reuses the web-app gate visual language (.g-radar/.g-title/.g-desc). Copy
      names Wi-Fi only on purpose: Wi-Fi is the blessed path, other links merely
      happen to work and would drag in edge cases we refuse to design for. */
   .ql-nolan {
@@ -747,13 +747,13 @@
     animation: bootSpin 0.8s linear infinite;
   }
 
-  /* Home-screen web app gate (phone): same card geometry as the retired
-   pairing overlay — one-message-one-action language. */
-#webAppGate, #offlineGate {
+   /* Home-screen web app gate (phone): same card geometry as the retired
+    pairing overlay — one-message-one-action language. */
+#webAppGate {
   position: fixed; inset: 0; z-index: 90; background: var(--bg);
   display: none; align-items: center; justify-content: center; padding: 20px;
 }
-#webAppGate.show, #offlineGate.show { display: flex; }
+#webAppGate.show { display: flex; }
 
 /* Context Menu */
   .ctx-menu {
@@ -875,14 +875,14 @@
         <h2 class="st-section-title">收件箱位置</h2>
         <div class="st-panel st-location">
           <div class="st-path-row"><div class="st-path" id="stPath">…</div><button class="st-change" id="stChange">更改位置</button></div>
-          <div class="st-impact"><svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10" fill="currentColor"/><path d="M12 6.8v6.4m0 3.9h.01" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/></svg><span>更改收件箱位置后需要重启应用以生效。</span></div>
+          <div class="st-impact"><svg width="15" height="15" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="10" fill="currentColor"/><path d="M12 6.8v6.4m0 3.9h.01" fill="none" stroke="#fff" stroke-width="2.4" stroke-linecap="round"/></svg><span>需要重启应用</span></div>
         </div>
       </section>
       <section class="st-section">
         <h2 class="st-section-title">关闭窗口时</h2>
         <div class="st-panel radio-row" id="stCloseRadio">
-          <button data-v="tray"><span class="dot"></span><span class="st-option-title">最小化到托盘</span><span class="st-option-desc">关闭窗口，服务继续运行，手机不断连</span></button>
-          <button data-v="quit"><span class="dot"></span><span class="st-option-title">直接退出</span><span class="st-option-desc">关闭即退出程序，手机需重新扫码连接</span></button>
+          <button data-v="tray"><span class="dot"></span><span class="st-option-title">最小化到托盘</span><span class="st-option-desc">在后台继续运行</span></button>
+          <button data-v="quit"><span class="dot"></span><span class="st-option-title">直接退出</span></button>
         </div>
       </section>
       <section class="st-section st-danger-section">
@@ -917,17 +917,6 @@
     </div>
     <div class="g-title">请用浏览器打开</div>
     <div class="g-desc">tinbox 不支持以应用方式打开。</div>
-  </div>
-</div>
-
-<!-- Offline gate (guest): a sustained SSE outage means this page's origin is
-     gone — the PC changed networks, so its LAN IP moved and this page can never
-     discover the new one. It cannot auto-recover; say so and point at the QR. -->
-<div id="offlineGate">
-  <div class="g-card">
-    <div class="g-radar"><span style="font-size:44px;line-height:1">📡</span></div>
-    <div class="g-title">连接已断开</div>
-    <div class="g-desc" id="offlineDesc">正在尝试重连…</div>
   </div>
 </div>
 
@@ -1216,7 +1205,7 @@ async function delItem(it){
       catch {}
     }
   } else {
-    toast('删除失败，请去收件箱手动删除');
+    toast('删除失败，请到收件箱手动删除');
   }
   refresh();
 }
@@ -1830,7 +1819,6 @@ function paintCorner(id){
       const p = Math.max(0, Math.min(100, sst.pct));
       ring.classList.toggle('p0', !(p > 0));
       ring.querySelector('.cr-arc').style.strokeDasharray = p + ' ' + (100 - p);
-      ring.title = Math.round(p) + '% · 轻触取消';
       const glyph = ring.querySelector('.cr-glyph');
       glyph.classList.add('cancel');
       glyph.classList.remove('pct');
@@ -2465,7 +2453,7 @@ $('clearConfirm').onclick = async () => {
       let msg = '已清空';
       try {
         const m = /^cleared:(\d+):(\d+)$/.exec((await r.text()).trim());
-        if(m && +m[2] > 0) msg = '部分未清空，请去收件箱手动删除';
+        if(m && +m[2] > 0) msg = '部分未清空，请到收件箱手动删除';
       } catch {}
       toast(msg);
     }
@@ -2552,33 +2540,24 @@ async function addLocalPaths(paths){
       r = await serverFetch('/add-local', { method:'POST', body:{ paths: entries } });
     } catch {
       failBatch();
-      toast('添加失败');
+      toast('导入失败');
       return;
     }
   }
-  if(!r.ok){ failBatch(); toast('添加失败'); return; }
+  if(!r.ok){ failBatch(); toast('导入失败'); return; }
   dropBatch(); reapply();
-  // Success reports its count: the server answers "added: N" (partial success
-  // is normal — a locked/OneDrive-placeholder/missing source is skipped while
-  // its siblings land, so N can be smaller than what was picked).
+  // Failure-only toast: landed cards are the success signal, so silence covers
+  // both full success and folder expansion (one dropped path -> N cards, N can
+  // exceed the path count). Any shortfall is surfaced with a count — a real copy
+  // failure, or a re-drag of a file already in the inbox. The latter is
+  // deliberate: dragging a file that is already in the inbox is "sending a file
+  // to yourself", called out rather than silently accepted.
   let n = fresh.length;
   try {
     const m = /added:\s*(\d+)/.exec(await r.text());
     if(m) n = parseInt(m[1], 10);
   } catch {}
-  if(fresh.length === 1 && n === 0){
-    // Single file, skipped: toast-only — added:0 conflates
-    // genuine failure with benign skips (already-in-inbox re-drag most notably).
-    toast('添加失败');
-  } else if(n < fresh.length){
-    // Failure-only: landed cards confirm success; toast only the shortfall.
-    toast(`导入成功 ${n}/${fresh.length} 个文件`);
-  } else if(n > fresh.length){
-    // A dropped folder expands server-side (collect_files flattens it — the
-    // inbox keeps no hierarchy), so one drag lands N cards. Name the count:
-    // otherwise "dragged 1, got N" reads as a bug.
-    toast(`导入 ${n} 个文件`);
-  }
+  if(n < fresh.length) toast(`有 ${fresh.length - n} 个文件导入失败`);
 }
 // Tauri fires tauri://drag-drop with the real paths; listening to it covers
 // platforms where the File.path injection is missing. In practice only this
@@ -2609,6 +2588,22 @@ async function pickLocal(){
   }
   try {
     const picked = await T.dialog.open({ multiple: true, title: '选择文件' });
+    // This path has no other observability (the phone picker logs its change /
+    // cancel; this one did not), so record what the native dialog returned —
+    // the only way a silent return becomes diagnosable.
+    //
+    // Known and accepted: selecting a .lnk comes back as `null`. Tauri's dialog
+    // (rfd) sets FOS_ALLOWMULTISELECT but not FOS_NODEREFERENCELINKS, so the
+    // shell dereferences the shortcut instead of handing back the .lnk path;
+    // rfd yields None and Tauri maps it to null. That is indistinguishable from
+    // a user cancel, so it cannot be toasted without false alarms — we accept
+    // the OS default. Drag-and-drop still adds a .lnk (the native drop delivers
+    // the real path over a different channel).
+    const desc = picked == null ? 'null'
+      : Array.isArray(picked) ? `arr n=${picked.length}`
+      : `${typeof picked} ${String(picked).slice(0, 120)}`;
+    clientLog('pc picker: ' + desc
+      + (Array.isArray(picked) && picked.length ? ' ' + JSON.stringify(picked).slice(0, 200) : ''));
     if(!picked) return;
     let paths = [];
     if(Array.isArray(picked)) paths = picked.map(p => typeof p === 'string' ? p : p.path);
@@ -2616,7 +2611,7 @@ async function pickLocal(){
     else if(picked && picked.path) paths = [picked.path];
     addLocalPaths(paths);
   } catch(e) {
-    toast('添加失败');
+    toast('打开选择器失败');
   }
 }
 
@@ -2700,7 +2695,7 @@ function applyInfo(d){
   if(!isOwner || !d) return;
   const online = !!d.mobileConnected;
   if(seenInfo && online && !everOnline){
-    toast('已配对,可以传输了');
+    toast('连接成功，可以传输了');
     // The phone just arrived: dismiss the card if it is open. closeQrLightbox
     // is guarded, so a card that is already closed is left alone — a device
     // pairing must not silently retire an unread cue the user never looked at.
@@ -2799,7 +2794,7 @@ function connect(){
   // presence flip that follows the scan doesn't double-toast.
   es.addEventListener('paired', () => {
     lastSeen = Date.now(); everOnline = true;
-    toast('已配对,可以传输了');
+    toast('连接成功，可以传输了');
     // Dismiss the card if it is open (the scan just used it). closeQrLightbox
     // is guarded, so a card that is already closed is untouched: pairing never
     // retires an unread cue the user has not looked at.
@@ -2877,7 +2872,6 @@ function reconcile(){
 // EventSource will never notice on its own. Force a fresh connection; its
 // `open` replays state. The same tick expires stale rings (see
 // pruneIdleRings) — no extra timer, one 1s loop covers both.
-let downSince = 0;
 setInterval(() => {
   if(pairExpired) return;
   if(!esDown && lastSeen && Date.now() - lastSeen > 3000){
@@ -2885,25 +2879,6 @@ setInterval(() => {
     lastSeen = Date.now();
     try { es.close(); } catch {}
     connect();
-  }
-  // Guest only: a sustained SSE outage means this page's origin is gone (the PC
-  // changed networks, so its LAN IP moved) and this page can never discover the
-  // new one. Tell the user to rescan instead of retrying silently. A brief blip
-  // never reaches the threshold, and a reconnect clears it.
-  if(!isOwner){
-    if(esDown){ if(!downSince) downSince = Date.now(); } else { downSince = 0; }
-    const show = !!downSince && Date.now() - downSince > 8000;
-    if(show){
-      // The page cannot tell a transient outage from a network change — both
-      // simply fail every request — so never assert "the network changed".
-      // navigator.onLine only separates "no network at all" from the rest, and
-      // even a healthy LAN with no internet can read online, so it is a hint,
-      // not a verdict.
-      $('offlineDesc').textContent = (navigator.onLine === false)
-        ? '手机当前没有网络连接，请检查 Wi-Fi。'
-        : '正在尝试重连。若长时间无反应，请确认手机与电脑在同一 Wi-Fi，并在电脑上打开“连接手机”重新扫码。';
-    }
-    $('offlineGate').classList.toggle('show', show);
   }
   pruneIdleRings();
 }, 1000);
@@ -2965,7 +2940,7 @@ function applyFw(needRepair){
     // repair return only means "UAC granted", the confirmation is this
     // transition.
     serverFetch('/untop', {method:'POST'}).catch(()=>{});
-    toast('网络访问已恢复');
+    toast('防火墙已放行，可以连接了');
   }
   if(!show){
     // Overlay gone: no repair is in flight any more.
@@ -3094,17 +3069,12 @@ window.addEventListener('unhandledrejection', e => {
   reportClientError('unhandledrejection: ' + msg);
 });
 
-// A fresh ?t= served its one purpose the moment this response set the cookie:
-// drop it from the address bar so later reloads authenticate by cookie and
-// never re-fire the server's paired broadcast. Server-side ?t= then means
-// exactly "a scan just happened" — reloads stay silent, scans always toast.
-// Only `t` goes; /view?id= and friends keep their params.
-if(new URLSearchParams(location.search).has('t')){
-  const u = new URL(location.href);
-  u.searchParams.delete('t');
-  const q = u.searchParams.toString();
-  history.replaceState(null, '', u.pathname + (q ? '?' + q : '') + u.hash);
-}
+// `?t=` is left in the URL for the whole session (no history scrub): the token
+// is the credential, and keeping it makes the address bar copy-pasteable to
+// another browser on the same LAN without a rescan. Reloads therefore re-fire
+// the server's Paired broadcast — accepted as harmless (rare, and only a
+// redundant "connected" toast on the PC). The cookie still authenticates the
+// requests that carry no query (SSE, /list, /view).
 
 refresh();
 </script>

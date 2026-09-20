@@ -75,17 +75,13 @@ fn cookie_carries_token(headers: &HeaderMap, tok: &str) -> bool {
 
 /// What an unpaired, non-loopback visitor sees: a card visually identical to
 /// the in-app pairing overlay (same glyph, card geometry, type,
-/// theme-following palette). Two variants, picked by request path in
-/// require_token (a refused credential is a given in both):
-///   - file link (/view, /dl): a shared/forwarded URL, which can never work
-///     (LAN-only, paired device only) — the copy says so, not "rescan";
-///   - anything else (/ and the rest): expired session or stale link — the
-///     copy says rescan. Bare-IP first visits don't happen (entry always
-///     carries ?t= or the cookie), so no third variant.
-/// All CSS and the emoji are inline; the page makes ZERO further requests
-/// (every asset it could want is behind the very gate that served it). The
-/// PC's loopback window never reaches this branch, so the text below is
-/// visitor-only.
+/// theme-following palette). One variant now: every refusal — expired session,
+/// stale or forwarded link — is told to rescan. The old path-based "invalid
+/// share link" page is gone: a shared link is just another unpaired visitor,
+/// and splitting the copy by path only papered over the same answer. All CSS
+/// and the glyph are inline; the page makes ZERO further requests (every asset
+/// it could want is behind the very gate that served it). The PC's loopback
+/// window never reaches this branch, so the text below is visitor-only.
 fn unpaired_page(glyph: &str, title: &str, heading: &str, body: &str) -> String {
     // Dark-only, like the app page: no light variant, no media query.
     format!(
@@ -110,7 +106,7 @@ fn unpaired_page(glyph: &str, title: &str, heading: &str, body: &str) -> String 
     )
 }
 
-/// Inline "scan" glyph for the expired-session variant (SVG Repo
+/// Inline "scan" glyph for the refusal page (SVG Repo
 /// "Qr Code Scanner Phone Qr Code Smartphone", Objects Infographic Icons
 /// collection, CC0 License, uploader SVG Repo).
 /// Optimized for inline use: prolog/dimensions stripped, fill=currentColor so
@@ -166,35 +162,10 @@ pub(crate) async fn require_token(
     if cookie_carries_token(req.headers(), &tok) {
         return next.run(req).await;
     }
-    // Refused: pick the copy AND the glyph by path. The glyph sits in the
-    // status-icon slot, so it must read as status, not brand: 📦 (the tinbox
-    // box) says "package" on a page that is about neither packages nor boxes.
-    // A file link (/view, /dl) opened without a valid credential is a
-    // shared/forwarded URL — ⛓️‍💥 names the culprit (broken chain, Emoji
-    // 15.1; pre-support systems fall back to ⛓️💥 side by side — both halves
-    // are ancient codepoints, so no tofu, still reads as broken). Anything else is an expired
-    // session or stale link — SCAN_GLYPH names the fix (scan again): an inline
-    // SVG illustration instead of the 📷 emoji, which never had a dedicated
-    // QR-scan codepoint and read as "camera" rather than "scan".
-    let path = req.uri().path();
-    let (glyph, title, heading, body) = if path.starts_with("/view")
-        || path.starts_with("/dl")
-        || path.starts_with("/poster")
-    {
-        (
-            "⛓️‍💥",
-            "tinbox — 无效的分享链接",
-            "无效的分享链接",
-            "tinbox 文件不能靠分享/转发网页链接发给别人，仅限同一 Wi-Fi 下扫码配对的设备打开。<br>发给他人请先保存或复制后再分享。",
-        )
-    } else {
-        (
-            SCAN_GLYPH,
-            "tinbox — 请重新扫码连接",
-            "请重新扫码连接",
-            "tinbox 每次启动配对都会更新,请点击电脑上的「连接手机」调出二维码,重新扫码连接。",
-        )
-    };
+    // Refused: one copy for every unpaired visitor — expired session, or a
+    // stale/forwarded link. SCAN_GLYPH names the fix (scan again): an inline SVG
+    // illustration instead of the 📷 emoji, which never had a dedicated QR-scan
+    // codepoint and read as "camera" rather than "scan".
     let mut resp = (
         StatusCode::FORBIDDEN,
         [
@@ -203,7 +174,12 @@ pub(crate) async fn require_token(
             // error pages share their URL with the real bytes (/view?id=…).
             (header::CACHE_CONTROL, "no-store".to_string()),
         ],
-        unpaired_page(glyph, title, heading, body),
+        unpaired_page(
+            SCAN_GLYPH,
+            "tinbox — 请重新扫码连接",
+            "请重新扫码连接",
+            "配对二维码已经更换，请在电脑上打开「连接手机」重新扫码连接。",
+        ),
     )
         .into_response();
     resp.headers_mut().insert(UNPAIRED_MARKER, HeaderValue::from_static("1"));
