@@ -179,13 +179,14 @@
   #connectBtn svg { color: var(--accent); flex: none; }
   #connectBtn:hover { border-color: var(--accent); color: var(--accent); transform: translateY(-1px); }
   #connectBtn:active { transform: scale(0.95); }
-  /* Network changed: the scanned QR is stale. A red "!" on the connect button
-     pulls the eye to the one action that fixes it. */
+  /* Network changed: the shown QR is stale. A plain unread dot on the connect
+     button — deliberately no "!" glyph — marks it. This is an unread cue, not
+     a warning: the PC is healthy on its new network, there is just a new code
+     to look at. */
   .qr-alert {
-    display: none; position: absolute; top: -5px; right: -5px;
-    width: 15px; height: 15px; border-radius: 50%;
-    background: var(--danger); color: #fff;
-    font-size: 11px; font-weight: 800; line-height: 15px; text-align: center;
+    display: none; position: absolute; top: -4px; right: -4px;
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--danger);
     box-shadow: 0 0 0 2px var(--card);
   }
   #connectBtn.alert .qr-alert { display: block; }
@@ -613,18 +614,16 @@
     position: fixed; inset: 0; z-index: 500;
     background: rgba(0, 113, 227, 0.15);
     backdrop-filter: blur(12px);
-    border: 3px dashed var(--accent);
     display: none; align-items: center; justify-content: center;
     pointer-events: none; opacity: 0; transition: opacity 0.2s ease;
   }
   #dragOverlay.active { display: flex; opacity: 1; }
   .drag-card {
-    background: var(--card); padding: 24px 36px; border-radius: 20px;
+    background: var(--card); padding: 22px; border-radius: 20px;
     box-shadow: 0 12px 40px rgba(0,0,0,0.15); text-align: center;
     transform: scale(0.95); transition: transform 0.2s var(--ease-spring);
   }
   #dragOverlay.active .drag-card { transform: scale(1); }
-  .drag-title { font-size: 16px; font-weight: 600; margin-top: 8px; }
 
   /* Toast */
   .toast {
@@ -790,7 +789,7 @@
     <button id="connectBtn" title="扫码连接设备">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7V5a2 2 0 0 1 2-2h2"/><path d="M17 3h2a2 2 0 0 1 2 2v2"/><path d="M21 17v2a2 2 0 0 1-2 2h-2"/><path d="M7 21H5a2 2 0 0 1-2-2v-2"/><line x1="7" y1="12" x2="17" y2="12"/></svg>
       <span>连接手机</span>
-      <span class="qr-alert" aria-hidden="true">!</span>
+      <span class="qr-alert" aria-hidden="true"></span>
     </button>
     <span class="head-sep"></span>
     <button id="inboxBtn" title="打开收件箱">
@@ -966,7 +965,6 @@
 <div id="dragOverlay">
   <div class="drag-card">
     <svg width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="var(--accent)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-    <div class="drag-title">松手即发送</div>
   </div>
 </div>
 
@@ -2501,19 +2499,13 @@ $('fileInput').addEventListener('cancel', () => clientLog('picker canceled (dism
 // Send real PC paths to /add-local (the plus button and PC drag-and-drop; the
 // webview exposes the dropped file's path via the non-standard File.path). The
 // server copies each one into the Inbox folder and only then adds its card, so a
-// file appears in the timeline once the copy is done. A short dedup window
-// absorbs the drop being delivered both as an HTML5 drop AND as the
-// tauri://drag-drop event, so the file is not copied twice.
-const recentLocal = new Map();
+// file appears in the timeline once the copy is done. No client-side dedup: the
+// only "duplicate" would be one physical drop delivered twice (native event +
+// HTML5 drop), and diagnostics prove each environment uses exactly one channel
+// (Tauri window: native only; desktop browser: HTML5 only) — nothing to collapse.
 async function addLocalPaths(paths){
   if(!paths.length) return;
-  const now = Date.now();
-  const fresh = paths.filter(p => {
-    const t = recentLocal.get(p);
-    recentLocal.set(p, now);
-    return !t || now - t > 5000;
-  });
-  if(!fresh.length) return;
+  const fresh = paths;
   // Optimistic "复制中…" cards, one per path: a big-file copy can take seconds
   // and the timeline must not sit dead. Removed as one batch when this single
   // round-trip resolves; name-based coverage graduates early arrivals with no
@@ -2585,11 +2577,23 @@ async function addLocalPaths(paths){
     toast(`导入 ${n} 个文件`);
   }
 }
-// Tauri fires tauri://drag-drop with the real paths in parallel with the HTML5
-// drop. Listening to it covers platforms where the File.path injection is
-// missing; addLocalPaths' dedup makes the double-delivery harmless.
+// Tauri fires tauri://drag-drop with the real paths; listening to it covers
+// platforms where the File.path injection is missing. In practice only this
+// channel fires in the webview (HTML5 drop does not), so no dedup is needed.
 if(isWebview){
-  window.__TAURI__.event.listen('tauri://drag-drop', e => {
+  const T = window.__TAURI__;
+  // Tauri's native drag-drop owns file drags (dragDropEnabled defaults to true),
+  // so the page's HTML5 dragenter never carries `Files` and the overlay's own
+  // listener can never light up — the native drag lifecycle has to drive it too.
+  // Drop still delivers the real paths.
+  T.event.listen('tauri://drag-enter', () => {
+    if(isOwner) $('dragOverlay').classList.add('active');
+  }).catch(()=>{});
+  T.event.listen('tauri://drag-leave', () => {
+    $('dragOverlay').classList.remove('active');
+  }).catch(()=>{});
+  T.event.listen('tauri://drag-drop', e => {
+    $('dragOverlay').classList.remove('active');
     const p = e.payload;
     if(p && Array.isArray(p.paths) && p.paths.length) addLocalPaths(p.paths);
   }).catch(()=>{});
@@ -2616,7 +2620,7 @@ async function pickLocal(){
 // Drag and drop overlay. The overlay (and only it) is gated on the drag
 // carrying real FILES: dragging a chat <img> around (long-press + move, esp.
 // on iOS Safari) fires dragenter too, but its types are URL/HTML with an empty
-// files list — showing 松手即发送 there is a lie (drop would no-op, and even
+// files list — showing the drop overlay there is a lie (drop would no-op, and even
 // if it carried bytes it would re-upload the server's own file). preventDefault
 // stays unconditional so a stray drop can never navigate the page away.
 function dragHasFiles(e){
