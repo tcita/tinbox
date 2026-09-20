@@ -100,7 +100,7 @@ fn unpaired_page(glyph: &str, title: &str, heading: &str, body: &str) -> String 
         box-shadow:0 16px 48px rgba(0,0,0,0.35)}}\
         .glyph{{font-size:44px;line-height:1;margin-bottom:12px;color:#ffffff}}\
         .glyph svg{{width:44px;height:auto;display:inline-block;vertical-align:top}}\
-        h1{{font-size:20px;font-weight:700;letter-spacing:-0.4px;margin:0 0 6px;color:#ffffff}}\
+        h1{{font-size:20px;font-weight:700;letter-spacing:-0.4px;margin:0 0 6px;color:#e3e3e5}}\
         p{{font-size:13px;line-height:1.65;margin:0;color:#8e8e93;text-align:left}}\
         </style></head><body><div class=\"card\">\
         <div class=\"glyph\">{glyph}</div>\

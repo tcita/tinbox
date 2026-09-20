@@ -20,17 +20,20 @@
     --bg-chat: #09090b;
     --card: #1c1c1e;
     --card-subtle: #242426;
-    --text: #f5f5f7;
+    --text: #e3e3e5;
     --sub: #8e8e93;
     --line: rgba(255, 255, 255, 0.1);
     --line-strong: rgba(255, 255, 255, 0.18);
     --accent: #0a84ff;
     --accent-hover: #409cff;
     --accent-bg: rgba(10, 132, 255, 0.15);
-    --bubble-me: #2bb457;
-    --bubble-me-text: #ffffff;
+    /* Outgoing bubble: green with near-black text. Black-on-green clears WCAG
+       AA with room to spare (~9.5:1), where the old white-on-green sat at
+       ~2.7:1 and read as glare. Softer system green, not a neon one. */
+    --bubble-me: #34C759;
+    --bubble-me-text: #0a0a0a;
     --bubble-them: #1c1c1e;
-    --bubble-them-text: #f5f5f7;
+    --bubble-them-text: #e3e3e5;
     --bubble-them-border: rgba(255, 255, 255, 0.08);
     --bubble-them-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
     --danger: #ff3b30;
@@ -317,7 +320,7 @@
   .msg.me .bubble {
     background: var(--bubble-me); color: var(--bubble-me-text);
     border-bottom-right-radius: 4px;
-    box-shadow: 0 2px 8px rgba(43, 180, 87, 0.25);
+    box-shadow: 0 2px 8px rgba(52, 199, 89, 0.25);
   }
   .msg.them .bubble {
     background: var(--bubble-them); color: var(--bubble-them-text);
@@ -442,7 +445,7 @@
     background: var(--accent-bg); color: var(--accent);
   }
   .msg.me .fc-ico {
-    background: rgba(255, 255, 255, 0.2); color: #fff;
+    background: rgba(0, 0, 0, 0.10); color: #0a0a0a;
   }
   .fc-info { min-width: 0; flex: 1; }
   /* Icon rows (documents, video) carry an OVERLAID corner button
@@ -464,7 +467,7 @@
     display: block; width: 100%; max-height: 240px; object-fit: cover;
     border-radius: 12px; background: rgba(0,0,0,0.06);
   }
-  .msg.me .file-card.has-preview img { background: rgba(255, 255, 255, 0.15); }
+  .msg.me .file-card.has-preview img { background: rgba(0, 0, 0, 0.08); }
   .file-card.has-preview .fc-info { width: 100%; }
   .file-card.has-preview .fc-name { max-width: none; }
 
