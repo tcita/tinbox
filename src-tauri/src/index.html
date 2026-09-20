@@ -892,7 +892,7 @@
           <button class="st-danger-btn" id="clearBtn">清空</button>
         </div>
         <div class="st-panel st-danger-row">
-          <div class="st-danger-copy"><div class="st-danger-title">查看日志与配置文件</div></div>
+          <div class="st-danger-copy"><div class="st-danger-title">日志与配置文件</div></div>
           <button class="st-change" id="stOpenData">打开文件夹</button>
         </div>
       </section>
@@ -985,6 +985,14 @@ function toast(msg){
   const t = $('toast'); t.textContent = msg; t.classList.add('show');
   clearTimeout(t._t); t._t = setTimeout(()=>t.classList.remove('show'), 1800);
 }
+// Every failure the user SEES must also land in the server log, or "the app
+// showed a failure but the log looks normal" becomes undebuggable — the failure
+// paths that never reach the server (a dead network, a browser API throwing)
+// left no trace at all. Success and info toasts stay local; failures go here.
+// (A failure caused by the network being down still cannot reach the log at
+// that instant — the report rides the same broken link; the attempt is the most
+// we can do, and the server's request gap is itself evidence.)
+function failToast(msg){ clientLog('ui-fail: ' + msg); toast(msg); }
 
 function fmtSize(n){
   if(n<1024) return n+' B';
@@ -1175,8 +1183,8 @@ async function copyText(it){
     ta.focus(); ta.select();
     const ok = document.execCommand('copy');
     ta.remove();
-    toast(ok ? '已复制' : '复制失败');
-  } catch { toast('复制失败'); }
+    if(ok) toast('已复制'); else failToast('复制失败');
+  } catch { failToast('复制失败'); }
 }
 // File-card Copy = the FILE itself on the clipboard (CF_HDROP, written by
 // the same-process server via /copy-file — the web Clipboard API cannot
@@ -1188,7 +1196,7 @@ async function copyText(it){
 // path, one writer, always a file.
 async function copyFile(it){
   const r = await serverFetch('/copy-file', { method:'POST', query:{ id: it.id } });
-  toast(r.ok ? '文件已复制' : '复制失败');
+  if(r.ok) toast('文件已复制'); else failToast('复制失败');
 }
 // No confirmation dialog: window.confirm is broken inside the Tauri WebView
 // (no dialog plugin -> it resolves to a rejected Promise, which is truthy, so
@@ -1205,13 +1213,13 @@ async function delItem(it){
       catch {}
     }
   } else {
-    toast('删除失败，请到收件箱手动删除');
+    failToast('删除失败，请到收件箱手动删除');
   }
   refresh();
 }
 async function revealItem(it){
   const res = await serverFetch('/reveal', { method:'POST', query:{ id: it.id } });
-  if(!res.ok) toast('文件不存在');
+  if(!res.ok) failToast('文件不存在');
 }
 function hideCtxMenu(){ $('ctxMenu').classList.remove('show'); }
 
@@ -1622,7 +1630,7 @@ function render(items){
 
 async function openDefault(it){
   const res = await serverFetch('/open', { method:'POST', query:{ id: it.id } });
-  if(!res.ok) toast('文件不存在');
+  if(!res.ok) failToast('文件不存在');
 }
 
 // Downloads are NATIVE-ONLY: every file is handed to the browser's own
@@ -2140,8 +2148,8 @@ function sendText(){
   serverFetch('/send-text', { method:'POST', body:{ text } }).then(r => {
     sending = false;
     if(r.ok){ t.value = ''; autoSize(); updateSendBtn(); }
-    else { updateSendBtn(); toast('发送失败'); }
-  }).catch(() => { sending = false; updateSendBtn(); toast('发送失败'); });
+    else { updateSendBtn(); failToast('发送失败'); }
+  }).catch(() => { sending = false; updateSendBtn(); failToast('发送失败'); });
 }
 
 function autoSize(){
@@ -2184,7 +2192,7 @@ async function uploadFiles(files){
   // Failure-only toasts: the new card in the timeline IS the success
   // confirmation (plus the ring closing). A toast only when something
   // did not land — full success stays silent.
-  if(ok < queue.length) toast(ok === 0 ? '传输失败' : `已发送 ${ok}/${queue.length}`);
+  if(ok < queue.length) failToast(ok === 0 ? '传输失败' : `已发送 ${ok}/${queue.length}`);
 }
 // MIME-derived fallback for nameless uploads (see startUpload): keeps the
 // server's filename, so cache keys and inbox names stay meaningful.
@@ -2380,7 +2388,7 @@ $('txt').addEventListener('keydown', e => {
 $('send').onclick = sendText;
 
 $('inboxBtn').onclick = () => {
-  serverFetch('/open-dir', {method:'POST'}).catch(()=>toast('无法打开收件箱'));
+  serverFetch('/open-dir', {method:'POST'}).catch(()=>failToast('无法打开收件箱'));
 };
 
 // Clear-all lives in the owner-only settings panel; the backend enforces the
@@ -2399,7 +2407,7 @@ $('stOpenData').onclick = async () => {
   try {
     const r = await serverFetch('/settings/open-data-dir', { method:'POST' });
     if(!r.ok) throw 0;
-  } catch { toast('打开失败'); }
+  } catch { failToast('打开失败'); }
 };
 async function openSettings(){
   $('settingsOverlay').classList.add('show');
@@ -2410,7 +2418,7 @@ async function openSettings(){
     const s = await r.json();
     $('stPath').textContent = s.inbox_dir;
     paintCloseRadio(s.close_behavior || 'tray');
-  } catch { $('stPath').textContent = '读取失败'; }
+  } catch { $('stPath').textContent = '读取失败'; clientLog('ui-fail: 读取设置失败'); }
 }
 function paintCloseRadio(v){
   document.querySelectorAll('#stCloseRadio button').forEach(b =>
@@ -2422,7 +2430,7 @@ $('stCloseRadio').onclick = async (e) => {
     const r = await serverFetch('/settings/close-behavior', { method:'POST', body:{ behavior: b.dataset.v } });
     if(!r.ok) throw 0;
     paintCloseRadio((await r.json()).close_behavior);
-  } catch { toast('保存失败'); }
+  } catch { failToast('保存失败'); }
 };
 $('stChange').onclick = async () => {
   // Native picker, server-driven (works from the webview and a loopback
@@ -2433,20 +2441,20 @@ $('stChange').onclick = async () => {
     const r = await serverFetch('/settings/pick-dir', { method:'POST' });
     if(!r.ok) throw 0;
     dir = (await r.json()).path;
-  } catch { toast('打开选择器失败'); return; }
+  } catch { failToast('打开选择器失败'); return; }
   if(!dir) return;
   try {
     const r = await serverFetch('/settings/inbox-dir', { method:'POST', body:{ path: dir } });
-    if(!r.ok){ toast(await r.text() || '保存失败'); return; }
+    if(!r.ok){ failToast(await r.text() || '保存失败'); return; }
     const s = await r.json();
     $('stPath').textContent = s.inbox_dir;
-  } catch { toast('保存失败'); }
+  } catch { failToast('保存失败'); }
 };
 $('clearConfirm').onclick = async () => {
   $('clearOverlay').classList.remove('show');
   try {
     const r = await serverFetch('/rm-all', {method:'POST'});
-    if(!r.ok){ toast('清空失败'); }
+    if(!r.ok){ failToast('清空失败'); }
     else {
       // Server answers "cleared:<gone>:<kept>" — leftovers are exactly the
       // files the bin couldn't take; no names, no counts, just the pointer.
@@ -2455,9 +2463,9 @@ $('clearConfirm').onclick = async () => {
         const m = /^cleared:(\d+):(\d+)$/.exec((await r.text()).trim());
         if(m && +m[2] > 0) msg = '部分未清空，请到收件箱手动删除';
       } catch {}
-      toast(msg);
+      if(msg === '已清空') toast(msg); else failToast(msg);
     }
-  } catch { toast('清空失败'); }
+  } catch { failToast('清空失败'); }
   refresh();
 };
 
@@ -2540,11 +2548,11 @@ async function addLocalPaths(paths){
       r = await serverFetch('/add-local', { method:'POST', body:{ paths: entries } });
     } catch {
       failBatch();
-      toast('导入失败');
+      failToast('导入失败');
       return;
     }
   }
-  if(!r.ok){ failBatch(); toast('导入失败'); return; }
+  if(!r.ok){ failBatch(); failToast('导入失败'); return; }
   dropBatch(); reapply();
   // Failure-only toast: landed cards are the success signal, so silence covers
   // both full success and folder expansion (one dropped path -> N cards, N can
@@ -2557,7 +2565,7 @@ async function addLocalPaths(paths){
     const m = /added:\s*(\d+)/.exec(await r.text());
     if(m) n = parseInt(m[1], 10);
   } catch {}
-  if(n < fresh.length) toast(`有 ${fresh.length - n} 个文件导入失败`);
+  if(n < fresh.length) failToast(`有 ${fresh.length - n} 个文件导入失败`);
 }
 // Tauri fires tauri://drag-drop with the real paths; listening to it covers
 // platforms where the File.path injection is missing. In practice only this
@@ -2611,7 +2619,7 @@ async function pickLocal(){
     else if(picked && picked.path) paths = [picked.path];
     addLocalPaths(paths);
   } catch(e) {
-    toast('打开选择器失败');
+    failToast('打开选择器失败');
   }
 }
 
