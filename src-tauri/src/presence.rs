@@ -173,8 +173,8 @@ pub(crate) async fn monitor_loop() {
         // network, so the only useful signal is to the PC: re-push `info` with
         // the new url so the page can flag its connect button and tell the user
         // to rescan. Sampled every tick: once warm, refresh_url() is just the
-        // adapter enumeration (the gateway probes and the PowerShell adapter
-        // query are cached 30-60s), and the 1s beat is the difference between
+        // adapter enumeration (the PowerShell adapter query is cached 30s),
+        // and the 1s beat is the difference between
         // "the new QR is already rendered when you open it" and "you opened it
         // into a blank box".
         let url = refresh_url();
@@ -194,7 +194,7 @@ pub(crate) async fn monitor_loop() {
         }
         // Pre-render on the first sample and on every change, so the QR the user
         // opens next is already an in-memory PNG (netinfo::refresh_qr) instead
-        // of a request that must probe the new gateway first.
+        // of a request that must re-enumerate adapters first.
         if changed || prev_url.is_none() {
             crate::netinfo::refresh_qr();
         }

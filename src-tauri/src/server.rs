@@ -402,9 +402,9 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
             };
             let _ = BOUND_PORT.set(actual);
             // IP encoded in the QR code: take the first candidate. The ordering
-            // (wireless first, then gateway-reachable, then name) lives in
-            // netinfo::collect_ips. If the phone cannot connect, compare this IP
-            // with the machine's actual subnet.
+            // (wireless first, then name) lives in netinfo::collect_ips. If the
+            // phone cannot connect, compare this IP with the machine's actual
+            // subnet.
             let ips = collect_ips();
             let ip = ips.first().cloned().unwrap_or_else(|| "127.0.0.1".to_string());
             logf(&format!(
@@ -845,9 +845,9 @@ fn push_event_to_sse(ev: PushEvent) -> Event {
 /// up): the URL degrades to 127.0.0.1, which no phone can reach, so the UI must
 /// say so and hide the QR rather than offer a code that scans to nothing.
 /// Request paths (`/qr`, the `info` replay on connect) read this snapshot; only
-/// the monitor recomputes, so a handler never pays collect_ips()'s ICMP gateway
-/// probes or its PowerShell adapter query — the reason /qr went blank for
-/// seconds right after a network switch.
+/// the monitor recomputes, so a handler never pays collect_ips()'s PowerShell
+/// adapter query — the reason /qr went blank for seconds right after a
+/// network switch.
 static URL_SNAP: OnceLock<Mutex<(String, bool)>> = OnceLock::new();
 
 fn url_snap() -> &'static Mutex<(String, bool)> {
@@ -855,9 +855,9 @@ fn url_snap() -> &'static Mutex<(String, bool)> {
 }
 
 /// Recompute the pairing URL (best LAN IP + bound port + token) and store it
-/// with its usability. Expensive — collect_ips() enumerates adapters and may
-/// probe gateways (up to ~2s on the first call after a switch). Only the
-/// monitor may call this on a schedule; everything else reads `current_url()`.
+/// with its usability. Expensive — collect_ips() enumerates adapters and
+/// re-queries them through PowerShell once the 30s facts cache expired. Only
+/// the monitor may call this on a schedule; everything else reads `current_url()`.
 pub(crate) fn refresh_url() -> String {
     let ip = collect_ips().first().cloned();
     let usable = ip.is_some();
