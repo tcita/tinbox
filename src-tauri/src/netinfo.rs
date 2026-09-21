@@ -1,6 +1,6 @@
-// LAN topology: pick the IP the QR code points at (gateway-reachability
-// scoring, virtual adapters excluded), the QR PNG itself, and the
-// foreign-subnet diagnostic for the access log.
+// LAN topology: pick the IP the QR code points at (wireless-first, virtual
+// adapters excluded), the QR PNG itself, and the foreign-subnet diagnostic
+// for the access log.
 
 use crate::logger::{loge, logf};
 use crate::presence::now_mono;
@@ -147,10 +147,10 @@ pub(crate) async fn qr() -> impl IntoResponse {
 /// Virtual adapters (TUN VPNs, Docker/WSL vswitches) can never be reached by
 /// the phone, so they are excluded outright by name/description keyword and are
 /// never returned, not even as a fallback. The remaining real adapters are
-/// ordered by gateway reachability (alive first), but a probe miss does NOT
-/// remove an adapter: an active VPN TUN hijacks the ICMP to the real gateway
-/// and produces false "dead"s, and any real IP is still a better QR target
-/// than a vswitch address.
+/// ordered wireless-first, then by adapter name for determinism (see the
+/// ordering note in the body) — there is no gateway probe: it would measure
+/// "PC -> gateway", not "phone -> PC", and misorder exactly the machines where
+/// the choice matters.
 pub(crate) fn collect_ips() -> Vec<String> {
     // All private IPv4s with their interface names, deduplicated. Only
     // adapters that are actually connected are considered (see
@@ -210,90 +210,53 @@ pub(crate) fn collect_ips() -> Vec<String> {
         return out;
     }
 
-    // Filter 2: gateway reachability, probed with the candidate's own address
-    // as source so the answer is per-interface, not whatever the default route
-    // happens to pick. A failed probe only demotes the adapter; it never drops
-    // it (false negatives are common with a VPN TUN active, and any real IP
-    // beats a virtual one).
-    let probes: Vec<(Ipv4Addr, Ipv4Addr)> = real
-        .iter()
-        .filter_map(|(name, v4)| {
-            facts
-                .get(name)
-                .and_then(|f| f.gateway.as_deref())
-                .and_then(|g| g.parse::<Ipv4Addr>().ok())
-                .map(|g| (*v4, g))
-        })
-        .collect();
-    let probed = probe_gateways(&probes);
-
-    // Order the survivors. Only two keys mean anything, and neither is a guess
-    // about the phone's network:
-    //   1. wireless   — the app's copy promises "同一 Wi-Fi", so prefer the
-    //                   interface the user was told to use.
-    //   2. gateway ok — measured evidence the interface is on a live network
-    //                   (an unplugged NIC's gateway times out).
-    // When those tie (a machine on two live Wi-Fis, or two live wired segments)
-    // nothing can know which one the phone is on, so the remaining key is pure
+    // Order the survivors. One key means anything, and it is not a guess about
+    // the phone's network:
+    //   wireless — the app's copy promises "同一 Wi-Fi", so prefer the
+    //              interface the user was told to use.
+    // When that ties (a machine on two Wi-Fis, or two wired segments) nothing
+    // can know which one the phone is on, so the remaining key is pure
     // determinism — the adapter name. It implies no preference; it only
     // guarantees "same adapter set -> same order", which the 1s URL comparison
-    // needs to avoid phantom network-change reports. There is deliberately no
-    // IP-value or interface-metric key: neither improves the chance of picking
-    // the phone's network, so neither earns a place.
+    // needs to avoid phantom network-change reports.
+    //
+    // There is deliberately no gateway-reachability key. A gateway probe
+    // measures "PC -> its gateway", not "phone -> PC": they diverge exactly
+    // where it would matter (a hotspot/AP that does not answer ICMP, a VPN TUN
+    // eating the probe, an uplink-less LAN), so ranking by it can pick an
+    // interface the phone cannot reach while demoting the one it is on.
+    // Wireless-first is the better proxy for "the phone is here".
     struct Cand {
         name: String,
         v4: Ipv4Addr,
         wireless: bool,
-        rank: u8, // 0 = gateway ok, 1 = no gateway to probe, 2 = gateway dead
     }
     let mut cands: Vec<Cand> = real
         .into_iter()
-        .map(|(name, v4)| {
-            let fact = facts.get(&name);
-            let gw = fact
-                .and_then(|f| f.gateway.as_deref())
-                .and_then(|g| g.parse::<Ipv4Addr>().ok());
-            let rank = match gw {
-                Some(g) if probed.get(&(v4, g)) == Some(&true) => 0,
-                Some(_) => 2,
-                None => 1,
-            };
-            Cand {
-                name,
-                v4,
-                wireless: fact.map(|f| f.wireless).unwrap_or(false),
-                rank,
-            }
+        .map(|(name, v4)| Cand {
+            wireless: facts.get(&name).map(|f| f.wireless).unwrap_or(false),
+            name,
+            v4,
         })
         .collect();
-    // Wireless first (so !wireless sorts last), then reachable, then the name.
-    cands.sort_by(|a, b| (!a.wireless, a.rank, &a.name).cmp(&(!b.wireless, b.rank, &b.name)));
+    // Wireless first (so !wireless sorts last), then the name.
+    cands.sort_by(|a, b| (!a.wireless, &a.name).cmp(&(!b.wireless, &b.name)));
     let ips: Vec<String> = cands.iter().map(|c| c.v4.to_string()).collect();
 
     // Log whenever this decision changes, not just the winner: a new virtual
-    // adapter appearing or a candidate flipping to dead is diagnostic noise
+    // adapter appearing or a candidate changing class is diagnostic noise
     // worth one line, while steady-state checks stay silent.
     let best = ips.first().cloned().unwrap_or_default();
     let signature = format!(
         "{best}|{:?}|{dropped_virtual:?}",
-        cands
-            .iter()
-            .map(|c| (c.v4, c.wireless, c.rank))
-            .collect::<Vec<_>>()
+        cands.iter().map(|c| (c.v4, c.wireless)).collect::<Vec<_>>()
     );
     {
         let mut last = LAST_DECISION.lock().unwrap_or_else(|e| e.into_inner());
         if *last != signature {
             let list = cands
                 .iter()
-                .map(|c| {
-                    format!(
-                        "{} {}/{}",
-                        c.v4,
-                        if c.wireless { "wifi" } else { "wired" },
-                        ["alive", "no-gateway", "dead"][c.rank as usize],
-                    )
-                })
+                .map(|c| format!("{} {}", c.v4, if c.wireless { "wifi" } else { "wired" }))
                 .collect::<Vec<_>>()
                 .join(", ");
             logf(&format!(
@@ -427,110 +390,14 @@ unsafe fn pwstr_to_string(p: windows::core::PWSTR) -> String {
     String::from_utf16_lossy(std::slice::from_raw_parts(p.0, len))
 }
 
-/// Probe several (source address, gateway) pairs concurrently; each answer
-/// is cached for 60s because collect_ips runs on every `info` event / connect
-/// replay and a probe costs up to ~2s of ping timeout (1s per attempt, two attempts).
-fn probe_gateways(
-    probes: &[(Ipv4Addr, Ipv4Addr)],
-) -> std::collections::HashMap<(Ipv4Addr, Ipv4Addr), bool> {
-    // (last probe unix, (src addr, gateway)) -> reachable, invalidated after 60s
-    type ProbeCache = (u64, std::collections::HashMap<(Ipv4Addr, Ipv4Addr), bool>);
-    static CACHE: OnceLock<Mutex<ProbeCache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new((0, Default::default())));
-    let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
-    let now = now_mono();
-    if now.saturating_sub(g.0) >= 60 {
-        g.0 = now;
-        g.1.clear();
-    }
-    let missing: Vec<(Ipv4Addr, Ipv4Addr)> = probes
-        .iter()
-        .copied()
-        .filter(|p| !g.1.contains_key(p))
-        .collect();
-    if !missing.is_empty() {
-        let handles: Vec<_> = missing
-            .iter()
-            .map(|p| {
-                let p = *p;
-                std::thread::spawn(move || (p, gateway_reachable(p.0, p.1)))
-            })
-            .collect();
-        for h in handles {
-            if let Ok((p, ok)) = h.join() {
-                g.1.insert(p, ok);
-            }
-        }
-    }
-    probes
-        .iter()
-        .map(|p| (*p, g.1.get(p).copied().unwrap_or(false)))
-        .collect()
-}
-
-/// One ICMP echo to the gateway with the interface address pinned as source
-/// (`ping -S`), 1s cap per attempt, up to two attempts. A single dropped ICMP
-/// (transient WiFi blip, or a VPN TUN capturing the packet) is otherwise a
-/// false "dead" that misorders multi-adapter machines. Exit code 0 means at
-/// least one reply came back.
-/// Logging is change-or-failure only: a steady `alive` would be one line a
-/// minute of idle noise, so it stays silent. First probe, any `no reply`,
-/// and dead->alive recovery still log.
-#[cfg(windows)]
-fn gateway_reachable(src: Ipv4Addr, gw: Ipv4Addr) -> bool {
-    use std::os::windows::process::CommandExt;
-    use std::process::Command;
-    use std::time::Instant;
-    let started = Instant::now();
-    let mut ok = false;
-    for _ in 0..2 {
-        let out = Command::new("ping")
-            .args(["-n", "1", "-w", "1000", "-S", &src.to_string(), &gw.to_string()])
-            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
-            .output();
-        if out.map(|o| o.status.success()).unwrap_or(false) {
-            ok = true;
-            break;
-        }
-    }
-    // Last logged verdict per (src, gateway): steady `alive` repeats are
-    // suppressed, so an idle machine stays silent. Failures always log
-    // (each 60s miss while dead is evidence, not noise); recovery logs via
-    // the verdict change.
-    static LAST_VERDICT: OnceLock<Mutex<std::collections::HashMap<(Ipv4Addr, Ipv4Addr), bool>>> =
-        OnceLock::new();
-    let prev = LAST_VERDICT
-        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert((src, gw), ok);
-    if prev != Some(ok) || !ok {
-        logf(&format!(
-            "gateway probe from {src} to {gw}: {} in {}ms",
-            if ok { "alive" } else { "no reply" },
-            started.elapsed().as_millis()
-        ));
-    }
-    ok
-}
-
-/// Never called: adapter facts are empty off-Windows, so collect_ips returns
-/// before probing. Kept only so the crate compiles on other platforms.
-#[cfg(not(windows))]
-fn gateway_reachable(_src: Ipv4Addr, _gw: Ipv4Addr) -> bool {
-    false
-}
-
 /// Adapter metadata used for filtering and for ordering the QR candidates.
-/// Gathered by one powershell call, cached 30s — `info` events fire on connect
-/// and on phone transitions, so the query must not spawn a process each time.
+/// Gathered by one powershell call, cached 30s — collect_ips runs ~1/s (the
+/// monitor's URL sample), so the query must not spawn a process each time.
 #[derive(Clone, Default)]
 struct AdapterFact {
     /// InterfaceDescription ("Intel(R) Wi-Fi 6 AX201 …"); the virtual-adapter
     /// keyword filter reads it.
     desc: String,
-    /// Default gateway, when the interface has one (else it cannot be probed).
-    gateway: Option<String>,
     /// 802.11/Wi-Fi family — see the ordering in collect_ips (the app tells
     /// users "同一 Wi-Fi", so the wireless interface wins).
     wireless: bool,
@@ -545,7 +412,12 @@ fn adapter_facts() -> AdapterFacts {
     let cache = ADAPTER_FACTS.get_or_init(|| Mutex::new((0, Default::default())));
     let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
     let now = now_mono();
-    if now.saturating_sub(g.0) < 30 {
+    // g.0 == 0 is now_mono()'s "never cached" sentinel, NOT a fresh stamp:
+    // now_mono() starts at 1, so a naive `now - g.0 < 30` treats a cold process
+    // as "cached 1s ago" and serves the EMPTY initial table for the first ~30s
+    // — every adapter then reads as wired, so the wireless-first ordering
+    // silently doesn't apply at startup. Require a real prior stamp.
+    if g.0 != 0 && now.saturating_sub(g.0) < 30 {
         return g.1.clone();
     }
     let facts = gather_adapter_facts();
@@ -556,32 +428,27 @@ fn adapter_facts() -> AdapterFacts {
     facts
 }
 
-/// One read-only powershell query: for every Up adapter, its name, description,
-/// IPv4 addresses, default gateway and wireless flag, tab-separated per address.
+/// One read-only powershell query: for every Up adapter, its name, description
+/// and wireless flag. One line per adapter; the map is keyed by name.
 #[cfg(windows)]
 fn gather_adapter_facts() -> AdapterFacts {
     let ps = r#"Get-NetAdapter | Where-Object Status -eq 'Up' | ForEach-Object {
-  $n = $_.Name; $d = $_.InterfaceDescription; $i = $_.ifIndex
+  $n = $_.Name; $d = $_.InterfaceDescription
   $w = if (("$d $n" -match 'Wi-?Fi|WLAN|Wireless|802\.11') -or ($_.PhysicalMediaType -match '802\.11|Wireless')) { '1' } else { '0' }
-  Get-NetIPAddress -InterfaceIndex $i -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object {
-    $g = (Get-NetRoute -InterfaceIndex $i -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue | Select-Object -First 1).NextHop
-    "{0}`t{1}`t{2}`t{3}`t{4}" -f $n, $d, $_.IPAddress, $g, $w
-  }
+  "{0}`t{1}`t{2}" -f $n, $d, $w
 }"#;
     let mut map = AdapterFacts::new();
     if let Some((true, out)) = crate::firewall::run_ps(ps) {
         for line in out.lines() {
             let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() != 5 {
+            if parts.len() != 3 {
                 continue;
             }
-            let gw = parts[3].trim();
             map.insert(
                 parts[0].trim().to_string(),
                 AdapterFact {
                     desc: parts[1].trim().to_string(),
-                    gateway: if gw.is_empty() { None } else { Some(gw.to_string()) },
-                    wireless: parts[4].trim() == "1",
+                    wireless: parts[2].trim() == "1",
                 },
             );
         }

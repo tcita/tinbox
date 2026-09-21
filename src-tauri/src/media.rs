@@ -39,10 +39,14 @@ pub fn is_bmff_name(name: &str) -> bool {
 }
 
 /// Timeline-video names: Shell poster extraction and the frontend VID_EXTS
-/// table stay in lockstep. Broader than is_bmff_name — avi/mkv/webm still
-/// get a poster try even though they have no moov suffix.
+/// table stay in lockstep. Broader than is_bmff_name — mkv/webm/3gp still
+/// get a poster try even though they have no moov suffix. avi is excluded
+/// everywhere on purpose: no browser decodes it, so it is download-only.
 pub fn is_video_name(name: &str) -> bool {
-    matches!(ext_of(name).as_str(), "mp4" | "mov" | "m4v" | "avi" | "mkv" | "webm")
+    matches!(
+        ext_of(name).as_str(),
+        "mp4" | "mov" | "m4v" | "mkv" | "webm" | "3gp" | "3g2"
+    )
 }
 
 /// Parse if applicable, else None. Never panics, never reads box payloads

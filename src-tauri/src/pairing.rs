@@ -178,7 +178,7 @@ pub(crate) async fn require_token(
             SCAN_GLYPH,
             "tinbox — 请重新扫码连接",
             "请重新扫码连接",
-            "配对二维码已经更换，请在电脑上打开「连接手机」重新扫码连接。",
+            "配对二维码已经更换，请在电脑上点击「连接手机」重新扫码连接。",
         ),
     )
         .into_response();

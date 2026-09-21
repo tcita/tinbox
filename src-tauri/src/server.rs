@@ -89,7 +89,10 @@ pub(crate) enum PushEvent {
     ///   - monitor_loop: stale entries were pruned (finished past 15s, or
     ///     silent past 5s),
     ///   - cancel(): a push was stopped mid-flight — it pushes no terminal
-    ///     progress tick, so clients must reconcile their mirrors away.
+    ///     progress tick, so clients must reconcile their mirrors away,
+    ///   - StreamCutGuard::drop: a pull was cut by the receiver mid-flight —
+    ///     same no-terminal-tick situation as cancel(), for the other
+    ///     direction.
     /// Clients additionally reconcile on (re)connect and on visibilitychange
     /// (each pass pulls /list and /dl-status once). The phone keeps no
     /// /dl-status poll and no transfer mirror at all (rings are the
@@ -230,18 +233,11 @@ async fn bind_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
     socket.listen(1024)
 }
 
-/// Build fingerprint for the startup banner: how a session's log identifies
-/// the exact build it ran, so "I forgot to rebuild" is visible at a glance
-/// (an unchanged line means the same binary). FNV-1a over the embedded transfer
-/// page (stable across runs, unlike the randomized std hasher) plus the running
-/// exe's mtime/size (any Rust change moves them).
-fn build_fingerprint() -> String {
-    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for &b in include_str!("index.html").as_bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    let (mtime, len) = std::env::current_exe()
+/// The running exe's (mtime_secs, len): a recompile moves them, a mere restart
+/// of the same binary does not. Shared by the startup banner fingerprint and
+/// the cache-validator tag (build_tag), which both key off "which build".
+fn exe_stamp() -> (u64, u64) {
+    std::env::current_exe()
         .ok()
         .and_then(|p| std::fs::metadata(p).ok())
         .map(|m| {
@@ -253,8 +249,39 @@ fn build_fingerprint() -> String {
                 .unwrap_or(0);
             (t, m.len())
         })
-        .unwrap_or((0, 0));
+        .unwrap_or((0, 0))
+}
+
+/// Build fingerprint for the startup banner: how a session's log identifies
+/// the exact build it ran, so "I forgot to rebuild" is visible at a glance
+/// (an unchanged line means the same binary). FNV-1a over the embedded transfer
+/// page (stable across runs, unlike the randomized std hasher) plus the running
+/// exe's mtime/size (any Rust change moves them).
+fn build_fingerprint() -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in include_str!("index.html").as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let (mtime, len) = exe_stamp();
     format!("page={h:016x} exe-mtime={mtime} exe-len={len}")
+}
+
+/// Per-build cache-validator tag, appended to the inline /view and /poster
+/// ETags. A client's cached copy is bound to the response headers it was
+/// served with, and a 304 reuses those stored headers — it cannot remove one.
+/// So when a new build changes any response header, the old validator must
+/// stop matching (the client gets a fresh 200 instead of a 304) or it keeps
+/// serving stale headers, e.g. the CSP that once disabled WebKit's media
+/// player. Derived from the exe stamp: new on recompile, stable across a plain
+/// restart of the same binary — exactly the granularity at which headers can
+/// change.
+pub(crate) fn build_tag() -> &'static str {
+    static T: OnceLock<String> = OnceLock::new();
+    T.get_or_init(|| {
+        let (mtime, len) = exe_stamp();
+        format!("{mtime:x}{len:x}")
+    })
 }
 
 /// Start axum on a separate thread; once the port is bound, send the actual

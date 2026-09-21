@@ -5,8 +5,9 @@
 
 ## 服务器侧能力(/dl 与 /view 共用 serve())
 
-- 文件响应携带 `ETag`(= catalog id,id 与文件一一对应且不可变,可当强
-  validator),并校验 `If-Range`:失配回落完整 200,防止拼脏字节。
+- 文件响应携带 `ETag`(= catalog id + 构建标签;id 与文件一一对应且不可
+  变,构建标签在重新编译后变化,使旧构建缓存的响应头不会被 304 沿用,
+  可当强 validator),并校验 `If-Range`:失配回落完整 200,防止拼脏字节。
 - `Range: bytes=N-` → 206 Partial Content(含 Content-Range);畸形/多段
   Range 头也回落完整 200。
 - 逐字节正确性已抽样验证:206 切片与源文件同偏移 SHA256 一致。

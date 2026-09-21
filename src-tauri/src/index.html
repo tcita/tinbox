@@ -927,7 +927,9 @@
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
     </button>
     <div class="ql-title">扫码连接设备</div>
-    <img class="ql-qr" id="qrImg" src="/qr" alt="QR code">
+    <!-- No src: fetched lazily by openQrLightbox (PC-only card), so a page
+         load — phone especially — never pays for a QR it will not show. -->
+    <img class="ql-qr" id="qrImg" alt="QR code">
     <div><div class="ql-url" id="qlUrl">…</div></div>
     <div class="ql-warn">网络已变化，请用手机重新扫码</div>
     <div class="ql-nolan">
@@ -1024,15 +1026,15 @@ function fmtTime(unix){
 }
 function iconFor(name){
   const ext = (name.split('.').pop()||'').toLowerCase();
-  if(['jpg','jpeg','png','gif','webp','heic','bmp','svg'].includes(ext)) return '🖼️';
-  if(['mp4','mov','avi','mkv','webm'].includes(ext)) return '🎬';
+  if(['jpg','jpeg','png','gif','webp','avif','heic','bmp','svg'].includes(ext)) return '🖼️';
+  if(['mp4','mov','m4v','avi','mkv','webm','3gp','3g2'].includes(ext)) return '🎬';
   if(['mp3','m4a','wav','flac','aac','ogg'].includes(ext)) return '🎵';
   if(['pdf'].includes(ext)) return '📕';
   if(['doc','docx','rtf'].includes(ext)) return '📄';
   if(['xls','xlsx','csv'].includes(ext)) return '📊';
   if(['ppt','pptx'].includes(ext)) return '📑';
   if(['zip','rar','7z','tar','gz'].includes(ext)) return '🗜️';
-  if(['txt','md','log','json'].includes(ext)) return '📝';
+  if(['txt','md','log','json','yml','yaml','toml','ini','srt','vtt','lrc'].includes(ext)) return '📝';
   if(['js','ts','rs','go','py','java','c','cpp','html','css'].includes(ext)) return '⚙️';
   return '📦';
 }
@@ -1059,8 +1061,12 @@ function mediaFailed(card, it){
 // "open" action and the long-press convergence all ask the same two questions
 // about a file name. Kept ahead of their users (function declarations, so
 // hoisting would also work, but one table reads better than three literals).
-const IMG_EXTS = ['jpg','jpeg','png','gif','webp','heic','bmp','svg'];
-const VID_EXTS = ['mp4','mov','m4v','avi','mkv','webm'];
+// Preview classes: keep in lockstep with media::is_video_name on the server
+// (poster extraction) and mime_for (inline content type). avi is deliberately
+// absent: no browser decodes it, so it stays navigation-to-download instead
+// of opening a player that can only spin.
+const IMG_EXTS = ['jpg','jpeg','png','gif','webp','avif','heic','bmp','svg'];
+const VID_EXTS = ['mp4','mov','m4v','mkv','webm','3gp','3g2'];
 const isImgName = n => IMG_EXTS.includes((n.split('.').pop()||'').toLowerCase());
 const isVidName = n => VID_EXTS.includes((n.split('.').pop()||'').toLowerCase());
 // Every HTTP call to the local server goes through serverFetch(): the method, query
@@ -2456,14 +2462,16 @@ $('clearConfirm').onclick = async () => {
     const r = await serverFetch('/rm-all', {method:'POST'});
     if(!r.ok){ failToast('清空失败'); }
     else {
-      // Server answers "cleared:<gone>:<kept>" — leftovers are exactly the
-      // files the bin couldn't take; no names, no counts, just the pointer.
+      // Server answers "cleared:<gone>:<left>" — rows are always dropped, so
+      // the list is clean either way; <left> counts inbox items the sweep
+      // couldn't take (still on disk; files come back as fresh entries on
+      // next startup, subdirs were never touched).
       let msg = '已清空';
       try {
         const m = /^cleared:(\d+):(\d+)$/.exec((await r.text()).trim());
-        if(m && +m[2] > 0) msg = '部分未清空，请到收件箱手动删除';
+        if(m && +m[2] > 0) msg = `已清空，但还有 ${m[2]} 项需手动清空`;
       } catch {}
-      if(msg === '已清空') toast(msg); else failToast(msg);
+      toast(msg);
     }
   } catch { failToast('清空失败'); }
   refresh();
@@ -2746,7 +2754,7 @@ function applyInfo(d){
     // looking at a superseded code — a usable change (A->B) or a recovery
     // (none->LAN) — swap in the fresh one now. A closed card fetches on open.
     if((urlChanged || recovered) && $('qrLightbox').classList.contains('show')){
-      $('qrImg').src = '/qr?r=' + Date.now();
+      loadQr('/qr?r=' + Date.now());
     }
   }
   lanUsable = usable;
@@ -2987,14 +2995,24 @@ $('fwQuit').onclick = () => { serverFetch('/quit', {method:'POST'}).catch(()=>{}
 // Closing is explicit — the card's ✕ button or the Escape key; the backdrop
 // does not swallow clicks (no accidental dismissal when a stray click lands
 // beside the card).
+// Swap the QR only after the new bytes have decoded, so the img is never
+// cleared mid-request. Setting src directly can blank the element for a frame,
+// which reads as the lightbox's white placeholder flashing before the code.
+function loadQr(src){
+  const next = new Image();
+  next.onload = next.onerror = () => { $('qrImg').src = src; };
+  next.src = src;
+}
 function openQrLightbox(){
-  // The QR <img> is fetched at page load; a network change makes it stale, so
-  // always re-request it cache-busted. The dot is deliberately NOT cleared
+  // The QR <img> has no page-load src (see the tag); every open requests it
+  // cache-busted, so a network change can never leave a stale code showing.
+  // loadQr keeps the warmed frame (see the owner preload below) on screen
+  // until the fresh one is ready. The dot is deliberately NOT cleared
   // here: the unread cue is one entity (dot while closed, warning while open)
   // that clears only when the card is CLOSED, so opening just swaps one surface
   // for the other. With no LAN address there is nothing to fetch — the lightbox
   // explains instead (see applyInfo / .ql-nolan).
-  if(lanUsable) $('qrImg').src = '/qr?r=' + Date.now();
+  if(lanUsable) loadQr('/qr?r=' + Date.now());
   else $('qrImg').removeAttribute('src');
   $('qrLightbox').classList.add('show');
 }
@@ -3010,6 +3028,11 @@ function closeQrLightbox(){
 }
 $('connectBtn').onclick = openQrLightbox;
 $('qlClose').onclick = closeQrLightbox;
+// PC-only preload: warm the QR once so the first lightbox open shows a frame
+// immediately instead of the img's white placeholder (the phone never opens
+// this card, so it stays request-free; /qr is no-store, so the open still
+// fetches fresh — this only removes the blank first frame).
+if(isOwner && lanUsable) $('qrImg').src = '/qr';
 document.addEventListener('keydown', e => {
   if(e.key === 'Escape'){ closeQrLightbox(); $('clearOverlay').classList.remove('show'); $('settingsOverlay').classList.remove('show'); }
 });

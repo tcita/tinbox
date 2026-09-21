@@ -188,6 +188,9 @@ pub(crate) async fn upload(
             logw(&format!("upload rejected: empty filename from {peer} (?size={:?})", q.size));
             return (StatusCode::BAD_REQUEST, "bad filename").into_response();
         }
+        // Dedupe before building paths so display, storage (`{id}__{name}`),
+        // and the eventual download filename all agree from the start.
+        let filename = catalog::dedupe_name(&filename);
         // Write to inbox under a SENTINEL name, not the final one:
         // `pending__{id}__{filename}` until the whole body is on disk, then a
         // same-volume rename strips the prefix (atomic — same directory). The
@@ -214,7 +217,9 @@ pub(crate) async fn upload(
             return (StatusCode::CONFLICT, "duplicate cid").into_response();
         }
         let stored = catalog::inbox_dir().join(format!("pending__{id}__{filename}"));
-        let final_path = catalog::inbox_dir().join(format!("{id}__{filename}"));
+        // No `{id}__` final path anymore: graduation lands on the bare deduped
+        // display name via resolve_graduation_target (check-and-bump there),
+        // so the id prefix never escapes into Explorer/clipboard/shares.
         // Register the row as `pending` the moment the request lands, and seed a
         // shared byte counter, so BOTH ends render a progress ring immediately.
         // The sender reports its declared total via ?size=.
@@ -299,7 +304,7 @@ pub(crate) async fn upload(
                 }
             }
         };
-        let write_result = match write_result {
+        let write_result: Result<(PathBuf, String), String> = match write_result {
             // Declared-size check (?size=, always sent by our own page): the
             // body looked complete (clean FIN) but carried fewer — or more —
             // bytes than the sender's File.size. Graduate nothing: the Err
@@ -310,29 +315,39 @@ pub(crate) async fn upload(
             Ok(()) if size > 0 && total != size => Err(format!(
                 "size mismatch: got {total} expected {size}"
             )),
-            Ok(()) => match tokio::fs::rename(&stored, &final_path).await {
-                Ok(()) => Ok(()),
-                // Graduation failed (file locked by AV/backup): the bytes may
-                // be complete, but the sentinel is still on — serving it as
-                // ready would survive this session only to be killed by the
-                // next reconcile. Fail the upload instead; the cleanup below
-                // deletes the file, and even a lost delete race leaves the
-                // sentinel on for the next reconcile to finish.
-                Err(e) => Err(format!("promote: {e}")),
-            },
-            other => other,
+            Ok(()) => {
+                // Graduate to the bare display name (no id prefix): resolve
+                // bumps (` (N)`) and repoints the row when another file/row
+                // took the target, so this rename can never overwrite.
+                match catalog::resolve_graduation_target(&id) {
+                    Some((final_path, final_name)) => {
+                        match tokio::fs::rename(&stored, &final_path).await {
+                            Ok(()) => Ok((final_path, final_name)),
+                            // Graduation failed (file locked by AV/backup): the bytes may
+                            // be complete, but the sentinel is still on — serving it as
+                            // ready would survive this session only to be killed by the
+                            // next reconcile. Fail the upload instead; the cleanup below
+                            // deletes the file, and even a lost delete race leaves the
+                            // sentinel on for the next reconcile to finish.
+                            Err(e) => Err(format!("promote: {e}")),
+                        }
+                    }
+                    None => Err("row gone before graduation".to_string()),
+                }
+            }
+            Err(e) => Err(e),
         };
         match write_result {
-            Ok(()) => {
+            Ok((final_path, final_name)) => {
                 catalog::mark_remote_ready(&id, &final_path);
-                crate::poster::request(&id, &final_path, &filename);
-                logf(&format!("upload done: {} ({} bytes) -> inbox", filename, total));
+                crate::poster::request(&id, &final_path, &final_name);
+                logf(&format!("upload done: {} ({} bytes) -> inbox", final_name, total));
                 if total >= 4 * 1024 * 1024 {
                     let secs = t0.elapsed().as_secs_f64();
                     if secs > 0.0 {
                         logf(&format!(
                             "ul {}: {:.1} MB in {:.2}s = {:.1} MB/s",
-                            filename,
+                            final_name,
                             total as f64 / (1024.0 * 1024.0),
                             secs,
                             total as f64 / secs / (1024.0 * 1024.0)
@@ -349,7 +364,7 @@ pub(crate) async fn upload(
                     push_progress(&mut map, &id, now_ms(), true);
                 }
                 let _ = notifier().send(PushEvent::List(catalog::all_items()));
-                return (StatusCode::OK, format!("uploaded: {filename}")).into_response();
+                return (StatusCode::OK, format!("uploaded: {final_name}")).into_response();
             }
             Err(e) => {
                 // Aborted or failed mid-transfer: drop the pending row and the
@@ -394,6 +409,8 @@ pub(crate) async fn copy_into_inbox(
             "bad file name",
         ));
     }
+    // Same dedupe-before-paths contract as the upload handler above.
+    let safe = catalog::dedupe_name(&safe);
     // Adopt the client's id when it is valid and free (the sender's optimistic
     // card already wears it), else a server id. Never fail the copy over it:
     // /add-local's optimistic batch is dropped on its own response, so a
@@ -403,7 +420,7 @@ pub(crate) async fn copy_into_inbox(
         _ => catalog::new_id(),
     };
     let stored = catalog::inbox_dir().join(format!("pending__{id}__{safe}"));
-    let final_path = catalog::inbox_dir().join(format!("{id}__{safe}"));
+    // Final path resolved at graduation below (bare name, check-and-bump).
     let size = tokio::fs::metadata(src).await.map(|m| m.len()).unwrap_or(0);
 
     // Self-clean on any failure past registration: the pending row, the
@@ -485,13 +502,22 @@ pub(crate) async fn copy_into_inbox(
     // like uploads: before the rename the sentinel still marks the (maybe
     // complete) bytes for reconcile — the source disk holds the original;
     // after the rename the final name is a complete file, so even if the
-    // catalog update is lost, reconcile's adoption of it is correct.
+    // catalog update is lost, reconcile's adoption of it is correct. The
+    // target is the bare display name (no id prefix); resolve bumps on
+    // collision so this rename can never overwrite.
+    let Some((final_path, final_name)) = catalog::resolve_graduation_target(&id) else {
+        fail(&stored, &id).await;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "row gone before graduation",
+        ));
+    };
     if let Err(e) = tokio::fs::rename(&stored, &final_path).await {
         fail(&stored, &id).await;
         return Err(e);
     }
     catalog::mark_remote_ready(&id, &final_path);
-    crate::poster::request(&id, &final_path, &safe);
+    crate::poster::request(&id, &final_path, &final_name);
     {
         // Final tick (sent == total) closes the ring immediately, unthrottled.
         let mut map = dl_lock();
@@ -501,13 +527,15 @@ pub(crate) async fn copy_into_inbox(
         }
         push_progress(&mut map, &id, now_ms(), true);
     }
-    Ok((id, final_path, safe))
+    Ok((id, final_path, final_name))
 }
 
 /// Infer Content-Type from the file extension for /view so the browser can
 /// preview images/videos/PDFs/text inline. Types the browser cannot open
 /// (office docs, archives, etc.) return octet-stream and automatically fall
-/// back to download.
+/// back to download. Deliberately NOT mapped: avi (no browser decodes it —
+/// an inline player would only spin, download is the working path) and opus
+/// (same story on Safari, the desk-range target phone).
 fn mime_for(name: &str) -> String {
     let ext = Path::new(name)
         .extension()
@@ -515,7 +543,8 @@ fn mime_for(name: &str) -> String {
         .unwrap_or("")
         .to_lowercase();
     let m = match ext.as_str() {
-        "txt" | "md" | "log" | "csv" => "text/plain; charset=utf-8",
+        "txt" | "md" | "log" | "csv" | "yml" | "yaml" | "toml" | "ini" | "srt" | "vtt"
+        | "lrc" => "text/plain; charset=utf-8",
         "css" => "text/css; charset=utf-8",
         "js" => "text/javascript; charset=utf-8",
         "json" => "application/json",
@@ -525,13 +554,18 @@ fn mime_for(name: &str) -> String {
         "png" => "image/png",
         "gif" => "image/gif",
         "webp" => "image/webp",
+        "avif" => "image/avif",
+        "heic" => "image/heic",
         "bmp" => "image/bmp",
         "svg" => "image/svg+xml",
-        "mp4" => "video/mp4",
+        "mp4" | "m4v" => "video/mp4",
         "webm" => "video/webm",
         "mov" => "video/quicktime",
         "mkv" => "video/x-matroska",
+        "3gp" => "video/3gpp",
+        "3g2" => "video/3gpp2",
         "mp3" => "audio/mpeg",
+        "aac" => "audio/aac",
         "m4a" => "audio/mp4",
         "wav" => "audio/wav",
         "ogg" => "audio/ogg",
@@ -567,6 +601,14 @@ impl Drop for StreamCutGuard {
             let start_ms = map.get(&self.tid).map(|e| e.start_ms).unwrap_or(0);
             map.remove(&self.tid);
             drop(map);
+            // Broadcast so clients reconcile: this pull is gone from the ledger
+            // and no terminal `progress` tick is coming (the cut IS the end), so
+            // a mirror frozen on the last tick must be cleared by a /dl-status
+            // pass. Without this the PC's corner ring sticks on the last
+            // percent forever — the monitor's prune cannot help, because the
+            // entry is already gone by the time it looks, so it sees no drop to
+            // announce (this mirrors cancel(), the other no-terminal-tick path).
+            let _ = notifier().send(PushEvent::Resync);
             // Cuts of real size carry their achieved rate (same shape as the
             // completion `dl` line): an abort with a speed needs no follow-up
             // test to judge the pipeline.
@@ -650,12 +692,14 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
     // versions; what HTTP asks of the server is a strong validator so a
     // resume can be proven safe — without one, clients that would otherwise
     // resume restart from zero. Content behind an id is immutable, so the id
-    // doubles as the ETag; a stale client's mismatched If-Range falls through
-    // to a full 200 body. Malformed / multi-range headers also fall through
-    // to a full 200 body.
-    let etag = format!("\"{}\"", p.id);
+    // seeds the ETag; the build tag is appended so a client holding a response
+    // from an older build — whose headers may have differed — fails validation
+    // and re-fetches a full 200 instead of a 304 that would reuse the stored
+    // headers (see server::build_tag). A stale client's mismatched If-Range
+    // falls through to a full 200 body, as do malformed / multi-range headers.
+    let etag = format!("\"{}-{}\"", p.id, crate::server::build_tag());
     // Cache policy splits by dispatch: previews ride the browser cache
-    // (`private, no-cache` + this strong id ETag) — bytes are kept locally
+    // (`private, no-cache` + this build-tagged ETag) — bytes are kept locally
     // but every reuse revalidates, so a deleted message 404s instead of
     // serving stale. Retention matches no-store to within one validation
     // roundtrip, while a reopen costs N 304s instead of N full downloads.
@@ -885,19 +929,27 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
             (header::ACCEPT_RANGES, "bytes".to_string()),
             (header::CONTENT_DISPOSITION, cd),
             (header::CONTENT_LENGTH, len.to_string()),
-            (header::CONTENT_TYPE, ct),
+            (header::CONTENT_TYPE, ct.clone()),
             (header::ETAG, etag),
             (header::CACHE_CONTROL, cc.to_string()),
-            // Inline responses get navigated to directly now (a tapped card
-            // hands the file to the browser). A sandboxed document can never
-            // execute scripts on this app's origin: an inbox .svg opened by
-            // navigation stays inert, while <img>/<video> subresource loads
-            // are unaffected — CSP applies to documents, not images.
-            (header::CONTENT_SECURITY_POLICY, "sandbox".to_string()),
         ],
         body,
     )
     .into_response();
+    // Inline responses get navigated to directly now (a tapped card hands the
+    // file to the browser). A sandboxed document can never execute scripts on
+    // this app's origin — but the sandbox ALSO disables WebKit's built-in
+    // media player on a navigated audio/video document (bugs.webkit.org
+    // #225865: spinner forever, bytes delivered fine), so it is sent only for
+    // SVG: the one inline type that can execute scripts when navigated to
+    // directly. <img>/<video>/<audio> subresource loads are unaffected either
+    // way — CSP applies to documents, not media.
+    if inline && ct == "image/svg+xml" {
+        resp.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("sandbox"),
+        );
+    }
     if partial {
         *resp.status_mut() = StatusCode::PARTIAL_CONTENT;
         let cr = format!("bytes {start}-{end}/{len}");
@@ -988,7 +1040,9 @@ pub(crate) async fn serve_poster(
         Ok(b) => b,
         Err(_) => return not_found(),
     };
-    let etag = format!("\"{}\"", entry.id);
+    // Same build-tagged validator as /view: a poster cached under an older
+    // build's headers must not be reused via a 304.
+    let etag = format!("\"{}-{}\"", entry.id, crate::server::build_tag());
     let fresh = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -1184,7 +1238,11 @@ pub(crate) async fn remove(
     };
 
     // Deleting never asks: files go to the bin, anything the bin can't take
-    // fails untouched (record + bytes kept) for Explorer to handle.
+    // fails untouched (record + bytes kept) for Explorer to handle — except a
+    // file that is already gone (deleted in Explorer by hand): then the
+    // mapping is the only thing left, so drop it and succeed. Without this a
+    // manually-deleted file leaves a card that errors forever ("please delete
+    // manually") until a restart reconciles it away.
     // Oversize/edge files are deliberately NOT tinbox's job.
     let (label, binned) = match &entry.body {
         catalog::MsgBody::File { source, name, .. } => match source {
@@ -1205,6 +1263,14 @@ pub(crate) async fn remove(
                         }
                     };
                     (format!("{name}: record removed ({detail})"), false)
+                } else if !std::path::Path::new(path).exists() {
+                    // Already gone: drop the mapping, succeed. (A file deleted
+                    // between this check and recycle_delete below still errors;
+                    // tapping delete again then succeeds — converges.)
+                    (
+                        format!("{name}: already gone from inbox, record removed"),
+                        false,
+                    )
                 } else {
                     // Gate passed above: the bin's verdict decides, refusal
                     // fails untouched (see the pre-check).
@@ -1247,12 +1313,16 @@ pub(crate) async fn remove(
     (StatusCode::OK, if binned { "binned" } else { "deleted" }).into_response()
 }
 
-/// Delete EVERYTHING in one sweep: landed inbox copies go to the Recycle
-/// Bin; anything the bin can't take (over quota, shell errors) stays fully
-/// intact and is counted, never asked — bulk leftovers are Explorer's job,
-/// like single oversize deletes. PC-only like /rm (same rationale, amplified
-/// — a guest must not be able to vaporize the owner's history). One List push
-/// for the whole sweep, not N.
+/// Delete EVERYTHING in one sweep: the index is dropped first (take_all
+/// drains + persists empty, equivalent to deleting catalog.json), then the
+/// inbox directory itself is emptied — every top-level file, indexed or not
+/// (a mid-session hand-drop the index never saw is still gone). Rows are NEVER
+/// put back, so a bulk clear cannot strand erroring cards: leftovers stay on
+/// disk and are re-adopted as fresh entries on the next startup (honest — the
+/// bytes really are there). Subdirectories are left alone and reported:
+/// bulk-deleting unknown trees is out of scope.
+/// PC-only like /rm (same rationale, amplified — a guest must not be able to
+/// vaporize the owner's history). One List push for the whole sweep, not N.
 pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> impl IntoResponse {
     if from_by_peer(peer) != "owner" {
         logw("remove-all: rejected delete request from guest");
@@ -1262,68 +1332,123 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
     if all.is_empty() {
         return (StatusCode::OK, "nothing to delete").into_response();
     }
-    let mut files = 0usize;
     let mut texts = 0usize;
+    let mut files = 0usize;
     let mut binned = 0usize;
-    let mut skipped = 0usize;
-    let mut refused: Vec<catalog::Entry> = Vec::new();
+    let mut left = 0usize;
     let total = all.len();
-    for e in all {
-        // Same teardown as remove(): stop the writer, drop the mirror.
+    // In-memory teardown per drained entry (rows are already gone): stop
+    // writers, drop mirrors, unlink sidecars. File deletes happen below from
+    // the directory listing, not from these rows.
+    for e in &all {
         if e.pending {
             cancel_lock().insert(e.id.clone());
         }
         dl_lock().remove(&e.id);
-        let mut keep = false;
-        match &e.body {
-            catalog::MsgBody::File { source, .. } => {
-                files += 1;
-                if let catalog::Source::Remote { path } = source {
-                    // Never-landed partials are garbage: hard-delete, no bin.
-                    if e.pending {
-                        if std::fs::remove_file(path).is_err() {
-                            logw(&format!("remove-all: could not delete partial {}", path));
-                        }
-                    } else {
-                        match recycle_delete(path) {
-                            Ok(()) => binned += 1,
-                            Err(er) => {
-                                logw(&format!("remove-all: bin failed {} ({}), kept", path, er));
-                                keep = true;
-                            }
-                        }
-                    }
-                }
-            }
-            catalog::MsgBody::Text { .. } => texts += 1,
-        }
-        if keep {
-            // Untouched: record goes back, bytes and poster stay.
-            refused.push(e);
-            skipped += 1;
-            continue;
-        }
         if matches!(e.body, catalog::MsgBody::File { .. }) {
             crate::poster::unlink(&e.id);
         }
+        if matches!(e.body, catalog::MsgBody::Text { .. }) {
+            texts += 1;
+        }
     }
-    if !refused.is_empty() {
-        // Put the kept records back (single persist); the binned ones stay gone.
-        catalog::restore(refused);
+    // Disk truth, not index truth: wipe every top-level file in the inbox —
+    // indexed copies and mid-session hand-drops the index never saw alike.
+    // Sentinel partials are hard-deleted (garbage); the rest ride the Recycle
+    // Bin so a bulk clear stays recoverable. Subdirectories are left alone
+    // and reported. On Windows an in-use file cannot be deleted out from
+    // under a live writer, so a concurrent upload racing this sweep either
+    // keeps its file (its row survives too — consistent) or fails loudly; no
+    // corrupt middle.
+    match std::fs::read_dir(catalog::inbox_dir()) {
+        Ok(rd) => {
+            for ent in rd.flatten() {
+                let p = ent.path();
+                let Ok(meta) = ent.metadata() else {
+                    left += 1;
+                    continue;
+                };
+                if !meta.is_file() {
+                    logw(&format!("remove-all: left subdirectory {}", p.display()));
+                    left += 1;
+                    continue;
+                }
+                files += 1;
+                let is_partial = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .map_or(false, crate::catalog::is_sentinel_name);
+                if is_partial {
+                    if std::fs::remove_file(&p).is_err() {
+                        logw(&format!("remove-all: could not delete partial {}", p.display()));
+                        left += 1;
+                    }
+                    continue;
+                }
+                match recycle_delete(&p.to_string_lossy()) {
+                    Ok(()) => binned += 1,
+                    Err(er) => {
+                        logw(&format!(
+                            "remove-all: bin failed {} ({}), left on disk",
+                            p.display(),
+                            er
+                        ));
+                        left += 1;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            logw(&format!(
+                "remove-all: cannot list inbox ({}); index already dropped",
+                e
+            ));
+        }
     }
     let _ = notifier().send(PushEvent::List(catalog::all_items()));
     logf(&format!(
-        "remove-all: cleared {} of {} entries ({} files, {} texts, {} binned, {} kept)",
-        total - skipped,
-        total,
-        files,
-        texts,
-        binned,
-        skipped
+        "remove-all: cleared {} entries ({} files, {} texts, {} binned, {} left on disk)",
+        total, files, texts, binned, left
     ));
     (
         StatusCode::OK,
-        format!("cleared:{}:{}", total - skipped, skipped),
+        format!("cleared:{}:{}", total, left),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mime_for;
+
+    /// Inline table: every previewable extension must resolve to a playable
+    /// content type. Add a row whenever a new extension joins mime_for.
+    #[test]
+    fn inline_types_stay_inline() {
+        for (name, mime) in [
+            ("a.avif", "image/avif"),
+            ("a.heic", "image/heic"),
+            ("a.svg", "image/svg+xml"),
+            ("a.m4v", "video/mp4"),
+            ("a.3gp", "video/3gpp"),
+            ("a.3g2", "video/3gpp2"),
+            ("a.mp3", "audio/mpeg"),
+            ("a.aac", "audio/aac"),
+            ("a.yml", "text/plain; charset=utf-8"),
+            ("a.pdf", "application/pdf"),
+        ] {
+            assert_eq!(mime_for(name), mime, "{name}");
+        }
+    }
+
+    /// Deliberate octet-stream cases (locked so a well-meaning addition can't
+    /// regress them): html would execute scripts; avi/opus have no decoder on
+    /// the desk-range phones, where a dead inline player is worse than a
+    /// clean download.
+    #[test]
+    fn risky_and_unplayable_fall_back_to_download() {
+        for name in ["a.html", "a.exe", "a.zip", "a.avi", "a.opus", "a.amr", "noext"] {
+            assert_eq!(mime_for(name), "application/octet-stream", "{name}");
+        }
+    }
 }

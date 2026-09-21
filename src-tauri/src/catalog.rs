@@ -333,9 +333,10 @@ pub fn save() {
 ///   - dangling records (indexed, file gone — the user deleted or moved the
 ///     file via Explorer) are DROPPED, matching that intent; keeping them
 ///     would leave dead "file missing" bubbles.
-///   - `pending__`-prefixed files are a dead upload's residue — the sentinel
-///     stamped at registration and stripped only by the success-path rename,
-///     so its presence proves the body never graduated. They are DELETED on
+///   - Well-formed `pending__{id}__` names (see is_sentinel_name) are a dead
+///     upload's residue — the sentinel stamped at registration and stripped
+///     only by the success-path rename, so its presence proves the body never
+///     graduated. They are DELETED on
 ///     sight. This is the one carve-out from "the index yields to the disk":
 ///     a sentinel file is not disk truth, it is a transfer that never became
 ///     a file. The prefix is namespaced with a server-generated nanosecond
@@ -362,9 +363,11 @@ pub fn reconcile() {
                 }
                 continue;
             }
-            // Kill the sentinel-named residue before it can be mistaken for
-            // an orphan to adopt (see the doc block above).
-            if name.starts_with("pending__") {
+            // Kill genuine sentinel residue before it can be mistaken for an
+            // orphan to adopt (see the doc block above). The shape check is
+            // the point: a user file merely starting with the word falls
+            // through to normal adoption below instead of being deleted.
+            if is_sentinel_name(&name) {
                 let p = e.path();
                 match std::fs::remove_file(&p) {
                     Ok(()) => crate::logger::logf(&format!("catalog: deleted partial upload {name}")),
@@ -465,19 +468,67 @@ pub fn reconcile() {
     }
 }
 
-/// Adopted files may still carry the stored `{nanos}-{seq}__` prefix; show
-/// the clean name instead. Anything that does not match the shape (a user
-/// file like "2024-report__draft.jpg") is kept verbatim.
+fn base36_group(p: &str) -> bool {
+    !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+/// Whether `head` is a storage id in either minted shape: the server's
+/// `{nanos}-{seq}` (exactly one hyphen, both sides digits) or the frontend's
+/// `c-{ts36}-{seq36}-{rand36}` (see newCid / valid_client_id). Shared by the
+/// display recovery (strip_stored_prefix) and the residue gate
+/// (is_sentinel_name) so both agree on what "ours" looks like.
+fn is_stored_id(head: &str) -> bool {
+    let server_shaped = match head.split_once('-') {
+        Some((a, b)) => {
+            !a.is_empty()
+                && !b.is_empty()
+                && !b.contains('-')
+                && a.chars().all(|c| c.is_ascii_digit())
+                && b.chars().all(|c| c.is_ascii_digit())
+        }
+        None => false,
+    };
+    let client_shaped = match head.strip_prefix("c-") {
+        Some(tail) => {
+            let mut g = tail.split('-');
+            matches!(
+                (g.next(), g.next(), g.next(), g.next()),
+                (Some(a), Some(b), Some(c), None)
+                    if base36_group(a) && base36_group(b) && base36_group(c)
+            )
+        }
+        None => false,
+    };
+    server_shaped || client_shaped
+}
+
+/// Adopted files may still carry the stored `{id}__` prefix; show the clean
+/// name instead. Anything else (a user file like "2024-report__draft.jpg")
+/// is kept verbatim. The shapes are matched exactly (not "looks id-ish")
+/// because a miss here either leaks a storage prefix into the timeline or,
+/// worse, eats a real user filename.
 fn strip_stored_prefix(name: &str) -> String {
     if let Some((head, rest)) = name.split_once("__") {
-        let looks_like_id = !head.is_empty()
-            && head.contains('-')
-            && head.split('-').all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
-        if looks_like_id {
+        if is_stored_id(head) {
             return rest.to_string();
         }
     }
     name.to_string()
+}
+
+/// Whether a filename wears a genuine upload sentinel (`pending__{id}__…`)
+/// as opposed to merely starting with the word. A real sentinel is always
+/// built well-formed by a single format!, so anything malformed is by
+/// definition NOT ours — most importantly a user file literally named
+/// `pending__….txt`, which must be adopted (or left alone), never deleted.
+pub(crate) fn is_sentinel_name(name: &str) -> bool {
+    match name.strip_prefix("pending__") {
+        Some(rest) => match rest.split_once("__") {
+            Some((head, _)) => is_stored_id(head),
+            None => false,
+        },
+        None => false,
+    }
 }
 
 /// Adoption timestamps come from the file's mtime, not the adoption moment:
@@ -503,15 +554,132 @@ pub fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// Make a display filename unique among current file entries, Windows-style:
+/// `demo.txt` → `demo (1).txt` → `demo (2).txt`. Compared case-insensitively
+/// (a phone/PC download target is often case-insensitive, so `Demo.txt` must
+/// not pass as free next to `demo.txt`). Pending rows count — an in-flight
+/// `demo.txt` already owns the name. Call BEFORE building the stored path so
+/// display and storage agree (`{id}__{deduped}`), and so a later index-loss
+/// adoption recovers the same name via strip_stored_prefix.
+/// Best-effort under concurrency: two same-name uploads racing can still land
+/// on one display name (storage stays unique via id); that degrades to
+/// today's duplicate display, never corruption.
+pub fn dedupe_name(proposed: &str) -> String {
+    if proposed.is_empty() {
+        return String::new();
+    }
+    let taken: std::collections::HashSet<String> = cat_lock()
+        .iter()
+        .filter_map(|e| match &e.body {
+            MsgBody::File { name, .. } => Some(name.to_lowercase()),
+            MsgBody::Text { .. } => None,
+        })
+        .collect();
+    dedupe_against(proposed, &taken)
+}
+
+fn dedupe_against(proposed: &str, taken: &std::collections::HashSet<String>) -> String {
+    if !taken.contains(&proposed.to_lowercase()) {
+        return proposed.to_string();
+    }
+    let (stem, ext) = match proposed.rfind('.') {
+        Some(i) if i > 0 => (&proposed[..i], &proposed[i..]),
+        _ => (proposed, ""),
+    };
+    let mut n = 1u32;
+    loop {
+        let cand = format!("{stem} ({n}){ext}");
+        if !taken.contains(&cand.to_lowercase()) {
+            return cand;
+        }
+        n += 1;
+    }
+}
+
+/// Bump `demo (1).txt` → `demo (2).txt` (`demo.txt` → `demo (1).txt`).
+/// Pure; the caller decides what "taken" means.
+fn bump_display(name: &str) -> String {
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    if stem.ends_with(')') {
+        if let Some(open) = stem.rfind(" (") {
+            let inner = &stem[open + 2..stem.len() - 1];
+            if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_digit()) {
+                if let Ok(n) = inner.parse::<u32>() {
+                    return format!("{} ({}){}", &stem[..open], n.saturating_add(1), ext);
+                }
+            }
+        }
+    }
+    format!("{stem} (1){ext}")
+}
+
+/// Resolve where a pending row graduates: the inbox joined with its display
+/// name — BARE, no id prefix — bumped (` (N)`) while that name is taken.
+/// Taken means either a file already sits at the target (a same-name file
+/// hand-dropped mid-transfer, or a concurrent same-name graduation that won
+/// the race) or another row already shows it (a dangling record counts: never
+/// graduate over ambiguity). The row's display name is updated on a bump so
+/// display, storage, and the eventual download filename stay agreed. Returns
+/// None when the row is gone or not a pending file. Callers rename
+/// stored→returned, then mark_remote_ready as usual; the rename itself stays
+/// atomic, so graduation is still all-or-nothing.
+pub fn resolve_graduation_target(id: &str) -> Option<(PathBuf, String)> {
+    let display: String = {
+        let v = cat_lock();
+        match v.iter().find(|e| e.id == id) {
+            Some(e) => match &e.body {
+                MsgBody::File { name, .. } if e.pending => name.clone(),
+                _ => return None,
+            },
+            None => return None,
+        }
+    };
+    let mut candidate = display.clone();
+    loop {
+        let row_taken = {
+            let low = candidate.to_lowercase();
+            cat_lock().iter().any(|e| {
+                e.id != id
+                    && matches!(&e.body, MsgBody::File { name, .. } if name.to_lowercase() == low)
+            })
+        };
+        if !row_taken && !inbox_dir().join(&candidate).exists() {
+            break;
+        }
+        candidate = bump_display(&candidate);
+    }
+    if candidate != display {
+        let mut v = cat_lock();
+        if let Some(e) = v.iter_mut().find(|e| e.id == id) {
+            if let MsgBody::File { name, .. } = &mut e.body {
+                *name = candidate.clone();
+            }
+        }
+        drop(v);
+        save();
+        crate::logger::logf(&format!(
+            "catalog: graduation bumped {display} -> {candidate} (target taken)"
+        ));
+    }
+    Some((inbox_dir().join(&candidate), candidate))
+}
+
 /// Register a file already materialized in inbox as a from="<from>" file message:
 /// "owner" for a file the owner side added (the app copied it into inbox),
 /// "guest" for an inbound upload. The row is ready immediately (never pending).
 pub fn add_remote(from: &str, id: &str, inbox_path: &Path, display_name: &str) -> Entry {
+    // Adoption/migration paths build the stored path before calling, so dedupe
+    // the display here (single-threaded startup contexts — no race). Upload
+    // and add-local dedupe before building paths instead (see dedupe_name).
+    let display_name = dedupe_name(display_name);
     let size = std::fs::metadata(inbox_path).map(|m| m.len()).unwrap_or(0);
     // Probe once, at rest: the file is complete here (PC add, orphan
     // adoption), so moov is final. Pending uploads probe at graduation
     // instead (mark_remote_ready) — a partial moov would misreport.
-    let media = crate::media::probe_for(display_name, inbox_path);
+    let media = crate::media::probe_for(&display_name, inbox_path);
     let entry = Entry {
         id: id.to_string(),
         ts: now_ts(),
@@ -676,19 +844,6 @@ pub fn take_all() -> Vec<Entry> {
     all
 }
 
-/// Re-insert records withheld from a destructive sweep (files the bin
-/// couldn't take, left fully intact): single persist. Timeline order
-/// is by ts at read time, so append order is free.
-pub fn restore(mut items: Vec<Entry>) {
-    if items.is_empty() {
-        return;
-    }
-    let mut v = cat_lock();
-    v.append(&mut items);
-    drop(v);
-    save();
-}
-
 /// Flip the poster flag after a sidecar lands (or is lost). Returns true when
 /// the stored value actually changed, so the caller can skip a redundant save
 /// and List push.
@@ -731,6 +886,68 @@ mod tests {
         // interchangeable in the catalog.
         assert!(valid_client_id("1789000000000000000-0"));
         assert!(valid_client_id("abc123"));
+    }
+
+    #[test]
+    fn strip_prefix_recovers_both_id_shapes() {
+        assert_eq!(
+            strip_stored_prefix("1789779057050381500-4__test100m.png"),
+            "test100m.png"
+        );
+        assert_eq!(
+            strip_stored_prefix("c-muaei6w7-2-coxi__test500m.bin"),
+            "test500m.bin"
+        );
+        // User files stay verbatim — including near-misses of both shapes.
+        assert_eq!(
+            strip_stored_prefix("2024-report__draft.jpg"),
+            "2024-report__draft.jpg"
+        );
+        assert_eq!(strip_stored_prefix("demo.txt"), "demo.txt");
+        assert_eq!(
+            strip_stored_prefix("c-notes__draft.txt"),
+            "c-notes__draft.txt"
+        );
+    }
+
+    #[test]
+    fn sentinel_gate_needs_full_shape() {
+        // Genuine residue, both id shapes.
+        assert!(is_sentinel_name("pending__1789779057050381500-4__test100m.png"));
+        assert!(is_sentinel_name("pending__c-muaei6w7-2-coxi__test500m.bin"));
+        // A user file that merely starts with the word is NOT residue.
+        assert!(!is_sentinel_name("pending__notes.txt"));
+        assert!(!is_sentinel_name("pending__2024-report__x.jpg"));
+        assert!(!is_sentinel_name("pending__"));
+        assert!(!is_sentinel_name("pending__123-__x.bin"));
+        assert!(!is_sentinel_name("demo.txt"));
+    }
+
+    #[test]
+    fn dedupe_appends_windows_suffix() {
+        use std::collections::HashSet;
+        let taken: HashSet<String> =
+            ["demo.txt", "demo (1).txt", "README", "Demo.TXT"]
+                .iter()
+                .map(|s| s.to_lowercase())
+                .collect();
+        assert_eq!(dedupe_against("other.bin", &taken), "other.bin");
+        assert_eq!(dedupe_against("demo.txt", &taken), "demo (2).txt");
+        assert_eq!(dedupe_against("DEMO.txt", &taken), "DEMO (2).txt");
+        assert_eq!(dedupe_against("README", &taken), "README (1)");
+        assert_eq!(dedupe_against("archive.tar.gz", &taken), "archive.tar.gz");
+    }
+
+    #[test]
+    fn bump_increments_existing_suffix() {
+        assert_eq!(bump_display("demo.txt"), "demo (1).txt");
+        assert_eq!(bump_display("demo (1).txt"), "demo (2).txt");
+        assert_eq!(bump_display("demo (9).txt"), "demo (10).txt");
+        assert_eq!(bump_display("README"), "README (1)");
+        assert_eq!(bump_display("archive.tar.gz"), "archive.tar (1).gz");
+        // Not a suffix — parenthesized non-digits just get another layer.
+        assert_eq!(bump_display("note (final).txt"), "note (final) (1).txt");
+        assert_eq!(bump_display(".env"), ".env (1)");
     }
 
     #[test]

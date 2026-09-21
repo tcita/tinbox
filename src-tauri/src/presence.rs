@@ -1,7 +1,7 @@
-// Liveness: the presence evidence counters (open /events streams, last paired
-// activity), the shared monotonic clock, and the one-second background monitor
-// that announces device / firewall / prune transitions over the transfer
-// page's push channel.
+// Liveness: the presence evidence counter (open /events streams), the
+// last-paired-activity diagnostic stamp, the shared monotonic clock, and the
+// one-second background monitor that announces device / firewall / prune
+// transitions over the transfer page's push channel.
 
 use crate::logger::{logf, logw};
 use crate::server::{current_url, notifier, refresh_url, PushEvent};
@@ -11,29 +11,29 @@ use std::sync::OnceLock;
 use std::time::Duration;
 /// Monotonic seconds since start of the most recent request from a **paired**
 /// LAN device — stamped only for responses the pairing middleware let
-/// through. Presence (the arrival toast, the device transitions the monitor
-/// announces) must mean "a paired device is alive", so an expired or
-/// never-paired web page — which gets 403s for everything — cannot fake
-/// "connected" by merely refetching.
+/// through. Presence no longer reads it (see lan_peer_connected): it survives
+/// only as the `req=` diagnostic in presence_evidence(). Keeping it
+/// paired-only still matters for that line, so an unpaired page's 403
+/// refetches cannot look like activity.
 pub(crate) static LAST_PAIRED_ACT: AtomicU64 = AtomicU64::new(0);
 
-/// A LAN device is online while it holds an open /events stream or made a
-/// paired request recently. Evidence writers (the only two):
-/// events()/PresenceGuard -> LAN_EVENTS_OPEN (paired only: /events itself is
-/// behind the pairing gate), and log_requests, which stamps LAST_PAIRED_ACT for every
-/// response the pairing middleware did not refuse. Transfer bytes are not
-/// presence evidence either — byte stamps serve only the ledger prune.
+/// A LAN device is online exactly while it holds an open /events stream. The
+/// evidence writer is events()/PresenceGuard -> LAN_EVENTS_OPEN (/events
+/// itself is behind the pairing gate). log_requests still stamps
+/// LAST_PAIRED_ACT for every response the pairing middleware did not refuse,
+/// but that is diagnostics now, not evidence. Transfer bytes are not presence
+/// evidence either — byte stamps serve only the ledger prune.
 
 
 /// Monotonic seconds since process start, offset to begin at 1 so that 0 can
 /// serve as the permanent "never" sentinel for stamped values (LAST_PAIRED_ACT,
 /// DlProg::last_ts). With a 0-based clock, `now - 0` = uptime, which made a
-/// freshly started process read as "a device was seen PRESENCE_ACT_SECS ago":
+/// freshly started process read as "a device was seen moments ago":
 /// a phantom `device present` before any phone ever connected (historically this also faked inbound-proof for the
 /// firewall veto; that veto is removed — the flag is worker-verdict only). Every
 /// liveness stamp in the pipeline is only ever compared against a later
 /// `now_mono()`, so wall-clock jumps (NTP correction, manual clock change)
-/// cannot freeze stall detection, pruning or presence either: a backward step
+/// cannot freeze stall detection, pruning or the presence diagnostics: a backward step
 /// would otherwise make `now - stamp` saturate to 0 and hold every dead
 /// transfer "alive" for the whole step duration.
 pub(crate) fn now_mono() -> u64 {
@@ -47,15 +47,13 @@ pub(crate) fn now_mono() -> u64 {
 ///   keep-alive    SSE_HEARTBEAT_SECS — the server emits bytes on an idle
 ///                 /events stream: NAT/AP cannot reap the socket, and the
 ///                 client's watchdog measures server death by its silence.
-///   presence      PRESENCE_ACT_SECS — a LAN device is online while it holds
-///                 an open /events stream or made a paired request recently.
-///                 Evidence writers (the only two): `log_requests` ->
-///                 LAST_PAIRED_ACT (paired requests only — the pairing gate
-///                 marks its refusals, and unpaired 403 traffic must never
-///                 count as "device present", or an expired tab could lift the
-///                 PC scan gate), `events`/PresenceGuard -> LAN_EVENTS_OPEN
-///                 (itself behind the pairing gate). The monitor is the
-///                 single announcer of transitions.
+///   presence      a LAN device is online exactly while it holds an open
+///                 /events stream. The one evidence writer is
+///                 `events`/PresenceGuard -> LAN_EVENTS_OPEN (itself behind
+///                 the pairing gate). `log_requests` -> LAST_PAIRED_ACT is
+///                 kept for the diagnostic line only: it does not feed the
+///                 bit, so an unpaired 403 refetch cannot fake presence. The
+///                 monitor is the single announcer of transitions.
 ///                 Consumers are the arrival toast and the transition logs —
 ///                 no UI light. Byte-flow evidence is
 ///                 deliberately not folded in: byte stamps serve only the
@@ -86,54 +84,36 @@ pub(crate) fn now_mono() -> u64 {
 /// sync.
 ///
 /// Desk-range profile: both devices are in hand and sessions are short, so
-/// the numbers below are tight. One floor to respect: the presence window
-/// must stay above the EventSource reconnect delay (retry, 1s, set on every
-/// replayed event in events()) or a stream blip flaps the presence bit.
+/// the numbers below are tight.
 pub(crate) const SSE_HEARTBEAT_SECS: u64 = 1;
-
-/// [LIVENESS/presence] Seconds after the last paired request before a device
-/// that holds no /events stream is treated as gone. Requests are the only
-/// request-side evidence now; must stay above the SSE retry delay (see the
-/// LIVENESS block) so a blip cannot flap.
-const PRESENCE_ACT_SECS: u64 = 3;
 
 /// How many /events streams are currently open from a non-loopback peer. A
 /// device is "online" exactly while it holds one open — its page is alive and
 /// reachable for pushes. No periodic ping: a live page keeps its EventSource
 /// open (the server's keepalives keep it warm), and after any drop it
-/// reconnects, reopening a stream and flipping presence back on. The monitor
-/// debounces the count so a quick reconnect never reads as a drop.
+/// reconnects, reopening a stream and flipping presence back on. There is no
+/// debounce, so a quick reconnect can read as a drop for one tick; accepted,
+/// because the bit drives nothing user-facing (see lan_peer_connected).
 pub(crate) static LAN_EVENTS_OPEN: AtomicU64 = AtomicU64::new(0);
 
-/// Whether a LAN device is present: it either holds an open /events stream, or
-/// made a paired request within the last few seconds. "The phone can reach the
-/// server" is the question those two answers. Byte flow is not evidence: after
-/// the firewall's traffic veto was removed, nothing consumes byte stamps
-/// beyond the ledger prune. After the first arrival toast, nothing consumes
-/// this bit behaviorally except the transition logs. See the KNOWN LIMITS in the
-/// LIVENESS block: optimistic under no-FIN death, and global rather than
-/// per-device.
+/// Whether a LAN device is present: it holds an open /events stream. "The
+/// phone can reach the server and is holding the push channel" is the question
+/// this answers. Byte flow is not evidence: after the firewall's traffic veto
+/// was removed, nothing consumes byte stamps beyond the ledger prune. After
+/// the first arrival toast, nothing consumes this bit behaviorally except the
+/// transition logs. See the KNOWN LIMITS in the LIVENESS block: optimistic
+/// under no-FIN death, and global rather than per-device.
 pub(crate) fn lan_peer_connected() -> bool {
     LAN_EVENTS_OPEN.load(Ordering::Relaxed) > 0
-        || lan_paired_recently(PRESENCE_ACT_SECS)
-}
-
-/// Recent activity from a PAIRED LAN device: reads LAST_PAIRED_ACT, stamped
-/// only after the pairing gate let the request through. This is the stamp
-/// presence and the arrival toast run on; unpaired 403 traffic must not fake
-/// an arrival.
-fn lan_paired_recently(secs: u64) -> bool {
-    let last = LAST_PAIRED_ACT.load(Ordering::Relaxed);
-    last != 0 && now_mono().saturating_sub(last) < secs
 }
 
 /// One-line snapshot for the monitor's transition log: how many /events
 /// streams are open, how long ago the last paired request arrived, and how
-/// long ago an in-flight transfer last wrote a byte. The first two mirror
-/// lan_peer_connected(); the xfer term is pure diagnostic context — byte
-/// flow is consumed by nothing anymore. "never" marks
-/// a still-0 stamp (see now_mono's sentinel); xfer only tracks entries with
-/// sent < total.
+/// long ago an in-flight transfer last wrote a byte. Only `streams` feeds
+/// lan_peer_connected(); `req` and `xfer` are pure diagnostic context (the
+/// paired stamp and byte flow are consumed by nothing but this line and the
+/// ledger prune). "never" marks a still-0 stamp (see now_mono's sentinel);
+/// xfer only tracks entries with sent < total.
 fn presence_evidence() -> String {
     let now = now_mono();
     let streams = LAN_EVENTS_OPEN.load(Ordering::Relaxed);
@@ -156,15 +136,12 @@ fn presence_evidence() -> String {
 /// its powershell rule check.
 ///
 /// Presence is a single writer here. The monitor announces both ARRIVAL (a LAN
-/// peer holds an open /events stream, or is requesting without one)
-/// and the silent DEPARTURE (a closed stream has no event of its own); events()
-/// only maintains the stream count. There is deliberately no debounce counter:
-/// `online` is just `lan_peer_connected()` sampled now, and the activity
-/// windows inside it (PRESENCE_ACT_SECS) already provide the hysteresis that
-/// keeps a phone whose stream briefly reconnects from flipping the presence
-/// bit. Presence drives no user-facing light (see the LIVENESS block), so a
-/// genuinely absent device may read "gone" within one tick — honesty beats a
-/// state machine.
+/// peer holds an open /events stream) and the silent DEPARTURE (a closed
+/// stream has no event of its own); events() only maintains the stream count.
+/// There is deliberately no debounce counter: `online` is just
+/// `lan_peer_connected()` sampled now, so a stream blip can read as a drop for
+/// one tick. That is accepted — nothing user-facing consumes the bit (see the
+/// LIVENESS block), so honesty beats a state machine.
 pub(crate) async fn monitor_loop() {
     let mut prev_online: Option<bool> = None;
     let mut prev_repair: Option<bool> = None;
