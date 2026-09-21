@@ -321,6 +321,14 @@ pub(crate) async fn upload(
                 // took the target, so this rename can never overwrite.
                 match catalog::resolve_graduation_target(&id) {
                     Some((final_path, final_name)) => {
+                        // Irreversible: resolve already picked an untaken name
+                        // (row + disk checks), so landing on an existing file
+                        // here would mean a lost race — fail loudly in debug.
+                        debug_assert!(
+                            !final_path.exists(),
+                            "graduation must never overwrite {}",
+                            final_path.display()
+                        );
                         match tokio::fs::rename(&stored, &final_path).await {
                             Ok(()) => Ok((final_path, final_name)),
                             // Graduation failed (file locked by AV/backup): the bytes may
@@ -1419,7 +1427,7 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
 
 #[cfg(test)]
 mod tests {
-    use super::mime_for;
+    use super::{mime_for, parse_range};
 
     /// Inline table: every previewable extension must resolve to a playable
     /// content type. Add a row whenever a new extension joins mime_for.
@@ -1450,5 +1458,36 @@ mod tests {
         for name in ["a.html", "a.exe", "a.zip", "a.avi", "a.opus", "a.amr", "noext"] {
             assert_eq!(mime_for(name), "application/octet-stream", "{name}");
         }
+    }
+
+    #[test]
+    fn range_normal_and_open_end() {
+        assert_eq!(parse_range("bytes=0-99", 1000), Some(Ok((0, 99))));
+        assert_eq!(parse_range("bytes=900-", 1000), Some(Ok((900, 999))));
+        // An end past the last byte clamps; a satisfiable start never 416s.
+        assert_eq!(parse_range("bytes=0-99999", 1000), Some(Ok((0, 999))));
+    }
+
+    #[test]
+    fn range_suffix_takes_the_tail() {
+        assert_eq!(parse_range("bytes=-100", 1000), Some(Ok((900, 999))));
+        // Asking for more than exists clamps to the whole body.
+        assert_eq!(parse_range("bytes=-5000", 1000), Some(Ok((0, 999))));
+        // A zero-length suffix and an empty resource are not ranges.
+        assert_eq!(parse_range("bytes=-0", 1000), None);
+        assert_eq!(parse_range("bytes=-10", 0), None);
+    }
+
+    #[test]
+    fn range_unsatisfiable_is_416_and_garbage_is_full_body() {
+        // Start at/past the end: 416.
+        assert_eq!(parse_range("bytes=1000-", 1000), Some(Err(())));
+        assert_eq!(parse_range("bytes=5000-6000", 1000), Some(Err(())));
+        // Malformed or multi-range: the caller serves the full body.
+        assert_eq!(parse_range("bytes=200-100", 1000), None);
+        assert_eq!(parse_range("items=0-99", 1000), None);
+        assert_eq!(parse_range("bytes=0-1,2-3", 1000), None);
+        assert_eq!(parse_range("bytes=abc-", 1000), None);
+        assert_eq!(parse_range("bytes=", 1000), None);
     }
 }

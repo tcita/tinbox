@@ -369,6 +369,10 @@ pub fn reconcile() {
             // through to normal adoption below instead of being deleted.
             if is_sentinel_name(&name) {
                 let p = e.path();
+                // Irreversible: re-assert the gate at the delete itself, so a
+                // future refactor that loosens the `if` above fails loudly in
+                // debug instead of eating a user file.
+                debug_assert!(is_sentinel_name(&name));
                 match std::fs::remove_file(&p) {
                     Ok(()) => crate::logger::logf(&format!("catalog: deleted partial upload {name}")),
                     Err(err) => crate::logger::logw(&format!(
@@ -616,6 +620,22 @@ fn bump_display(name: &str) -> String {
     format!("{stem} (1){ext}")
 }
 
+/// Pure decision core of resolve_graduation_target: the row's display name —
+/// BARE, no id prefix — bumped (` (N)`) while `taken` says the name is used.
+/// `taken` must cover both senses of "used": another row already showing the
+/// name (a dangling record counts) and a file already sitting at the target.
+/// Never returns a taken name, so the caller's rename can never overwrite.
+/// Split out so the decision is unit-testable without touching the global
+/// catalog or the real inbox; the live closure below re-locks the catalog on
+/// every iteration, so a concurrent graduation landing mid-loop is still seen.
+fn graduation_candidate(display: &str, taken: impl Fn(&str) -> bool) -> String {
+    let mut candidate = display.to_string();
+    while taken(&candidate) {
+        candidate = bump_display(&candidate);
+    }
+    candidate
+}
+
 /// Resolve where a pending row graduates: the inbox joined with its display
 /// name — BARE, no id prefix — bumped (` (N)`) while that name is taken.
 /// Taken means either a file already sits at the target (a same-name file
@@ -637,20 +657,14 @@ pub fn resolve_graduation_target(id: &str) -> Option<(PathBuf, String)> {
             None => return None,
         }
     };
-    let mut candidate = display.clone();
-    loop {
-        let row_taken = {
-            let low = candidate.to_lowercase();
-            cat_lock().iter().any(|e| {
-                e.id != id
-                    && matches!(&e.body, MsgBody::File { name, .. } if name.to_lowercase() == low)
-            })
-        };
-        if !row_taken && !inbox_dir().join(&candidate).exists() {
-            break;
-        }
-        candidate = bump_display(&candidate);
-    }
+    let candidate = graduation_candidate(&display, |c| {
+        let low = c.to_lowercase();
+        let row_taken = cat_lock().iter().any(|e| {
+            e.id != id
+                && matches!(&e.body, MsgBody::File { name, .. } if name.to_lowercase() == low)
+        });
+        row_taken || inbox_dir().join(c).exists()
+    });
     if candidate != display {
         let mut v = cat_lock();
         if let Some(e) = v.iter_mut().find(|e| e.id == id) {
@@ -963,5 +977,46 @@ mod tests {
         assert!(!valid_client_id("abc\\def"), "path separator");
         assert!(!valid_client_id("ABC123"), "uppercase");
         assert!(!valid_client_id("abc.def"), "dot");
+    }
+
+    #[test]
+    fn graduation_uses_bare_name_when_free() {
+        let taken = |_: &str| false;
+        assert_eq!(graduation_candidate("demo.txt", taken), "demo.txt");
+        assert_eq!(graduation_candidate("README", taken), "README");
+    }
+
+    #[test]
+    fn graduation_bumps_past_disk_and_row_collisions() {
+        use std::collections::HashSet;
+        let rows: HashSet<String> = ["report.pdf"].iter().map(|s| s.to_string()).collect();
+        let disk: HashSet<String> = ["demo.txt", "demo (1).txt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let taken = |c: &str| rows.contains(&c.to_lowercase()) || disk.contains(c);
+        // Disk owns demo.txt and demo (1).txt: chain past both.
+        assert_eq!(graduation_candidate("demo.txt", taken), "demo (2).txt");
+        // A row showing the name — case-insensitively — also forces a bump,
+        // and the bump keeps the row's own casing.
+        assert_eq!(graduation_candidate("REPORT.PDF", taken), "REPORT (1).PDF");
+        // Free in both senses: the bare name stands.
+        assert_eq!(graduation_candidate("new.png", taken), "new.png");
+    }
+
+    #[test]
+    fn graduation_never_returns_a_taken_name() {
+        use std::collections::HashSet;
+        // Rows show demo.txt and demo (1).txt, disk holds demo (2).txt:
+        // the chain must skip all three, never landing on a taken name.
+        let rows: HashSet<String> = ["demo.txt", "demo (1).txt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let disk: HashSet<String> = ["demo (2).txt"].iter().map(|s| s.to_string()).collect();
+        let taken = |c: &str| rows.contains(&c.to_lowercase()) || disk.contains(c);
+        let out = graduation_candidate("demo.txt", taken);
+        assert_eq!(out, "demo (3).txt");
+        assert!(!taken(&out));
     }
 }

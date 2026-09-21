@@ -42,9 +42,9 @@ pub(crate) fn note_foreign_subnet(peer: &SocketAddr) {
 
 /// Cached QR PNG for the last URL the monitor rendered. Opening the lightbox
 /// used to go blank for seconds after a network switch: the handler computed
-/// current_url() inline, and the first collect_ips() past a switch probes the
-/// new gateway (up to ~2s) and re-queries adapters through PowerShell. The
-/// monitor now renders the PNG when it sees the URL change (see
+/// current_url() inline, and the first collect_ips() past a switch re-queries
+/// adapters through PowerShell once the 30s facts cache expired. The monitor
+/// now renders the PNG when it sees the URL change (see
 /// presence::monitor_loop), so that open is an in-memory copy.
 static QR_CACHE: OnceLock<Mutex<(String, Vec<u8>)>> = OnceLock::new();
 
@@ -140,6 +140,13 @@ pub(crate) async fn qr() -> impl IntoResponse {
         bytes,
     )
         .into_response()
+}
+
+/// Sort key for QR candidates: wireless first (the app promises "同一 Wi-Fi"),
+/// then the adapter name for determinism. A free function so the ordering is
+/// unit-testable without touching Win32 enumeration.
+fn cand_key(wireless: bool, name: &str) -> (bool, &str) {
+    (!wireless, name)
 }
 
 /// Enumerate this machine's IPv4 candidates for the QR code.
@@ -240,7 +247,7 @@ pub(crate) fn collect_ips() -> Vec<String> {
         })
         .collect();
     // Wireless first (so !wireless sorts last), then the name.
-    cands.sort_by(|a, b| (!a.wireless, &a.name).cmp(&(!b.wireless, &b.name)));
+    cands.sort_by(|a, b| cand_key(a.wireless, &a.name).cmp(&cand_key(b.wireless, &b.name)));
     let ips: Vec<String> = cands.iter().map(|c| c.v4.to_string()).collect();
 
     // Log whenever this decision changes, not just the winner: a new virtual
@@ -459,5 +466,50 @@ fn gather_adapter_facts() -> AdapterFacts {
 #[cfg(not(windows))]
 fn gather_adapter_facts() -> AdapterFacts {
     AdapterFacts::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn private_ranges_only() {
+        for ip in ["192.168.1.7", "10.0.0.2", "172.16.0.1", "172.31.255.255"] {
+            assert!(is_private(ip.parse().unwrap()), "{ip}");
+        }
+        // 172.15/172.32 are public, 169.254 is link-local, loopback is not LAN.
+        for ip in ["172.15.9.9", "172.32.0.1", "8.8.8.8", "169.254.10.20", "127.0.0.1"] {
+            assert!(!is_private(ip.parse().unwrap()), "{ip}");
+        }
+    }
+
+    #[test]
+    fn virtual_keywords_never_reach_the_qr() {
+        for name in [
+            "vEthernet (WSL)",
+            "WireGuard Tunnel",
+            "TAP-Windows Adapter",
+            "ZeroTier One",
+        ] {
+            assert!(virtual_adapter(name), "{name}");
+        }
+        for name in [
+            "WLAN",
+            "Intel(R) Wi-Fi 6 AX201",
+            "Realtek PCIe GbE Family Controller",
+            "Wi-Fi",
+        ] {
+            assert!(!virtual_adapter(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn wireless_first_then_name() {
+        // Wireless beats wired no matter the names.
+        assert!(cand_key(true, "Zulu") < cand_key(false, "Alpha"));
+        // Ties break on the name: deterministic, implying no preference.
+        assert!(cand_key(false, "Alpha") < cand_key(false, "Beta"));
+        assert_eq!(cand_key(true, "WLAN"), cand_key(true, "WLAN"));
+    }
 }
 
