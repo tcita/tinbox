@@ -163,7 +163,7 @@ pub(crate) async fn upload(
     // The sender follows the peer, exactly like /send-text: LAN pushes are
     // "guest", the desktop's own paste-to-send (no real path to /add-local)
     // is "owner" and must not be misattributed to a guest device.
-    let from = from_by_peer(peer);
+    let from: &str = from_by_peer(peer);
     loop {
         let mut field = match multipart.next_field().await {
             Ok(Some(f)) => f,
