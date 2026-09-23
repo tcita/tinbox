@@ -500,6 +500,25 @@
   /* A file that is still uploading pulses gently (no numeric progress). */
   .file-card.pending { animation: pendingPulse 1.6s ease-in-out infinite; }
   @keyframes pendingPulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
+  /* Failed upload kept for manual retry: stop the idle pulse (it is not
+     moving) and flag the caption. The card body retries on tap; a small 忽略
+     button dismisses it locally. A failed card only ever shows on the SENDER,
+     i.e. inside the green outgoing bubble, so the flag uses a dark red that
+     reads on green (var(--danger) would be ~1.9:1 there). */
+  .file-card.failed { animation: none; opacity: 1; }
+  .file-card.failed .fc-size { color: #6b0f0a; opacity: 1; font-weight: 600; }
+  /* Secondary, client-only dismiss for a failed card (the primary action is
+     tap-to-retry). Quiet by default so retry leads; it never touches the
+     server. */
+  .retry-ignore {
+    display: inline-block; margin-top: 7px; padding: 3px 11px;
+    border: 1px solid var(--line-strong); border-radius: 8px;
+    background: var(--card); color: var(--sub);
+    font: 600 11px inherit; line-height: 1.5; cursor: pointer;
+    transition: color .15s ease, border-color .15s ease;
+  }
+  .retry-ignore:hover { color: var(--text); border-color: var(--accent); }
+  .retry-ignore:active { transform: scale(0.96); }
 
   /* Fullscreen media preview (both ends, image/video) */
   .media-ov {
@@ -1106,6 +1125,22 @@ async function serverFetch(path, { method = 'GET', query, body, signal } = {}){
     return r;
   });
 }
+// Bounded /list read for the upload-retry path: a bare fetch() on a dead
+// mobile radio can hang for minutes (half-open TCP waits out the OS timeout
+// instead of rejecting), which would wedge the retry wrapper on 发送中
+// forever — exactly the multi-minute stuck card. Cap it; on timeout the
+// caller treats the row state as unknown (same-cid retry stays safe via the
+// server's duplicate-cid 409, so unknown never duplicates).
+async function fetchListBounded(ms){
+  const ac = new AbortController();
+  const t = setTimeout(() => { try { ac.abort(); } catch {} }, ms);
+  try {
+    const r = await serverFetch('/list', { signal: ac.signal });
+    return await r.json();
+  } finally {
+    clearTimeout(t);
+  }
+}
 
 // Context Menu
 let ctxTarget = null;
@@ -1253,8 +1288,20 @@ function applyListLive(items){
   // then the row stays owner-internal. The owner keeps it: its ring rides the
   // copy's progress pushes.
   if(!isOwner) items = items.filter(i => !(i.pending && i.from === 'owner'));
-  // Merge the sending phone's optimistic "just picked a file" cards in until the
-  // server's real (pending) row appears, so the UI shows the card instantly.
+  // Reconcile local remote-send cards against the server's rows (the row is a
+  // signal only — withOptimistic keeps it out of the render set while the cid is
+  // local):
+  //  - row READY => the send landed despite any local failure signal: drop the
+  //    local card and let the ready row show (never hide a real file).
+  //  - tombstone (dismissed/stopped) with the row gone => nothing left to hide.
+  //  - failed card with no/again-pending row => KEEP it, for a manual retry.
+  for(const o of optUploads.slice()){
+    if(!o.remote) continue;
+    const row = items.find(i => i.id === o.id);
+    const landed = !!(row && !row.pending);
+    if(landed || (o.hidden && !row)) optUploads.splice(optUploads.indexOf(o), 1);
+  }
+  // The sending end's local cards render until the server row takes over.
   const view = withOptimistic(items);
   const key = JSON.stringify(view);
   if(key === lastList) return;
@@ -1317,6 +1364,10 @@ function itemSig(it){
         // `queued` likewise: the caption must flip 等待中… → 发送中… when the
         // serial queue reaches this card.
         it.queued ? 1 : 0,
+        // `failed` forces a rebuild so the caption flips 发送中… → 发送失败… and
+        // the tap handler swaps to retry (otherwise the node is kept untouched,
+        // since every other field — local/pending — is unchanged).
+        it.failed ? 1 : 0,
         it.poster ? 1 : 0,
         it.media ? [it.media.dur_ms, it.media.w, it.media.h].join(',') : ''].join('|');
 }
@@ -1363,6 +1414,7 @@ function buildMsg(it, animate){
       const card = document.createElement('div');
       card.className = 'file-card';
       if(it.pending){ card.dataset.pending = '1'; card.classList.add('pending'); }
+      if(it.failed) card.classList.add('failed');
       const isImg = !it.pending && isImgName(it.name);
       const isVid = !it.pending && isVidName(it.name);
 
@@ -1426,7 +1478,21 @@ function buildMsg(it, animate){
       // worth it, and phones (no hover) ignore it.
       nmEl.title = it.name;
       info.querySelector('.fc-size').textContent = fmtSize(it.size) + mediaSuffix(it);
-      if(it.pending){
+      if(it.failed){
+        // Kept on screen after a failed attempt so the user can re-send: the
+        // card body and the corner retry disc both re-send under the same cid.
+        // The inline "忽略" drops the card — CLIENT-ONLY, so the server is never
+        // touched (it never knew about this retry card anyway; a leftover
+        // pending row times out on its own).
+        info.querySelector('.fc-size').textContent += ' · 发送失败，点击重试';
+        const ignore = document.createElement('button');
+        ignore.type = 'button';
+        ignore.className = 'retry-ignore';
+        ignore.textContent = '忽略';
+        ignore.title = '不再重试';
+        ignore.onclick = (e) => { e.stopPropagation(); dismissUpload(it.id); };
+        info.appendChild(ignore);
+      } else if(it.pending){
         // Caption by WHAT IS MOVING, not by sender alone: a pending
         // from="guest" row is bytes crossing Wi-Fi (发送 on the guest end, 接收
         // on the owner end); a pending from="owner" row is a LOCAL copy into
@@ -1492,6 +1558,12 @@ function buildMsg(it, animate){
           // anything else. The corner button stays the explicit download.
           location.href = '/view?id=' + encodeURIComponent(it.id) + '&ctx=nav';
         };
+      }
+      // A failed upload's card is a retry button: tapping anywhere on it
+      // re-sends the same File under the same cid (no silent retries; the user
+      // decides). Overrides the normal open/preview/navigate tap above.
+      if(it.failed){
+        card.onclick = () => retryUpload(it.id);
       }
       // The app's long-press menu is a PC affordance only (right-click). On
       // the phone the long-press gesture is handed to the browser's native
@@ -1668,13 +1740,27 @@ async function openDefault(it){
 // PC) before the server round-trips. Each carries an id the client GENERATES
 // and sends to the server (?cid= / add-local cid), which adopts it as the row
 // id — so card and row are the SAME identity from pick to graduation and the
-// view needs no name+size matching at all: a local card is hidden the instant
-// an item with its own id appears. That shared identity is also why a card can
-// never be re-derived into a phantom twin when a transfer signal stalls (the
-// old coverage model's failure mode). Failure drops the card; the batch
-// summary toast is the signal. Local cards merge only on their own side.
+// view needs no name+size matching at all.
+// Client-owned cards for transfers THIS end initiated. A remote send
+// {remote:true} is rendered by this end ALONE while it lives here (see
+// withOptimistic): the server's row for its cid is a signal that is kept out of
+// the render set, so one cid yields exactly one card and a stale pending row can
+// never outlive a failed card. Dropped on success so the server row shows, kept
+// as the retry card on failure, kept {hidden:true} on dismiss/stop only long
+// enough to keep filtering a possibly-stale row. Owner drag-in copies are not
+// remote (server row wins there). The server is never told any of this.
 const optUploads = [];
 let cidSeq = 0;
+// One card, one intent. failed/hidden/queued are mutually exclusive BY
+// CONSTRUCTION: every transition goes through here, so no path can ever leave
+// an opt "failed AND hidden" (which intent would that even express?). Readers
+// keep checking the flags directly; this helper is what keeps them exclusive,
+// so intent is stated once instead of being inferred from flag combinations.
+function setOpt(o, s){
+  o.failed = s === 'failed';
+  o.hidden = s === 'hidden';
+  o.queued = s === 'queued';
+}
 // Filename-safe (catalog::valid_client_id mirrors this): [a-z0-9-], 6..48, no
 // leading/trailing dash. Date.now in base36 keeps it unique per pick.
 function newCid(){
@@ -1682,17 +1768,25 @@ function newCid(){
   return 'c-' + Date.now().toString(36) + '-' + (++cidSeq).toString(36) + '-' + rnd;
 }
 function withOptimistic(serverItems){
-  let out = serverItems;
-  if(optUploads.length){
-    const have = new Set(serverItems.map(i => i.id));
-    out = serverItems.slice();
-    for(const o of optUploads){
-      if((o.from === 'owner') !== isOwner) continue;
-      if(have.has(o.id)) continue;   // the server row with this very id exists
-      out.push({ id: o.id, ts: String((o.at / 1000) | 0), from: o.from, kind: 'file',
-        name: o.name, size: o.size, source_kind: 'remote', pending: true, text: '',
-        local: true, queued: !!o.queued });
-    }
+  if(!optUploads.length) return serverItems;
+  // The initiator is the SOLE renderer of its own remote sends. While a cid is
+  // in optUploads, the server's row for it is a SIGNAL only (it drives the
+  // local card's outcome) and is filtered out of the render set — so one cid
+  // yields exactly one card here, and a stale pending row can never outlive a
+  // failed card. Owner drag-in copies are NOT remote: there the server row wins
+  // (it carries the stat'd size and the ring, for which the copy has no local
+  // mirror).
+  const ownRemote = new Set();
+  for(const o of optUploads) if(o.remote) ownRemote.add(o.id);
+  const out = ownRemote.size ? serverItems.filter(i => !ownRemote.has(i.id)) : serverItems.slice();
+  const have = new Set(out.map(i => i.id));
+  for(const o of optUploads){
+    if((o.from === 'owner') !== isOwner) continue;
+    if(o.hidden) continue;                     // dismissed/stopped: no local card
+    if(!o.remote && have.has(o.id)) continue;  // owner copy: server row wins
+    out.push({ id: o.id, ts: String((o.at / 1000) | 0), from: o.from, kind: 'file',
+      name: o.name, size: o.size, source_kind: 'remote', pending: true, text: '',
+      local: true, queued: !!o.queued, failed: !!o.failed });
   }
   return out;
 }
@@ -1746,6 +1840,9 @@ const BTN_FOLDER = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" s
 // The ring's only glyph is the completion check (Chrome's download-chip
 // pattern); cancel is the center ✕ text.
 const GLYPH_DONE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+// Failed-upload corner: a retry glyph (rotate-ccw) on the disc — the visible
+// affordance for re-sending, instead of a (misleading) 100% transfer ring.
+const BTN_RETRY = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>';
 
 // What a card's corner should show right now:
 //   null -> idle (no transfer) — the Download button may show instead
@@ -1768,10 +1865,10 @@ function cornerState(id){
 }
 
 // Sender truth (phone only): handed-to-socket bytes from the in-flight XHR,
-// keyed by name+size so the optimistic card and the server's pending row
-// share one number across the id handoff. No entry (or no computable length)
-// means no local truth — fall back to the card pulse. Never marked done:
-// graduation arrives as the row turning non-pending, which hides the ring.
+// matched to the card by id (the card IS the upload's cid, sender-rendered — see
+// withOptimistic). No entry (or no computable length) means no local truth —
+// fall back to the card pulse. Never marked done: graduation arrives as the row
+// turning non-pending, which drops the local card and shows the server row.
 function senderCornerState(id){
   if(isOwner) return null;
   const it = itemById(id);
@@ -1834,6 +1931,24 @@ function paintCorner(id){
   let st = cornerState(id);
   // A completion that was already flashed is idle now, not a ring to re-show.
   if(st && st.done && doneIds[id]) st = null;
+
+  // Failed upload: the corner is a RETRY affordance (rotate-ccw on the disc),
+  // never a transfer ring — a 100% arc would read as "done". Tapping the disc
+  // (or the card body, see buildMsg) re-sends under the same cid.
+  const itf = itemById(id);
+  if(itf && itf.failed){
+    ring.classList.remove('show', 'done', 'p0', 'canstop');
+    ring.querySelector('.cr-arc').classList.remove('out');
+    ring.onclick = null;   // hidden: drop the stop handler, the disc retries now
+    const rg = ring.querySelector('.cr-glyph');
+    if(rg){ rg.classList.remove('cancel', 'pct'); rg.innerHTML = ''; }
+    card.classList.remove('transferring');
+    btn.classList.remove('hidden');
+    btn.innerHTML = BTN_RETRY;
+    btn.title = '重试发送';
+    btn.onclick = (e) => { e.stopPropagation(); retryUpload(id); };
+    return;
+  }
 
   // Sender-side ring (phone): local XHR truth. Shares the disc, adds the
   // ✕ stop affordance; no completion flash — graduation hides the ring.
@@ -1985,30 +2100,21 @@ function transferClick(it){
   downloadFile(it);
 }
 
-// Sender-side abort: the phone stops its OWN upload. Local abort first (the
-// XHR settles false and finish() drops the optimistic card), then /cancel with the real id so the
-// server's pending row + partial file die at once instead of waiting out the
-// 5s silence timeout. Both ends converge on the next List push: the card
-// vanishes on PC and phone alike — i.e. the failure path, not a delete.
-// A card whose row has not been seen yet: local abort alone, the writer (if it
-// ever lands) dies on the broken socket / timeout.
+// Sender-side abort: the phone stops its OWN in-flight upload. Local abort
+// first (the XHR settles false), then a best-effort /cancel so the server's
+// pending row + partial file die at once instead of waiting out the 5s silence
+// timeout. The local card is tombstoned {hidden:true} — NOT deleted — so a
+// possibly-stale server row for the same cid stays filtered until a fresh list
+// proves it gone/ready (deleting it outright would let the stale row show).
 async function cancelOwnUpload(it){
-  let seen = false;
+  // Tombstone FIRST: abort() settles the attempt on a microtask, and the
+  // failure branch would otherwise flip this entry back to failed.
+  const opt = optUploads.find(o => o.id === it.id);
+  if(opt) setOpt(opt, 'hidden');
   for(const up of [...inFlightUploads]){
-    if(up.id === it.id){
-      seen = seen || up.seen;
-      try { up.ac.abort(); } catch {}
-    }
+    if(up.id === it.id){ try { up.ac.abort(); } catch {} }
   }
-  for(let i = optUploads.length - 1; i >= 0; i--){
-    if(optUploads[i].id === it.id) optUploads.splice(i, 1);
-  }
-  // /cancel only once the server has a row for this very id; before that the
-  // local abort alone is enough (the writer, if it ever lands, dies on the
-  // broken socket / timeout).
-  if(seen){
-    try { await serverFetch('/cancel', { method:'POST', query:{ id: it.id } }); } catch {}
-  }
+  cancelRemote(it.id);
   reapply();
 }
 function checkUploadGone(items){
@@ -2212,13 +2318,13 @@ async function uploadFiles(files){
   // down it (a card still awaiting its turn reads 等待中…, see buildMsg).
   const opts = queue.map(f => {
     const o = { id: newCid(), name: f.name || fallbackName(f), size: f.size || 0,
-      from: isOwner ? 'owner' : 'guest', at: Date.now(), queued: true };
+      from: isOwner ? 'owner' : 'guest', at: Date.now(), queued: true, f, remote: true };
     optUploads.push(o);
     return o;
   });
   reapply();
   let ok = 0;
-  for(let i = 0; i < queue.length; i++) if(await startUpload(queue[i], opts[i])) ok++;
+  for(let i = 0; i < queue.length; i++) if(await serialSend(() => startUpload(queue[i], opts[i]))) ok++;
   reapply();
   // Failure-only toasts: the new card in the timeline IS the success
   // confirmation (plus the ring closing). A toast only when something
@@ -2231,14 +2337,79 @@ function fallbackName(f){
   const m = /^image\/([a-z0-9]+)/i.exec(f.type || '');
   return 'pasted-image.' + (m ? m[1].toLowerCase() : 'bin');
 }
+// Manual-retry upload: ONE attempt per call. On failure the card is KEPT and
+// marked failed, so the user sees the failure and taps to re-send — no silent
+// retry loop that then deletes the card. The failed state is purely client-side
+// (the server keeps only its file list); the server's row for this cid is a
+// signal that withOptimistic keeps out of the render set while the cid is local.
 async function startUpload(f, opt){
-  // The card was painted by uploadFiles with its whole batch, already wearing
-  // the id the server adopts as its row id — see withOptimistic. `opt` is that
-  // very entry: its turn has come, so drop the queued caption; the ring below
-  // owns the card from here.
+  // Already resolved while this send waited its turn (its server row turned
+  // ready via a fresh list): nothing left to do, and no second POST.
+  if(!optUploads.includes(opt)) return true;
   const cid = opt.id;
-  opt.queued = false;
+  setOpt(opt, 'sending');
+  opt.retrying = true;
   reapply();
+  const ok = await tryUploadOnce(f, opt, cid);
+  opt.retrying = false;
+  if(ok){ dropOptCard(cid); return true; }
+  // The user stopped/dismissed while this attempt was dying: stay gone.
+  if(opt.hidden) return false;
+  setOpt(opt, 'failed');       // keep the card; the user decides whether to retry
+  cancelRemote(cid);           // free the cid so an immediate retry can re-POST
+  reapply();
+  return false;
+}
+
+// Best-effort server-side teardown of a cid's pending row: frees the id for an
+// immediate same-cid retry and removes the row from every other end. Only ever
+// touches a PENDING row, so a file that actually graduated is never destroyed;
+// offline or before the row exists it fails silently, and the server's own 5s
+// stall reaps the row regardless.
+function cancelRemote(cid){
+  serverFetch('/cancel', { method:'POST', query:{ id: cid } }).catch(() => {});
+}
+
+// One remote send at a time: a LAN link is saturated by a single stream, so a
+// retry must not run concurrently with a batch (they would split the pipe and
+// risk the server's 5s silence kill). Every remote send funnels through this
+// chain, so pick-N-then-retry stays serial.
+let sendTail = Promise.resolve();
+function serialSend(task){
+  const run = sendTail.then(task, task);
+  sendTail = run.then(() => {}, () => {});
+  return run;
+}
+
+// A tap on a failed card re-sends the SAME File under the same cid, queued
+// behind any in-flight send (the card shows 等待中… until its turn). The id is
+// idempotent: a first attempt that actually graduated answers the server's
+// duplicate-cid 409, which the attempt then recognizes as success — so a retry
+// can never land a twin file.
+function retryUpload(cid){
+  const opt = optUploads.find(o => o.id === cid);
+  if(!opt || opt.retrying) return;
+  setOpt(opt, 'queued');
+  opt.retrying = true;         // guard a second tap before the queued task runs
+  reapply();
+  serialSend(() => startUpload(opt.f, opt)).catch(() => {});
+}
+
+// Client-only dismiss: hide the card (tombstone, NOT delete) and keep filtering
+// its (possibly stale) server pending row until a fresh list proves it
+// gone/ready. The best-effort /cancel only speeds the row's own reaping — no
+// server dependency.
+function dismissUpload(cid){
+  const opt = optUploads.find(o => o.id === cid);
+  if(opt && opt.retrying) return;   // mid-retry: let it settle first
+  if(opt) setOpt(opt, 'hidden');
+  cancelRemote(cid);
+  reapply();
+}
+async function tryUploadOnce(f, opt, cid){
+  // Attempt body of the old startUpload: the card was painted by uploadFiles
+  // with its whole batch, already wearing the id the server adopts as its row
+  // id — see withOptimistic. The ring below owns the card from here.
   // Multipart body — do NOT switch this to a raw `xhr.send(File)` body. On
   // iOS WebKit (Safari AND Chrome) a large raw upload's 200 response can be
   // delivered and TCP-acked yet the XHR never reaches DONE, so onload never
@@ -2261,13 +2432,12 @@ async function startUpload(f, opt){
     via: '', httpStatus: 0, respDone: false, lateLogged: false };
   inFlightUploads.push(up);
   const upT0 = Date.now();
-  // Success and failure both drop the local card: success because the server
-  // row with this same id now exists (the view already hides the local one),
-  // failure into the batch summary toast.
-  const finish = (ok) => {
+  // Per-attempt cleanup: drop this attempt's in-flight entry. The optimistic
+  // card (opt) stays — the caller keeps it as a failed card for a manual retry,
+  // or drops it on success.
+  const finishAttempt = (ok) => {
     const i = inFlightUploads.indexOf(up);
     if(i >= 0) inFlightUploads.splice(i, 1);
-    for(let j = optUploads.length - 1; j >= 0; j--) if(optUploads[j].id === cid) optUploads.splice(j, 1);
     // Client diagnostics — transfers used to leave NO client-side trace at
     // all, so a failure was a silent hole with nothing to debug from. One
     // line per notable upload. `via` names what decided the outcome; `resp=no`
@@ -2301,8 +2471,7 @@ async function startUpload(f, opt){
   // its own silence — nothing recoverable is still alive over there, and 3s
   // of margin covers the 1s monitor tick plus retransmit jitter; an elevator
   // ride longer than this re-sends on return.
-  let responseTimedOut = false;
-  const ok = await new Promise((resolve) => {
+  let ok = await new Promise((resolve) => {
     let done = false;
     let idleT = 0, respT = 0;
     const settle = (v, via) => { if(!done){ done = true; if(!up.via) up.via = via || '?'; clearTimeout(idleT); clearTimeout(respT); resolve(v); } };
@@ -2330,8 +2499,7 @@ async function startUpload(f, opt){
     armIdle();
     // Sender truth for this end's ring: handed-to-socket bytes. Throttled —
     // progress fires per chunk, painting every tick would churn the DOM.
-    // Keyed by name+size in senderCornerState, so the optimistic card and
-    // the server's pending row share one number across the id handoff.
+    // Matched to the card by id in senderCornerState (same cid).
     xhr.upload.onprogress = (e) => {
       armIdle();
       if(e.lengthComputable){
@@ -2350,7 +2518,6 @@ async function startUpload(f, opt){
       // arrived", not a normal-path failure. Graduation normally wins first.
       respT = setTimeout(() => {
         if(up.graduated){ settle(true, 'sse-graduated'); return; }
-        responseTimedOut = true;
         failAndAbort('resp-timeout');
       }, 15000);
     };
@@ -2379,14 +2546,45 @@ async function startUpload(f, opt){
     xhr.open('POST', '/upload' + qs({ size: f.size || 0, cid }));
     try { xhr.send(fd); } catch(e) { settle(false, 'send-threw'); }
   });
+  // 409 only proves a row with this cid EXISTS — it may still be pending (a
+  // previous attempt's bytes complete, graduation in flight) or already gone.
+  // Verify via /list: ready => success; gone or still-pending => leave it
+  // failed, so the card stays for a manual retry (a gone row means the cid is
+  // free for a clean re-POST; a pending one times out server-side, after which
+  // the retry re-POSTs clean). Size comparison would prove nothing: the pending
+  // row's size is the same ?size= claim this phone sent, not received bytes —
+  // pending vs ready is the server's own verdict, so trust that instead.
+  if(!ok && up.httpStatus === 409){
+    try {
+      // Graduation (rename + row flip) is fast, so a few short polls are
+      // enough; each poll is bounded — an unreachable server breaks out on
+      // the first timeout instead of wedging this attempt for minutes.
+      for(let i = 0; i < 6; i++){
+        let items;
+        try { items = await fetchListBounded(4000); }
+        catch(e){ break; }
+        applyList(items);
+        const row = items.find(x => x.id === cid);
+        if(!row) break;              // row gone: cid free, a retry re-POSTs clean
+        if(!row.pending){ ok = true; break; }
+        await new Promise(res => setTimeout(res, 500));
+      }
+    } catch {}
+  }
   // Failure is judged here, all causes alike — network death, idle-timeout
-  // abort, self-abort, HTTP error statuses. finish() drops the card.
-  finish(ok);
-  // The request body may have reached disk even though its final HTTP response
-  // was lost. Do one non-blocking list/status pass in that ambiguous case;
-  // normal failures keep their existing behavior and cause no extra request.
-  if(!ok && responseTimedOut) reconcile();
+  // abort, self-abort, HTTP error statuses. Drops only this attempt's in-flight
+  // entry; the optimistic card stays (marked failed by the caller) for a
+  // manual retry.
+  finishAttempt(ok);
   return ok;
+}
+
+// Drop the optimistic card on success (the server row with this same id now
+// exists). On failure the card is NOT dropped — the caller keeps it, marked
+// failed, as the manual-retry affordance.
+function dropOptCard(cid){
+  for(let j = optUploads.length - 1; j >= 0; j--) if(optUploads[j].id === cid) optUploads.splice(j, 1);
+  reapply();
 }
 
 $('txt').addEventListener('input', () => { autoSize(); updateSendBtn(); });
