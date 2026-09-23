@@ -1390,6 +1390,9 @@ function buildMsg(it, animate){
           ? '/poster?id=' + encodeURIComponent(it.id) + '&ctx=card'
           : '/view?id=' + encodeURIComponent(it.id) + '&ctx=card';
         img.alt = it.name;
+        // Same full-name tooltip as .fc-name: the preview is the card's
+        // largest hover target and otherwise shows nothing on dwell.
+        img.title = it.name;
         img.loading = 'lazy';
         // Preview opens from the media element ITSELF on both ends. The card
         // surface stays dead for media, so a long-press that lands on the
@@ -1412,7 +1415,12 @@ function buildMsg(it, animate){
       const info = document.createElement('div');
       info.className = 'fc-info';
       info.innerHTML = '<div class="fc-name"></div><div class="fc-size"></div>';
-      info.querySelector('.fc-name').textContent = it.name;
+      const nmEl = info.querySelector('.fc-name');
+      nmEl.textContent = it.name;
+      // Truncated at 170px (ellipsis): the native tooltip carries the full
+      // name on PC hover. Always set — measuring truncation per card is not
+      // worth it, and phones (no hover) ignore it.
+      nmEl.title = it.name;
       info.querySelector('.fc-size').textContent = fmtSize(it.size) + mediaSuffix(it);
       if(it.pending){
         // Caption by WHAT IS MOVING, not by sender alone: a pending
@@ -1957,11 +1965,13 @@ function repaintTransfers(){
 // browser's business (its own UI shows progress and cancel), and a second tap
 // simply starts another download. The PC's counterpart is revealing the
 // file's folder.
-// 0-byte files have nothing to pull: the browser's download manager never
-// settles on an empty body, so refuse loudly instead of firing into a stuck
-// spinner. (A fetch-and-confirm path was tried and reverted: it needed a
-// second dl_lock() inside serve()'s prog-block scope, which self-deadlocked
-// the non-reentrant ledger mutex and hung every later transfer.)
+// [EMPTY-FILE/refuse] 0-byte pulls never fire: toast, no request. No browser
+// settles them — measured 2026-09-23, iPhone (UA iOS 18_7 / Safari 26.6.1):
+// Safari's iframe /dl spins forever (ledger: `download start ... [0-0]/0
+// (empty file)` with no outcome, the counted stream never fires); tapping
+// preview on an empty docx dies in the OS importer (OfficeImportErrorDomain
+// 912 — Chrome reaches it AFTER a successful 0 KB download, so completing
+// the bytes is not enough).
 function isEmptyFile(it){ return it && it.kind === 'file' && !it.pending && (it.size|0) === 0; }
 
 function transferClick(it){
