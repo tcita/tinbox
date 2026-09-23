@@ -2673,12 +2673,18 @@ $('stChange').onclick = async () => {
     dir = (await r.json()).path;
   } catch { failToast('打开选择器失败'); return; }
   if(!dir) return;
+  const before = $('stPath').textContent;
   try {
     const r = await serverFetch('/settings/inbox-dir', { method:'POST', body:{ path: dir } });
     if(!r.ok){ failToast(await r.text() || '保存失败'); return; }
     const s = await r.json();
     $('stPath').textContent = s.inbox_dir;
-    toast('收件箱位置已更换，重启后生效');
+    // Re-picking the same location is a no-op (the backend also avoids
+    // re-nesting inbox/inbox): don't claim anything changed.
+    if(s.inbox_dir && before && s.inbox_dir.toLowerCase() === before.toLowerCase())
+      toast('收件箱位置与之前相同');
+    else
+      toast('收件箱位置已更换，重启后生效');
   } catch { failToast('保存失败'); }
 };
 $('clearConfirm').onclick = async () => {
