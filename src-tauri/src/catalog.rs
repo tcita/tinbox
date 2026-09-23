@@ -586,17 +586,15 @@ fn dedupe_against(proposed: &str, taken: &std::collections::HashSet<String>) -> 
     if !taken.contains(&proposed.to_lowercase()) {
         return proposed.to_string();
     }
-    let (stem, ext) = match proposed.rfind('.') {
-        Some(i) if i > 0 => (&proposed[..i], &proposed[i..]),
-        _ => (proposed, ""),
-    };
-    let mut n = 1u32;
+    // Bump the existing suffix instead of appending a second one: an uploaded
+    // `demo (1).txt` (e.g. a browser-redownloaded copy) must become
+    // `demo (2).txt`, not `demo (1) (1).txt`. Same bump chain as graduation.
+    let mut candidate = proposed.to_string();
     loop {
-        let cand = format!("{stem} ({n}){ext}");
-        if !taken.contains(&cand.to_lowercase()) {
-            return cand;
+        candidate = bump_display(&candidate);
+        if !taken.contains(&candidate.to_lowercase()) {
+            return candidate;
         }
-        n += 1;
     }
 }
 
@@ -950,6 +948,8 @@ mod tests {
         assert_eq!(dedupe_against("DEMO.txt", &taken), "DEMO (2).txt");
         assert_eq!(dedupe_against("README", &taken), "README (1)");
         assert_eq!(dedupe_against("archive.tar.gz", &taken), "archive.tar.gz");
+        // Already-suffixed upload (browser-redownloaded copy) bumps, never stacks.
+        assert_eq!(dedupe_against("demo (1).txt", &taken), "demo (2).txt");
     }
 
     #[test]

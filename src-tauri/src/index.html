@@ -1461,16 +1461,19 @@ function buildMsg(it, animate){
       if(isImg || isVid){
         card.onclick = () => {
           if(it.pending) return;                          // still uploading
+          if(isEmptyFile(it)){ toast('空文件，无法打开'); return; }
           openPreview(it);
         };
       } else if(isOwner){
         card.onclick = () => {
           if(it.pending) return;                          // still uploading
+          if(isEmptyFile(it)){ toast('空文件，无法打开'); return; }
           openDefault(it);
         };
       } else {
         card.onclick = () => {
           if(it.pending) return;                          // still uploading
+          if(isEmptyFile(it)){ toast('空文件，无法打开'); return; }
           // Phone tap = "show it", exactly like tapping a file link on an
           // ordinary webpage: the browser decides — its inline viewer for
           // PDF/text, its own download flow (with its own progress UI) for
@@ -1954,8 +1957,16 @@ function repaintTransfers(){
 // browser's business (its own UI shows progress and cancel), and a second tap
 // simply starts another download. The PC's counterpart is revealing the
 // file's folder.
+// 0-byte files have nothing to pull: the browser's download manager never
+// settles on an empty body, so refuse loudly instead of firing into a stuck
+// spinner. (A fetch-and-confirm path was tried and reverted: it needed a
+// second dl_lock() inside serve()'s prog-block scope, which self-deadlocked
+// the non-reentrant ledger mutex and hung every later transfer.)
+function isEmptyFile(it){ return it && it.kind === 'file' && !it.pending && (it.size|0) === 0; }
+
 function transferClick(it){
   if(it.pending) return;                 // still uploading, nothing to act on
+  if(isEmptyFile(it)){ toast('空文件，无法下载'); return; }
   if(isOwner){ revealItem(it); return; }
   downloadFile(it);
 }

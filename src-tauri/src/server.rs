@@ -224,11 +224,10 @@ async fn bind_any() -> std::io::Result<(tokio::net::TcpListener, u16)> {
 async fn bind_listener(port: u16) -> std::io::Result<tokio::net::TcpListener> {
     let socket = tokio::net::TcpSocket::new_v4()?;
     socket.set_reuseaddr(true)?;
-    // Windows' default SO_SNDBUF is ~64 KB, which caps one LAN stream at
-    // buffer/RTT (64 KB / 5 ms ~ 12 MB/s, far less on congested WiFi), and the
-    // parallel chunks each inherit that ceiling. A large send buffer lets the
-    // server keep the pipe full; accepted sockets inherit SO_SNDBUF on Windows.
-    socket.set_send_buffer_size(4 * 1024 * 1024)?;
+    // No manual SO_SNDBUF: A/B-tested 2026-09-23 (1 GiB file, same spot):
+    // 64 KB default = 75.5/73.5 MB/s, 4 MB = 67.4/61.6 MB/s. The old
+    // "64K caps LAN at ~12 MB/s" claim was a far-WiFi misattribution; the OS
+    // default + autotuning already saturates the link, so leave it alone.
     socket.bind(std::net::SocketAddr::from(([0, 0, 0, 0], port)))?;
     socket.listen(1024)
 }

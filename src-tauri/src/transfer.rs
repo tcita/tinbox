@@ -815,7 +815,14 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
             e.start_ms = now_ms();
             touch_entry(e);
         }
-        logf(&format!("download start {id}: {name} [{start}-{end}]/{len}"));
+        logf(&format!("download start {id}: {name} [{start}-{end}]/{len}{}", if len == 0 { " (empty file)" } else { "" }));
+        // NOTE: no ledger teardown here. The prog-block guard above still lives
+        // until the end of this `if let` (named bindings drop at scope end, not
+        // last use) — a second dl_lock() on this thread would self-deadlock a
+        // non-reentrant std Mutex and wedge EVERY later transfer (seen
+        // 2026-09-23: all /dl hung after one empty pull). Empty pulls are
+        // refused client-side; if that ever changes, scope the first guard in
+        // braces before locking again.
     }
     // Take() caps the read at the range end so a partial response carries
     // exactly end-start+1 bytes, not the rest of the file. 1 MiB read buffer:
