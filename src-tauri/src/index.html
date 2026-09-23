@@ -1407,9 +1407,13 @@ function buildMsg(it, animate){
         const ico = document.createElement('div');
         ico.className = 'fc-ico';
         ico.textContent = '🎬';
+        ico.title = it.name;
         card.appendChild(ico);
       } else {
         card.innerHTML = `<div class="fc-ico">${iconFor(it.name)}</div>`;
+        // innerHTML first, title via property (a raw attribute would break on
+        // quotes in the name).
+        card.querySelector('.fc-ico').title = it.name;
       }
 
       const info = document.createElement('div');
