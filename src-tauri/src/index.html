@@ -508,18 +508,18 @@
      reads on green (var(--danger) would be ~1.9:1 there). */
   .file-card.failed { animation: none; opacity: 1; }
   .file-card.failed .fc-size { color: #6b0f0a; opacity: 1; font-weight: 600; }
-  /* Secondary, client-only dismiss for a failed card (the primary action is
-     tap-to-retry). Quiet by default so retry leads; it never touches the
-     server. */
-  .retry-ignore {
-    display: inline-block; margin-top: 7px; padding: 3px 11px;
-    border: 1px solid var(--line-strong); border-radius: 8px;
-    background: var(--card); color: var(--sub);
-    font: 600 11px inherit; line-height: 1.5; cursor: pointer;
-    transition: color .15s ease, border-color .15s ease;
+  /* Secondary, client-only dismiss for a failed card: a quiet footer link in
+     the message meta line, so the card itself stays a clean 40px row. Padding
+     plus a matching negative margin widen the tap target without growing the
+     footer line. It never touches the server. */
+  .meta-ignore {
+    border: 0; background: transparent; padding: 4px 5px; margin: -4px 0;
+    font: inherit; color: var(--sub); cursor: pointer;
+    text-decoration: underline; text-underline-offset: 2px;
+    transition: color .15s ease;
   }
-  .retry-ignore:hover { color: var(--text); border-color: var(--accent); }
-  .retry-ignore:active { transform: scale(0.96); }
+  .meta-ignore:hover { color: var(--text); }
+  .meta-ignore:active { opacity: .6; }
 
   /* Fullscreen media preview (both ends, image/video) */
   .media-ov {
@@ -1483,17 +1483,10 @@ function buildMsg(it, animate){
       if(it.failed){
         // Kept on screen after a failed attempt so the user can re-send: the
         // card body and the corner retry disc both re-send under the same cid.
-        // The inline "忽略" drops the card — CLIENT-ONLY, so the server is never
-        // touched (it never knew about this retry card anyway; a leftover
-        // pending row times out on its own).
+        // The secondary "忽略" does NOT live on the card — it crowded the
+        // compact row (and forced the card taller, which pushed the corner disc
+        // off-center). It rides the message footer instead (see meta-line).
         info.querySelector('.fc-size').textContent += ' · 发送失败，点击重试';
-        const ignore = document.createElement('button');
-        ignore.type = 'button';
-        ignore.className = 'retry-ignore';
-        ignore.textContent = '忽略';
-        ignore.title = '不再重试';
-        ignore.onclick = (e) => { e.stopPropagation(); dismissUpload(it.id); };
-        info.appendChild(ignore);
       } else if(it.pending){
         // Caption by WHAT IS MOVING, not by sender alone: a pending
         // from="guest" row is bytes crossing Wi-Fi (发送 on the guest end, 接收
@@ -1579,6 +1572,19 @@ function buildMsg(it, animate){
     const meta = document.createElement('div');
     meta.className = 'meta-line';
     meta.textContent = fmtTime(it.ts);
+    if(it.failed){
+      // Secondary, client-only dismiss, kept OFF the card (the card stays a
+      // clean 40px row with the retry disc in its corner): a quiet footer link,
+      // right-aligned under the bubble. No server call — the server never knew
+      // about this retry card; any leftover pending row times out on its own.
+      const ig = document.createElement('button');
+      ig.type = 'button';
+      ig.className = 'meta-ignore';
+      ig.textContent = '忽略';
+      ig.title = '不再重试';
+      ig.onclick = (e) => { e.stopPropagation(); dismissUpload(it.id); };
+      meta.appendChild(ig);
+    }
 
     bWrap.appendChild(bubble);
     bWrap.appendChild(meta);
