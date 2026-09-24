@@ -3,7 +3,6 @@
 // for the access log.
 
 use crate::logger::{loge, logf};
-use crate::presence::now_mono;
 use axum::{
     http::{header, StatusCode},
     response::IntoResponse,
@@ -42,10 +41,10 @@ pub(crate) fn note_foreign_subnet(peer: &SocketAddr) {
 
 /// Cached QR PNG for the last URL the monitor rendered. Opening the lightbox
 /// used to go blank for seconds after a network switch: the handler computed
-/// current_url() inline, and the first collect_ips() past a switch re-queries
-/// adapters through PowerShell once the 30s facts cache expired. The monitor
-/// now renders the PNG when it sees the URL change (see
-/// presence::monitor_loop), so that open is an in-memory copy.
+/// current_url() inline, and the first collect_ips() past a switch paid a
+/// full adapter enumeration. The monitor now renders the PNG when it sees
+/// the URL change (see presence::monitor_loop), so that open is an
+/// in-memory copy.
 static QR_CACHE: OnceLock<Mutex<(String, Vec<u8>)>> = OnceLock::new();
 
 fn qr_cache() -> &'static Mutex<(String, Vec<u8>)> {
@@ -163,30 +162,29 @@ pub(crate) fn collect_ips() -> Vec<String> {
     // adapters that are actually connected are considered (see
     // local_private_v4): this is what stops a disconnected Wi-Fi adapter's
     // stale DHCP address from keeping the QR alive.
-    let mut cands: Vec<(String, Ipv4Addr)> = Vec::new();
-    for (name, v4) in local_private_v4() {
-        if !cands.iter().any(|(_, v)| *v == v4) {
-            cands.push((name, v4));
+    // The (desc, wireless) metadata rides the same GetAdaptersAddresses pass,
+    // so it is fresh every call (~1/s) with no cache and no powershell.
+    let mut cands: Vec<(String, Ipv4Addr, String, bool)> = Vec::new();
+    for (name, v4, desc, wireless) in local_private_v4() {
+        if !cands.iter().any(|(_, v, _, _)| *v == v4) {
+            cands.push((name, v4, desc, wireless));
         }
     }
     if cands.is_empty() {
         return vec![];
     }
 
-    let facts = adapter_facts();
-
-    // Filter 1: known virtual adapters out. Name matching always applies even
-    // when facts are missing; description matching adds the adapter's type.
-    let mut real: Vec<(String, Ipv4Addr)> = Vec::new();
+    // Filter 1: known virtual adapters out. Name matching always applies;
+    // description matching adds the adapter's type.
+    let mut real: Vec<(String, Ipv4Addr, String, bool)> = Vec::new();
     let mut dropped_virtual: Vec<String> = Vec::new();
     let mut virtual_ips: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::new();
-    for (name, v4) in &cands {
-        let desc = facts.get(name).map(|f| f.desc.as_str()).unwrap_or("");
+    for (name, v4, desc, _wireless) in &cands {
         if virtual_adapter(name) || virtual_adapter(desc) {
             dropped_virtual.push(format!("{name} {v4}"));
             virtual_ips.insert(*v4);
         } else {
-            real.push((name.clone(), *v4));
+            real.push((name.clone(), *v4, desc.clone(), *_wireless));
         }
     }
 
@@ -240,8 +238,8 @@ pub(crate) fn collect_ips() -> Vec<String> {
     }
     let mut cands: Vec<Cand> = real
         .into_iter()
-        .map(|(name, v4)| Cand {
-            wireless: facts.get(&name).map(|f| f.wireless).unwrap_or(false),
+        .map(|(name, v4, _desc, wireless)| Cand {
+            wireless,
             name,
             v4,
         })
@@ -306,7 +304,11 @@ fn virtual_adapter(s: &str) -> bool {
 /// still rides the adapter struct) reads as a live LAN address. tinbox would
 /// then keep advertising a QR for a network that is gone, and the monitor sees
 /// no change so it never logs `network changed`. See `connected_private_v4`.
-fn local_private_v4() -> Vec<(String, Ipv4Addr)> {
+///
+/// Returns (name, ip, desc, wireless): the metadata rides the same
+/// GetAdaptersAddresses pass, so it is fresh every call (~1/s) with no cache
+/// and no powershell.
+fn local_private_v4() -> Vec<(String, Ipv4Addr, String, bool)> {
     #[cfg(windows)]
     if let Some(v) = connected_private_v4() {
         return v;
@@ -316,7 +318,10 @@ fn local_private_v4() -> Vec<(String, Ipv4Addr)> {
             ifaces
                 .into_iter()
                 .filter_map(|(name, ip)| match ip {
-                    IpAddr::V4(v4) if is_private(v4) => Some((name, v4)),
+                    IpAddr::V4(v4) if is_private(v4) => {
+                        let wireless = wireless_by_keywords(&name, "");
+                        Some((name, v4, String::new(), wireless))
+                    }
                     _ => None,
                 })
                 .collect()
@@ -324,12 +329,29 @@ fn local_private_v4() -> Vec<(String, Ipv4Addr)> {
         .unwrap_or_default()
 }
 
+/// IANA IF_TYPE for 802.11 wireless (matches Get-NetAdapter PhysicalMediaType
+/// 802.11/Wireless that the old powershell query read).
+#[cfg(windows)]
+const IF_TYPE_IEEE80211: u32 = 71;
+
+/// Keyword fallback for wireless detection: the old `Get-NetAdapter` query
+/// matched `"desc name" -match 'Wi-?Fi|WLAN|Wireless|802\.11'`. Kept so a
+/// wireless NIC whose IfType is not 71 still sorts first.
+fn wireless_by_keywords(name: &str, desc: &str) -> bool {
+    let l = format!("{desc} {name}").to_lowercase();
+    l.contains("wifi")
+        || l.contains("wi-fi")
+        || l.contains("wlan")
+        || l.contains("wireless")
+        || l.contains("802.11")
+}
+
 /// Enumerate private IPv4 addresses but keep ONLY adapters whose `OperStatus`
 /// is Up, so a disconnected interface (stale DHCP address, cable/Wi-Fi down)
 /// cannot masquerade as a reachable LAN. Returns `None` on any API failure so
 /// `local_private_v4` can fall back to the crate.
 #[cfg(windows)]
-fn connected_private_v4() -> Option<Vec<(String, Ipv4Addr)>> {
+fn connected_private_v4() -> Option<Vec<(String, Ipv4Addr, String, bool)>> {
     use windows::Win32::NetworkManagement::IpHelper::{
         GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH, GAA_FLAG_SKIP_ANYCAST,
         GAA_FLAG_SKIP_MULTICAST, GET_ADAPTERS_ADDRESSES_FLAGS,
@@ -360,13 +382,20 @@ fn connected_private_v4() -> Option<Vec<(String, Ipv4Addr)>> {
             _ => return None,
         }
     }
-    let mut out: Vec<(String, Ipv4Addr)> = Vec::new();
+    let mut out: Vec<(String, Ipv4Addr, String, bool)> = Vec::new();
     unsafe {
         let mut adapter = buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
         while !adapter.is_null() {
             let a = &*adapter;
             if a.OperStatus == IfOperStatusUp && a.FriendlyName.0 != std::ptr::null_mut() {
                 let name = pwstr_to_string(a.FriendlyName);
+                let desc = if a.Description.0 != std::ptr::null_mut() {
+                    pwstr_to_string(a.Description)
+                } else {
+                    String::new()
+                };
+                let wireless = a.IfType == IF_TYPE_IEEE80211
+                    || wireless_by_keywords(&name, &desc);
                 let mut u = a.FirstUnicastAddress;
                 while !u.is_null() {
                     let ua = &*u;
@@ -374,8 +403,10 @@ fn connected_private_v4() -> Option<Vec<(String, Ipv4Addr)>> {
                     if !sa.is_null() && (*sa).sa_family == AF_INET {
                         let sin = &*sa.cast::<SOCKADDR_IN>();
                         let v4 = Ipv4Addr::from(sin.sin_addr.S_un.S_addr.to_ne_bytes());
-                        if is_private(v4) && !out.iter().any(|(_, v): &(String, Ipv4Addr)| *v == v4) {
-                            out.push((name.clone(), v4));
+                        if is_private(v4)
+                            && !out.iter().any(|(_, v, _, _)| *v == v4)
+                        {
+                            out.push((name.clone(), v4, desc.clone(), wireless));
                         }
                     }
                     u = ua.Next;
@@ -397,76 +428,7 @@ unsafe fn pwstr_to_string(p: windows::core::PWSTR) -> String {
     String::from_utf16_lossy(std::slice::from_raw_parts(p.0, len))
 }
 
-/// Adapter metadata used for filtering and for ordering the QR candidates.
-/// Gathered by one powershell call, cached 30s — collect_ips runs ~1/s (the
-/// monitor's URL sample), so the query must not spawn a process each time.
-#[derive(Clone, Default)]
-struct AdapterFact {
-    /// InterfaceDescription ("Intel(R) Wi-Fi 6 AX201 …"); the virtual-adapter
-    /// keyword filter reads it.
-    desc: String,
-    /// 802.11/Wi-Fi family — see the ordering in collect_ips (the app tells
-    /// users "同一 Wi-Fi", so the wireless interface wins).
-    wireless: bool,
-}
-
-type AdapterFacts = std::collections::HashMap<String, AdapterFact>;
-
-static ADAPTER_FACTS: OnceLock<Mutex<(u64, AdapterFacts)>> = OnceLock::new();
 static LAST_DECISION: Mutex<String> = Mutex::new(String::new());
-
-fn adapter_facts() -> AdapterFacts {
-    let cache = ADAPTER_FACTS.get_or_init(|| Mutex::new((0, Default::default())));
-    let mut g = cache.lock().unwrap_or_else(|e| e.into_inner());
-    let now = now_mono();
-    // g.0 == 0 is now_mono()'s "never cached" sentinel, NOT a fresh stamp:
-    // now_mono() starts at 1, so a naive `now - g.0 < 30` treats a cold process
-    // as "cached 1s ago" and serves the EMPTY initial table for the first ~30s
-    // — every adapter then reads as wired, so the wireless-first ordering
-    // silently doesn't apply at startup. Require a real prior stamp.
-    if g.0 != 0 && now.saturating_sub(g.0) < 30 {
-        return g.1.clone();
-    }
-    let facts = gather_adapter_facts();
-    if !facts.is_empty() {
-        g.0 = now;
-        g.1 = facts.clone();
-    }
-    facts
-}
-
-/// One read-only powershell query: for every Up adapter, its name, description
-/// and wireless flag. One line per adapter; the map is keyed by name.
-#[cfg(windows)]
-fn gather_adapter_facts() -> AdapterFacts {
-    let ps = r#"Get-NetAdapter | Where-Object Status -eq 'Up' | ForEach-Object {
-  $n = $_.Name; $d = $_.InterfaceDescription
-  $w = if (("$d $n" -match 'Wi-?Fi|WLAN|Wireless|802\.11') -or ($_.PhysicalMediaType -match '802\.11|Wireless')) { '1' } else { '0' }
-  "{0}`t{1}`t{2}" -f $n, $d, $w
-}"#;
-    let mut map = AdapterFacts::new();
-    if let Some((true, out)) = crate::firewall::run_ps(ps) {
-        for line in out.lines() {
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() != 3 {
-                continue;
-            }
-            map.insert(
-                parts[0].trim().to_string(),
-                AdapterFact {
-                    desc: parts[1].trim().to_string(),
-                    wireless: parts[2].trim() == "1",
-                },
-            );
-        }
-    }
-    map
-}
-
-#[cfg(not(windows))]
-fn gather_adapter_facts() -> AdapterFacts {
-    AdapterFacts::new()
-}
 
 #[cfg(test)]
 mod tests {
@@ -510,6 +472,19 @@ mod tests {
         // Ties break on the name: deterministic, implying no preference.
         assert!(cand_key(false, "Alpha") < cand_key(false, "Beta"));
         assert_eq!(cand_key(true, "WLAN"), cand_key(true, "WLAN"));
+    }
+
+    #[test]
+    fn wireless_keywords_match_old_ps_query() {
+        // Old Get-NetAdapter query: "desc name" -match 'Wi-?Fi|WLAN|Wireless|802.11'.
+        assert!(wireless_by_keywords("WLAN", ""));
+        assert!(wireless_by_keywords("Wi-Fi", ""));
+        assert!(wireless_by_keywords("Ethernet", "Intel(R) Wi-Fi 6 AX201"));
+        assert!(wireless_by_keywords("Ethernet", "802.11n USB Wireless LAN Card"));
+        assert!(!wireless_by_keywords(
+            "Ethernet",
+            "Realtek PCIe GbE Family Controller"
+        ));
     }
 }
 

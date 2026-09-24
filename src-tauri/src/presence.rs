@@ -172,8 +172,8 @@ pub(crate) async fn monitor_loop() {
         // phone already scanned. The server cannot reach a phone now on another
         // network, so the only useful signal is to the PC: re-push `info` with
         // the new url so the page can flag its connect button and tell the user
-        // to rescan. Sampled every tick: once warm, refresh_url() is just the
-        // adapter enumeration (the PowerShell adapter query is cached 30s),
+        // to rescan. Sampled every tick: refresh_url() is just one native
+        // GetAdaptersAddresses pass (IP + desc + wireless together),
         // and the 1s beat is the difference between
         // "the new QR is already rendered when you open it" and "you opened it
         // into a blank box".

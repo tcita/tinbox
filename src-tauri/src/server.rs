@@ -844,8 +844,8 @@ fn push_event_to_sse(ev: PushEvent) -> Event {
 /// up): the URL degrades to 127.0.0.1, which no phone can reach, so the UI must
 /// say so and hide the QR rather than offer a code that scans to nothing.
 /// Request paths (`/qr`, the `info` replay on connect) read this snapshot; only
-/// the monitor recomputes, so a handler never pays collect_ips()'s PowerShell
-/// adapter query — the reason /qr went blank for seconds right after a
+/// the monitor recomputes, so a handler never pays collect_ips()'s adapter
+/// enumeration — the reason /qr went blank for seconds right after a
 /// network switch.
 static URL_SNAP: OnceLock<Mutex<(String, bool)>> = OnceLock::new();
 
@@ -854,8 +854,7 @@ fn url_snap() -> &'static Mutex<(String, bool)> {
 }
 
 /// Recompute the pairing URL (best LAN IP + bound port + token) and store it
-/// with its usability. Expensive — collect_ips() enumerates adapters and
-/// re-queries them through PowerShell once the 30s facts cache expired. Only
+/// with its usability. One native GetAdaptersAddresses pass — only
 /// the monitor may call this on a schedule; everything else reads `current_url()`.
 pub(crate) fn refresh_url() -> String {
     let ip = collect_ips().first().cloned();
