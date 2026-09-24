@@ -146,10 +146,16 @@ pub fn load() {
 /// Safety first: the persisted directory becomes a landing zone that
 /// reconcile() adopts wholesale (every file becomes an entry, and /rm really
 /// deletes files) — so the chosen location is NEVER used directly. The
-/// effective inbox is always an `inbox` child inside it, meaning picking
+/// effective inbox is ALWAYS an `inbox` child inside it, meaning picking
 /// Desktop (or any lived-in folder, or even a drive root) cannot swallow the
-/// user's own files. A directory already named `inbox` is used as-is, so
-/// re-picking the current location never nests `inbox/inbox`.
+/// user's own files. The child is created here and is always fresh: if
+/// `base/inbox` already exists and is not the current effective path, the pick
+/// is rejected rather than adopted (tinbox never merges or reuses a
+/// pre-existing inbox it did not create). No sentinel marker is needed —
+/// ownership is enforced by "create it fresh or refuse", not by inspecting
+/// contents.
+/// Picking a directory already named `inbox` therefore yields `inbox/inbox`,
+/// accepted on purpose rather than risking someone else's folder.
 ///
 /// Creates the directory (with a write probe, so a read-only or bogus
 /// location fails HERE with a message instead of failing uploads later).
@@ -174,15 +180,31 @@ pub fn save_inbox_dir(raw: &str) -> Result<PathBuf, String> {
         normalized.pop();
     }
     let base = PathBuf::from(&normalized);
-    let already_inbox = base
-        .file_name()
-        .map(|n| n.to_string_lossy().eq_ignore_ascii_case("inbox"))
-        .unwrap_or(false);
-    let final_path = if already_inbox {
-        base
-    } else {
-        base.join("inbox")
-    };
+    // Always nest `inbox`: never reuse a same-named folder the user happened to
+    // pick, so the effective directory is always one we created — its ownership
+    // is unambiguous without any marker file.
+    let final_path = base.join("inbox");
+    // tinbox only ever uses an inbox it created itself: refuse to adopt a
+    // pre-existing `inbox` folder, which would merge someone else's files into
+    // the timeline (and let /rm delete them). The sole exception is the CURRENT
+    // effective path — re-picking it is a no-op and it is by definition ours.
+    if final_path.exists() {
+        let current = effective_inbox_dir();
+        let same = match (
+            std::fs::canonicalize(&final_path),
+            std::fs::canonicalize(&current),
+        ) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => final_path
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&current.to_string_lossy()),
+        };
+        if !same {
+            return Err(
+                "该位置已有 inbox 文件夹，请另选位置或先移除它".to_string(),
+            );
+        }
+    }
     if let Err(e) = std::fs::create_dir_all(&final_path) {
         return Err(format!("无法创建目录: {e}"));
     }
@@ -312,14 +334,20 @@ pub(crate) async fn pick_dir(
     // blocking_* must never run on the main thread (deadlock with the event
     // loop); the axum worker is already off it, and spawn_blocking keeps the
     // async runtime free while the modal sits open — same posture as /repair.
+    // Start at the BASE (the parent of the active inbox, e.g. ...\foo for
+    // ...\foo\inbox), NOT the inbox itself: the effective path is always
+    // base/inbox, so opening inside it would make a plain re-confirm nest
+    // inbox/inbox. Starting one level up keeps "pick the same spot" a no-op.
+    let start = effective_inbox_dir();
+    let start = start.parent().map(|p| p.to_path_buf()).unwrap_or(start);
     let picked = tokio::task::spawn_blocking(move || {
         use tauri_plugin_dialog::DialogExt;
         app.dialog()
             .file()
             .set_title("选择收件箱位置（将创建 inbox 文件夹）")
-            // Starting from the active inbox preserves the user's context;
+            // Starting from the active base preserves the user's context;
             // without an explicit directory Windows commonly opens Downloads.
-            .set_directory(effective_inbox_dir())
+            .set_directory(start)
             .blocking_pick_folder()
     })
     .await

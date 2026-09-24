@@ -127,6 +127,7 @@
   .st-change:hover { border-color: var(--accent); background: var(--accent-bg); }
   .st-impact { display: flex; align-items: flex-start; gap: 7px; margin-top: 11px; font-size: 12px; color: var(--sub); line-height: 1.4; }
   .st-impact svg { color: var(--accent); flex: none; margin-top: 1px; }
+  .st-error { margin-top: 9px; font-size: 12px; color: var(--danger); line-height: 1.5; }
   .radio-row { display: block; }
   .radio-row button {
     position: relative; display: block; width: 100%; min-height: 0; padding: 13px 42px 13px 44px;
@@ -895,6 +896,7 @@
         <div class="st-panel st-location">
           <div class="st-path-row"><div class="st-path" id="stPath">…</div><button class="st-change" id="stChange">更改位置</button></div>
           <div class="st-impact"><span>更改目录后，收件箱中的文件不会自动转移，请手动将其移动到新目录，重启后生效。</span></div>
+          <div class="st-error" id="stError" hidden></div>
         </div>
       </section>
       <section class="st-section">
@@ -2641,6 +2643,7 @@ $('stOpenData').onclick = async () => {
 async function openSettings(){
   $('settingsOverlay').classList.add('show');
   $('stPath').textContent = '…';
+  const stErr = $('stError'); if(stErr){ stErr.hidden = true; stErr.textContent = ''; }
   try {
     const r = await serverFetch('/settings');
     if(!r.ok) throw 0;
@@ -2673,16 +2676,24 @@ $('stChange').onclick = async () => {
   } catch { failToast('打开选择器失败'); return; }
   if(!dir) return;
   const before = $('stPath').textContent;
+  const err = $('stError');
+  if(err){ err.hidden = true; err.textContent = ''; }
   try {
     const r = await serverFetch('/settings/inbox-dir', { method:'POST', body:{ path: dir } });
-    if(!r.ok){ failToast(await r.text() || '保存失败'); return; }
+    if(!r.ok){
+      // A choice this user must act on (pick elsewhere / remove it): show it
+      // inline and let it persist, not a 1.8s toast that vanishes mid-read.
+      const msg = (await r.text()) || '保存失败';
+      clientLog('ui-fail: ' + msg);
+      if(err){ err.textContent = msg; err.hidden = false; } else { failToast(msg); }
+      return;
+    }
     const s = await r.json();
     $('stPath').textContent = s.inbox_dir;
-    // Re-picking the same location is a no-op (the backend also avoids
-    // re-nesting inbox/inbox): don't claim anything changed.
-    if(s.inbox_dir && before && s.inbox_dir.toLowerCase() === before.toLowerCase())
-      toast('收件箱位置与之前相同');
-    else
+    // A no-op (the same base re-confirmed) says nothing: a "no change" toast
+    // reads like a null/error fallback, and the panel already shows the live
+    // path. Only a real change announces itself.
+    if(!(s.inbox_dir && before && s.inbox_dir.toLowerCase() === before.toLowerCase()))
       toast('收件箱位置已更换，重启后生效');
   } catch { failToast('保存失败'); }
 };
