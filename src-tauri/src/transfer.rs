@@ -232,17 +232,29 @@ pub(crate) async fn upload(
     // is "owner" and must not be misattributed to a guest device.
     let from: &str = from_by_peer(peer);
     loop {
-        let mut field = match multipart.next_field().await {
-            Ok(Some(f)) => f,
+        // Same silence rule as the per-chunk reads below: the first boundary
+        // + headers also ride the body, and hyper has no read timeout. No
+        // row/writer/partial exists yet, so a timeout just answers 400.
+        let mut field = match tokio::time::timeout(
+            Duration::from_secs(UPLOAD_SILENCE_SECS),
+            multipart.next_field(),
+        )
+        .await
+        {
+            Err(_) => {
+                logw(&format!("upload rejected: stalled before first field from {peer}"));
+                return (StatusCode::BAD_REQUEST, "stalled").into_response();
+            }
+            Ok(Ok(Some(f))) => f,
             // Early rejections happen before any pending row exists, so the
             // access log's error line is the only trace — log the reason here
             // or the next silent 400 is undebuggable (e.g. pasted clipboard
             // images once arrived with empty filenames).
-            Ok(None) => {
+            Ok(Ok(None)) => {
                 logw(&format!("upload rejected: no file field from {peer} (?size={:?})", q.size));
                 return (StatusCode::BAD_REQUEST, "no file field").into_response();
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 logw(&format!("upload rejected: multipart read from {peer}: {e}"));
                 return (StatusCode::BAD_REQUEST, format!("read: {e}")).into_response();
             }
