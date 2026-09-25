@@ -1,6 +1,6 @@
 // Byte-transfer machinery: the upload endpoint, the shared file dispatch
 // (serve: Range/ETag + per-request counters), /dl, /view, /dl-status,
-// /cancel, /rm, and the ledger (DlProg map + stopped-push set) they share.
+// /cancel, /rm, and the ledger (DlProg map + per-attempt writer stop) they share.
 // Push events ride crate::server::notifier; the catalog is the source of
 // truth; the transfer page's receiver rings render what these counters say
 // (download counters feed the outcome log only).
@@ -17,7 +17,6 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,13 +68,82 @@ fn touch_entry(e: &mut DlProg) {
     e.last_ts = now_mono();
 }
 
-/// Ids of uploads stopped via /cancel. The upload writer polls this on every
-/// chunk and tears down when it sees its id, dropping the pending row and
-/// the partial file. Only uploads can be stopped: pulls are the puller's
-/// business — their only cancel is the receiver's own browser UI.
-static CANCELLED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-fn cancelled() -> &'static Mutex<HashSet<String>> {
-    CANCELLED.get_or_init(|| Mutex::new(HashSet::new()))
+/// Stop signal for the upload writer currently holding an id. The attempt
+/// token (`?att=`, minted by the sender per tryUploadOnce call) names which
+/// attempt a stop belongs to: a stop for a finished attempt cannot kill a
+/// later retry that reuses the cid. The entry exists only while the writer
+/// lives — it is removed when the writer exits, so nothing is recorded for
+/// a later retry to trip over. Only uploads can be stopped: pulls are the
+/// puller's business.
+#[derive(Default)]
+struct Writer {
+    /// Attempt token from `?att=`; `None` for writers started without one
+    /// (hand-rolled clients). Compared verbatim against the stop's token.
+    tag: Option<String>,
+    stopped: bool,
+}
+
+static WRITERS: OnceLock<Mutex<std::collections::HashMap<String, Writer>>> = OnceLock::new();
+
+fn writers() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, Writer>> {
+    WRITERS
+        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Register the writer for `id`. `None` if the previous writer has not exited
+/// yet — /cancel removes the catalog row before the writer notices, so a
+/// retry in that window must not open a second handle on the same sentinel.
+fn begin_writer(id: &str, tag: Option<String>) -> bool {
+    let mut g = writers();
+    if g.contains_key(id) {
+        return false;
+    }
+    g.insert(
+        id.to_string(),
+        Writer {
+            tag,
+            stopped: false,
+        },
+    );
+    true
+}
+
+/// Signal the live writer for `id`, if one exists. A stop names the attempt
+/// it was issued for: `att=None` (explicit/hand-rolled stop) matches the
+/// live writer; `att=Some` only matches a writer holding the same token.
+/// A delayed stop from a previous attempt is ignored instead of killing the
+/// retry. A missing or finished attempt is a no-op.
+fn stop_writer(id: &str, att: Option<&str>) -> bool {
+    let mut g = writers();
+    let Some(e) = g.get_mut(id) else { return false };
+    if att.is_some() && e.tag.as_deref() != att {
+        return false;
+    }
+    e.stopped = true;
+    true
+}
+
+fn writer_stopped(id: &str) -> bool {
+    writers().get(id).is_some_and(|e| e.stopped)
+}
+
+fn end_writer(id: &str) {
+    writers().remove(id);
+}
+
+/// Drops the writer registration on every exit path, including panic. Safe:
+/// a new writer for this id cannot exist before this drop runs, because
+/// begin_writer refuses while the entry is present.
+struct WriterGuard {
+    id: String,
+}
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        end_writer(&self.id);
+    }
 }
 
 /// Poison-safe lock for the transfer map. A handler that panics while holding
@@ -86,11 +154,6 @@ fn cancelled() -> &'static Mutex<HashSet<String>> {
 /// push or resync.
 pub(crate) fn dl_lock() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, DlProg>> {
     dl_progress().lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// Poison-safe lock for the cancelled-ids set (same rationale as dl_lock).
-fn cancel_lock() -> std::sync::MutexGuard<'static, HashSet<String>> {
-    cancelled().lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Millisecond clock for throttling progress pushes (wall clock; fine for a
@@ -133,6 +196,10 @@ pub(crate) struct UpQuery {
     /// row's id so the sender's optimistic card IS this row — no merge by
     /// name+size, no possible second card. Absent (older client) -> server id.
     pub(crate) cid: Option<String>,
+    /// Attempt token minted by the sender per tryUploadOnce call. Stored on
+    /// the writer slot; a /cancel carrying the same token stops this attempt,
+    /// a stale token from a previous attempt is ignored. Absent -> legacy.
+    pub(crate) att: Option<String>,
 }
 
 /// [LIVENESS/death] Seconds an upload body may go silent before the upload
@@ -216,6 +283,16 @@ pub(crate) async fn upload(
             logw(&format!("upload rejected: duplicate client id {id} from {peer}"));
             return (StatusCode::CONFLICT, "duplicate cid").into_response();
         }
+        // Hold the writer slot before the row exists: /cancel deletes the row
+        // first and only then can the writer notice, so a retry must not open
+        // a second handle on this sentinel until this attempt has exited.
+        // The slot carries this attempt's token: a stop naming another
+        // attempt is ignored instead of killing this one.
+        if !begin_writer(&id, q.att.clone()) {
+            logw(&format!("upload rejected: previous writer still closing {id} from {peer}"));
+            return (StatusCode::CONFLICT, "writer busy").into_response();
+        }
+        let _writer = WriterGuard { id: id.clone() };
         let stored = catalog::inbox_dir().join(format!("pending__{id}__{filename}"));
         // No `{id}__` final path anymore: graduation lands on the bare deduped
         // display name via resolve_graduation_target (check-and-bump there),
@@ -256,10 +333,11 @@ pub(crate) async fn upload(
         // ceiling. (Create time excluded — pure body time.)
         let t0 = tokio::time::Instant::now();
         let write_result: Result<(), String> = loop {
-            // The PC (receiver) asked to stop this upload (/cancel): drop it as a
-            // failure so the row + partial file are cleaned up below. Noticed per
-            // chunk, so latency is one body chunk once the flag is set.
-            if cancel_lock().contains(&id) {
+            // The PC (receiver) or the sender asked to stop this upload: drop it
+            // as a failure so the row + partial file are cleaned up below.
+            // Noticed per chunk. Only a stop naming this attempt counts — a
+            // delayed stop for a previous try was rejected at /cancel time.
+            if writer_stopped(&id) {
                 break Err("cancelled by peer".to_string());
             }
             // [LIVENESS/death] A peer that dies without a FIN (WiFi drop, phone
@@ -423,10 +501,24 @@ pub(crate) async fn copy_into_inbox(
     // card already wears it), else a server id. Never fail the copy over it:
     // /add-local's optimistic batch is dropped on its own response, so a
     // fallback id only means a card that does not silently adopt.
-    let id = match cid {
+    let mut id = match cid {
         Some(c) if catalog::valid_client_id(c) && catalog::find(c).is_none() => c.to_string(),
         _ => catalog::new_id(),
     };
+    // Same writer slot as phone uploads: a phone push and a local copy must
+    // never share a sentinel. Unlike /upload the cid is not our identity —
+    // the optimistic batch drops on its own response — so a busy slot falls
+    // back to a fresh server id instead of failing the copy.
+    if !begin_writer(&id, None) {
+        id = catalog::new_id();
+        if !begin_writer(&id, None) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "previous upload still closing",
+            ));
+        }
+    }
+    let _writer = WriterGuard { id: id.clone() };
     let stored = catalog::inbox_dir().join(format!("pending__{id}__{safe}"));
     // Final path resolved at graduation below (bare name, check-and-bump).
     let size = tokio::fs::metadata(src).await.map(|m| m.len()).unwrap_or(0);
@@ -476,6 +568,12 @@ pub(crate) async fn copy_into_inbox(
     let mut buf = vec![0u8; 512 * 1024];
     let mut sent: u64 = 0;
     let copy = loop {
+        if writer_stopped(&id) {
+            break Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "cancelled",
+            ));
+        }
         match reader.read(&mut buf).await {
             Ok(0) => break Ok(()),
             Ok(n) => {
@@ -1138,17 +1236,30 @@ pub(crate) async fn cancel(
                 return (StatusCode::FORBIDDEN, "guest cannot stop transfers").into_response();
             }
             None => {
-                // Already gone (aborted + reaped, or optimistic-only abort that
-                // never made a row): idempotent OK, nothing to tear down.
+                // Row already gone. Still poke a writer that has not exited
+                // (/cancel removes the row before the writer notices). The
+                // poke names this cancel's attempt; a writer from a later
+                // retry carries another token and ignores it.
+                if stop_writer(&p.id, p.att.as_deref()) {
+                    logf(&format!(
+                        "cancel {}: upload stopped by sender (row already gone)",
+                        p.id
+                    ));
+                    return (StatusCode::OK, "stopped").into_response();
+                }
                 return (StatusCode::OK, "gone").into_response();
             }
         }
     }
-    cancel_lock().insert(p.id.clone());
+    // Signal the live writer, then drop the row. The stop names this cancel's
+    // attempt only — a delayed stop from a previous try is rejected above and
+    // below instead of killing a retry that reused the cid.
+    let signaled = stop_writer(&p.id, p.att.as_deref());
     // Remove the pending row and best-effort the partial file. If the writer
     // still holds the handle open (Windows), it deletes the file itself when
-    // it wakes on the cancel flag.
-    if let Some(e) = catalog::remove(&p.id) {
+    // it wakes on the stop flag.
+    let removed = catalog::remove(&p.id);
+    if let Some(e) = &removed {
         crate::poster::unlink(&e.id);
         if let catalog::MsgBody::File {
             source: catalog::Source::Remote { path },
@@ -1157,6 +1268,9 @@ pub(crate) async fn cancel(
         {
             let _ = std::fs::remove_file(path);
         }
+    }
+    if !signaled && removed.is_none() {
+        return (StatusCode::OK, "gone").into_response();
     }
     // Drop the shared counter so neither end keeps mirroring a dead transfer,
     // then push the corrected list.
@@ -1311,10 +1425,11 @@ pub(crate) async fn remove(
         catalog::MsgBody::Text { .. } => ("text message deleted".to_string(), false),
     };
 
-    // Deleting an in-flight upload's pending row directly: flag it so the upload
-    // writer tears down on its next chunk and removes its own partial file.
+    // Deleting an in-flight upload's pending row directly: signal its writer
+    // so it tears down on the next chunk and removes its own partial file.
+    // Unscoped (no att): delete means "stop whatever is writing now".
     if entry.pending {
-        cancel_lock().insert(entry.id.clone());
+        stop_writer(&entry.id, None);
     }
     catalog::remove(&entry.id);
     crate::poster::unlink(&entry.id);
@@ -1357,7 +1472,7 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
     // the directory listing, not from these rows.
     for e in &all {
         if e.pending {
-            cancel_lock().insert(e.id.clone());
+            stop_writer(&e.id, None);
         }
         dl_lock().remove(&e.id);
         if matches!(e.body, catalog::MsgBody::File { .. }) {
@@ -1483,6 +1598,33 @@ mod tests {
         // A zero-length suffix and an empty resource are not ranges.
         assert_eq!(parse_range("bytes=-0", 1000), None);
         assert_eq!(parse_range("bytes=-10", 0), None);
+    }
+
+    #[test]
+    fn stop_names_the_attempt() {
+        let id = "test-stop-att";
+        // A stop for an attempt that never started records nothing.
+        assert!(!super::stop_writer(id, Some("1")));
+        assert!(super::begin_writer(id, Some("1".to_string())));
+        // Previous writer still exiting: no second handle on the sentinel.
+        assert!(!super::begin_writer(id, Some("2".to_string())));
+        // Stale token ignored; current token kills; unscoped kills.
+        assert!(!super::writer_stopped(id));
+        super::stop_writer(id, Some("0"));
+        assert!(!super::writer_stopped(id));
+        super::stop_writer(id, Some("1"));
+        assert!(super::writer_stopped(id));
+        super::end_writer(id);
+        // Finished attempt leaves nothing for a reused cid to trip over.
+        assert!(!super::stop_writer(id, Some("1")));
+        assert!(super::begin_writer(id, Some("2".to_string())));
+        assert!(!super::writer_stopped(id));
+        // The old token is now stale and cannot kill the retry.
+        super::stop_writer(id, Some("1"));
+        assert!(!super::writer_stopped(id));
+        super::stop_writer(id, Some("2"));
+        assert!(super::writer_stopped(id));
+        super::end_writer(id);
     }
 
     #[test]

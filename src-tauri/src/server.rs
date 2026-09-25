@@ -120,6 +120,10 @@ pub(crate) fn notifier() -> &'static broadcast::Sender<PushEvent> {
 #[derive(serde::Deserialize)]
 pub(crate) struct IdParam {
     pub id: String,
+    /// Attempt token for /cancel: must match the writer slot's token from
+    /// ?att=, otherwise the stop is a stale one from a previous attempt and
+    /// is ignored. Absent -> stop whatever is writing now.
+    pub att: Option<String>,
     /// Traffic source tag for log attribution only (card = timeline tile,
     /// full = explicit fullscreen open, nav = phone tap navigation). Never
     /// affects serving; absent in old/bookmarked URLs.

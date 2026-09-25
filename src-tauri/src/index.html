@@ -2119,10 +2119,11 @@ async function cancelOwnUpload(it){
   // failure branch would otherwise flip this entry back to failed.
   const opt = optUploads.find(o => o.id === it.id);
   if(opt) setOpt(opt, 'hidden');
+  let att = opt ? opt.att : undefined;
   for(const up of [...inFlightUploads]){
-    if(up.id === it.id){ try { up.ac.abort(); } catch {} }
+    if(up.id === it.id){ att = up.att; try { up.ac.abort(); } catch {} }
   }
-  cancelRemote(it.id);
+  cancelRemote(it.id, att);
   reapply();
 }
 function checkUploadGone(items){
@@ -2355,16 +2356,21 @@ async function startUpload(f, opt){
   // ready via a fresh list): nothing left to do, and no second POST.
   if(!optUploads.includes(opt)) return true;
   const cid = opt.id;
+  // Attempt number for this try: the server pins its writer slot to it, and
+  // our /cancel carries it back — a delayed cancel from a previous attempt
+  // names the old number and is ignored instead of killing the retry.
+  opt.att = (opt.att || 0) + 1;
+  const att = opt.att;
   setOpt(opt, 'sending');
   opt.retrying = true;
   reapply();
-  const ok = await tryUploadOnce(f, opt, cid);
+  const ok = await tryUploadOnce(f, opt, cid, att);
   opt.retrying = false;
   if(ok){ dropOptCard(cid); return true; }
   // The user stopped/dismissed while this attempt was dying: stay gone.
   if(opt.hidden) return false;
   setOpt(opt, 'failed');       // keep the card; the user decides whether to retry
-  cancelRemote(cid);           // free the cid so an immediate retry can re-POST
+  cancelRemote(cid, att);      // free the cid so an immediate retry can re-POST
   reapply();
   return false;
 }
@@ -2373,9 +2379,11 @@ async function startUpload(f, opt){
 // immediate same-cid retry and removes the row from every other end. Only ever
 // touches a PENDING row, so a file that actually graduated is never destroyed;
 // offline or before the row exists it fails silently, and the server's own 5s
-// stall reaps the row regardless.
-function cancelRemote(cid){
-  serverFetch('/cancel', { method:'POST', query:{ id: cid } }).catch(() => {});
+// stall reaps the row regardless. `att` names the attempt being torn down —
+// the server ignores it when its writer already moved on to a retry.
+function cancelRemote(cid, att){
+  const query = att != null ? { id: cid, att: String(att) } : { id: cid };
+  serverFetch('/cancel', { method:'POST', query }).catch(() => {});
 }
 
 // One remote send at a time: a LAN link is saturated by a single stream, so a
@@ -2411,10 +2419,10 @@ function dismissUpload(cid){
   const opt = optUploads.find(o => o.id === cid);
   if(opt && opt.retrying) return;   // mid-retry: let it settle first
   if(opt) setOpt(opt, 'hidden');
-  cancelRemote(cid);
+  cancelRemote(cid, opt ? opt.att : undefined);
   reapply();
 }
-async function tryUploadOnce(f, opt, cid){
+async function tryUploadOnce(f, opt, cid, att){
   // Attempt body of the old startUpload: the card was painted by uploadFiles
   // with its whole batch, already wearing the id the server adopts as its row
   // id — see withOptimistic. The ring below owns the card from here.
@@ -2435,7 +2443,7 @@ async function tryUploadOnce(f, opt, cid){
   // phone stops writing bytes into a socket the server is already tearing
   // down.
   const ac = new AbortController();
-  const up = { ac, id: cid, name: upName, size: f.size || 0, seen: false, sent: 0, lastPaint: 0,
+  const up = { ac, id: cid, att, name: upName, size: f.size || 0, seen: false, sent: 0, lastPaint: 0,
     sentAt: 0, graduated: false, settle: null,
     via: '', httpStatus: 0, respDone: false, lateLogged: false };
   inFlightUploads.push(up);
@@ -2457,6 +2465,7 @@ async function tryUploadOnce(f, opt, cid){
     if(!ok || !up.respDone || up.size >= 4 * 1024 * 1024 || sendMs > 10000){
       clientLog('upload ' + (ok ? 'ok' : 'fail')
         + ' via=' + (up.via || '?')
+        + ' att=' + (up.att || '?')
         + ' send=' + sendMs + 'ms total=' + (now - upT0) + 'ms'
         + ' bytes=' + up.size
         + ' http=' + (up.httpStatus || 'none')
@@ -2551,7 +2560,7 @@ async function tryUploadOnce(f, opt, cid){
     xhr.onerror = () => { const wasDone = done; up.respDone = true; settle(false, 'net-error'); if(wasDone) lateLog('onerror'); };
     xhr.onabort = () => { settle(false, 'abort'); };
     xhr.ontimeout = () => { const wasDone = done; up.respDone = true; settle(false, 'timeout'); if(wasDone) lateLog('ontimeout'); };
-    xhr.open('POST', '/upload' + qs({ size: f.size || 0, cid }));
+    xhr.open('POST', '/upload' + qs({ size: f.size || 0, cid, att }));
     try { xhr.send(fd); } catch(e) { settle(false, 'send-threw'); }
   });
   // 409 only proves a row with this cid EXISTS — it may still be pending (a
