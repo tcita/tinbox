@@ -500,9 +500,14 @@ async fn index() -> impl IntoResponse {
     // The page is compiled into this binary; a browser-cached copy would drift
     // from the server's behavior after an update (phone Safari caches
     // heuristically), so forbid reuse and always re-fetch.
+    // {{VERSION}} is filled from the crate version so the About line can never
+    // drift from the binary. Substituted once, not per request.
+    static PAGE: OnceLock<String> = OnceLock::new();
+    let html = PAGE
+        .get_or_init(|| include_str!("index.html").replace("{{VERSION}}", env!("CARGO_PKG_VERSION")));
     (
         [(header::CACHE_CONTROL, "no-cache")],
-        Html(include_str!("index.html")),
+        Html(html.clone()),
     )
 }
 
@@ -927,5 +932,22 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "id": "c-redteam-1-2-abc" }))
                 .expect("old shape parses");
         assert!(p.att.is_none());
+    }
+
+    /// The served page must never ship the raw `{{VERSION}}` placeholder, and
+    /// must carry the crate version (guards the injection against drift).
+    #[tokio::test]
+    async fn index_embeds_the_crate_version() {
+        use axum::response::IntoResponse;
+        let resp = super::index().await.into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let html = String::from_utf8_lossy(&bytes);
+        assert!(!html.contains("{{VERSION}}"), "placeholder left unreplaced");
+        assert!(
+            html.contains(env!("CARGO_PKG_VERSION")),
+            "crate version missing from the served page"
+        );
     }
 }

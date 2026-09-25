@@ -150,6 +150,11 @@
   .st-danger-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px 13px; }
   .st-danger-copy { min-width: 0; }
   .st-danger-title { font-size: 13px; font-weight: 650; color: var(--text); }
+  /* About line: product · author, one dim caption under the functional list.
+     System font on purpose — this is an offline LAN page and must not pull a
+     web font. */
+  .st-about { margin: 18px 0 2px; text-align: center; font-size: 12px;
+    color: var(--sub); letter-spacing: 0.3px; }
   /* Soft red on black: full #ff3b30 vibrates against the dark card, so the
      text button lives one step down. The filled 清空 button keeps full red. */
   .st-danger-btn {
@@ -917,6 +922,7 @@
           <button class="st-change" id="stOpenData">打开文件夹</button>
         </div>
       </section>
+      <div class="st-about">tinbox v{{VERSION}} · TCITA Studio</div>
     </div>
   </div>
 </div>
