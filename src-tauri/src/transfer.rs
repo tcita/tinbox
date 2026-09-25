@@ -1251,10 +1251,17 @@ pub(crate) async fn cancel(
             }
         }
     }
-    // Signal the live writer, then drop the row. The stop names this cancel's
-    // attempt only — a delayed stop from a previous try is rejected above and
-    // below instead of killing a retry that reused the cid.
-    let signaled = stop_writer(&p.id, p.att.as_deref());
+    // A scoped stop (att=Some) that matches no live writer is stale: it names
+    // a previous attempt, so touch neither the writer nor the row — the row,
+    // if any, belongs to another attempt. An unscoped stop (att=None:
+    // explicit/hand-rolled client) hits whatever is writing now.
+    if let Some(att) = p.att.as_deref() {
+        if !stop_writer(&p.id, Some(att)) {
+            return (StatusCode::OK, "gone").into_response();
+        }
+    } else {
+        stop_writer(&p.id, None);
+    }
     // Remove the pending row and best-effort the partial file. If the writer
     // still holds the handle open (Windows), it deletes the file itself when
     // it wakes on the stop flag.
@@ -1269,7 +1276,7 @@ pub(crate) async fn cancel(
             let _ = std::fs::remove_file(path);
         }
     }
-    if !signaled && removed.is_none() {
+    if removed.is_none() {
         return (StatusCode::OK, "gone").into_response();
     }
     // Drop the shared counter so neither end keeps mirroring a dead transfer,
