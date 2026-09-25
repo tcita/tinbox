@@ -10,6 +10,10 @@ publish = false
 #   RUSTFLAGS="--cfg loom" cargo test
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
+# Same diagnostic wiring loom's own `model()` installs, so `LOOM_LOG=info`
+# prints "Completed in N iterations" for the bounded builder runs.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
