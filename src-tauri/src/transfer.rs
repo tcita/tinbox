@@ -437,7 +437,20 @@ pub(crate) async fn upload(
         };
         match write_result {
             Ok((final_path, final_name)) => {
-                catalog::mark_remote_ready(&id, &final_path);
+                // The row can vanish between resolve and mark (concurrent
+                // /cancel, /rm, /rm-all): someone explicitly deleted this
+                // upload. Honor that — drop the orphaned final file instead
+                // of reporting success for a row that will never show, so
+                // both ends agree on failure. The next startup stays clean
+                // either way (nothing sentinel-named is left behind).
+                if !catalog::mark_remote_ready(&id, &final_path) {
+                    drop(file);
+                    let _ = std::fs::remove_file(&final_path);
+                    dl_lock().remove(&id);
+                    let _ = notifier().send(PushEvent::List(catalog::all_items()));
+                    logw(&format!("upload failed {final_name}: row deleted during graduation"));
+                    return (StatusCode::BAD_REQUEST, "row gone").into_response();
+                }
                 crate::poster::request(&id, &final_path, &final_name);
                 logf(&format!("upload done: {} ({} bytes) -> inbox", final_name, total));
                 if total >= 4 * 1024 * 1024 {
@@ -634,7 +647,17 @@ pub(crate) async fn copy_into_inbox(
         fail(&stored, &id).await;
         return Err(e);
     }
-    catalog::mark_remote_ready(&id, &final_path);
+    // Same race as the upload path: the row may have been deleted while the
+    // rename was in flight. The source disk still holds the original, so
+    // dropping the orphaned copy loses nothing.
+    if !catalog::mark_remote_ready(&id, &final_path) {
+        let _ = tokio::fs::remove_file(&final_path).await;
+        fail(&stored, &id).await;
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "row deleted during graduation",
+        ));
+    }
     crate::poster::request(&id, &final_path, &final_name);
     {
         // Final tick (sent == total) closes the ring immediately, unthrottled.
@@ -1644,6 +1667,226 @@ mod tests {
         super::stop_writer(id, Some("2"));
         assert!(super::writer_stopped(id));
         super::end_writer(id);
+    }
+
+    #[test]
+    fn upquery_att_optional_for_old_clients() {
+        // Old clients/URLs carry no att: the stop degrades to unscoped
+        // instead of failing to parse.
+        let q: super::UpQuery =
+            serde_json::from_value(serde_json::json!({ "size": 11, "cid": "c-redteam-1-2-abc" }))
+                .expect("old shape parses");
+        assert!(q.att.is_none());
+        let q2: super::UpQuery = serde_json::from_value(serde_json::json!({
+            "size": 11, "cid": "c-redteam-1-2-abc", "att": "3"
+        }))
+        .expect("new shape parses");
+        assert_eq!(q2.att.as_deref(), Some("3"));
+    }
+
+    fn guest_peer() -> std::net::SocketAddr {
+        std::net::SocketAddr::from(([192, 168, 1, 5], 40101))
+    }
+
+    /// Drive the real /upload handler in-process: hand-rolled multipart body,
+    /// guest peer, real temp inbox. No network, no token layer (routes add
+    /// that; the handler owns the state machine).
+    async fn post_upload(
+        peer: std::net::SocketAddr,
+        size: Option<u64>,
+        cid: &str,
+        att: &str,
+        filename: &str,
+        bytes: &[u8],
+    ) -> axum::response::Response {
+        use axum::extract::FromRequest;
+        use axum::response::IntoResponse;
+        let boundary = "redteam-boundary-7f3a";
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let req = axum::http::Request::builder()
+            .uri("/upload")
+            .header(
+                "content-type",
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        let mp = axum::extract::Multipart::from_request(req, &())
+            .await
+            .expect("multipart parses");
+        super::upload(
+            axum::extract::ConnectInfo(peer),
+            axum::extract::Query(super::UpQuery {
+                size,
+                cid: Some(cid.to_string()),
+                att: Some(att.to_string()),
+            }),
+            mp,
+        )
+        .await
+        .into_response()
+    }
+
+    async fn resp_parts(
+        resp: axum::response::Response,
+    ) -> (axum::http::StatusCode, String) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// S1/X2: a clean upload graduates exactly once and the row is the truth.
+    #[tokio::test]
+    async fn red_upload_graduates_lists_ready() {
+        let env = crate::test_support::TestEnv::setup("upload-grad");
+        let (s, b) = resp_parts(
+            post_upload(
+                guest_peer(),
+                Some(11),
+                "c-redteam-grad-1",
+                "1",
+                "red-hello.bin",
+                b"hello world",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK, "{b}");
+        let row = crate::catalog::find("c-redteam-grad-1").expect("row exists");
+        assert!(!row.pending, "graduated exactly once");
+        assert_eq!(env.inbox_files(), vec!["red-hello.bin".to_string()]);
+        assert!(env.sentinel_files().is_empty(), "S3: no sentinel left");
+        assert_eq!(
+            std::fs::read(env.inbox().join("red-hello.bin")).unwrap(),
+            b"hello world"
+        );
+        // S1: ready never re-flips; a second mark is a no-op false.
+        assert!(!crate::catalog::mark_remote_ready(
+            "c-redteam-grad-1",
+            &env.inbox().join("red-hello.bin")
+        ));
+    }
+
+    /// S2: one cid → one row. A same-cid re-POST is 409, first bytes win.
+    #[tokio::test]
+    async fn red_upload_duplicate_cid_409() {
+        let env = crate::test_support::TestEnv::setup("upload-dup");
+        let (s, b) = resp_parts(
+            post_upload(guest_peer(), Some(3), "c-redteam-dup-1", "1", "red-dup.bin", b"aaa")
+                .await,
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK, "{b}");
+        let (s, b) = resp_parts(
+            post_upload(guest_peer(), Some(3), "c-redteam-dup-1", "2", "red-dup.bin", b"bbb")
+                .await,
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::CONFLICT, "{b}");
+        assert!(b.contains("duplicate"), "{b}");
+        assert_eq!(
+            std::fs::read(env.inbox().join("red-dup.bin")).unwrap(),
+            b"aaa",
+            "S2: first bytes win, no twin, no clobber"
+        );
+        assert_eq!(env.inbox_files(), vec!["red-dup.bin".to_string()]);
+    }
+
+    /// S5: a truncated body graduates nothing — row and sentinel both go.
+    #[tokio::test]
+    async fn red_upload_size_mismatch_cleans_up() {
+        let env = crate::test_support::TestEnv::setup("upload-mm");
+        let (s, b) = resp_parts(
+            post_upload(
+                guest_peer(),
+                Some(9999),
+                "c-redteam-mm-1",
+                "1",
+                "red-mm.bin",
+                b"tiny",
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::BAD_REQUEST, "{b}");
+        assert!(b.contains("size mismatch"), "{b}");
+        assert!(
+            crate::catalog::find("c-redteam-mm-1").is_none(),
+            "S5: row removed"
+        );
+        assert!(env.inbox_files().is_empty(), "S5: sentinel removed");
+    }
+
+    /// T3 end-to-end through /cancel: a stale attempt token touches neither
+    /// the writer nor the row; the live token tears both down; after exit
+    /// nothing is recorded; an unscoped stop still hits the live writer.
+    #[tokio::test]
+    async fn red_cancel_att_gating() {
+        use axum::response::IntoResponse;
+        let env = crate::test_support::TestEnv::setup("cancel-att");
+        let peer = guest_peer();
+        let id = "c-redteam-cancel-1";
+        let path = env.inbox().join(format!("pending__{id}__red-cancel.bin"));
+        crate::catalog::add_remote_pending("guest", id, &path, "red-cancel.bin", 10);
+        assert!(super::begin_writer(id, Some("7".to_string())));
+        let cancel = |att: Option<&str>| {
+            super::cancel(
+                axum::extract::ConnectInfo(peer),
+                axum::extract::Query(crate::server::IdParam {
+                    id: id.to_string(),
+                    att: att.map(str::to_string),
+                    ctx: None,
+                }),
+            )
+        };
+        // Stale token: row kept, writer live.
+        let (s, b) = resp_parts(cancel(Some("8")).await.into_response()).await;
+        assert_eq!(s, axum::http::StatusCode::OK, "{b}");
+        assert!(
+            crate::catalog::find(id).map(|e| e.pending).unwrap_or(false),
+            "stale cancel must keep the row, got {b}"
+        );
+        assert!(!super::writer_stopped(id));
+        // Live token: row gone, writer stopped.
+        let (s, b) = resp_parts(cancel(Some("7")).await.into_response()).await;
+        assert_eq!(s, axum::http::StatusCode::OK, "{b}");
+        assert!(crate::catalog::find(id).is_none());
+        assert!(super::writer_stopped(id));
+        super::end_writer(id);
+        // After exit: further stops are no-ops.
+        let (s, _) = resp_parts(cancel(Some("7")).await.into_response()).await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        // Unscoped stop still hits whatever is writing now.
+        let id2 = "c-redteam-cancel-2";
+        let path2 = env.inbox().join(format!("pending__{id2}__red-cancel.bin"));
+        crate::catalog::add_remote_pending("guest", id2, &path2, "red-cancel.bin", 10);
+        assert!(super::begin_writer(id2, Some("9".to_string())));
+        let (s, _) = resp_parts(
+            super::cancel(
+                axum::extract::ConnectInfo(peer),
+                axum::extract::Query(crate::server::IdParam {
+                    id: id2.to_string(),
+                    att: None,
+                    ctx: None,
+                }),
+            )
+            .await
+            .into_response(),
+        )
+        .await;
+        assert_eq!(s, axum::http::StatusCode::OK);
+        assert!(crate::catalog::find(id2).is_none());
+        super::end_writer(id2);
     }
 
     #[test]

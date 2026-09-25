@@ -916,3 +916,16 @@ async fn logo() -> impl IntoResponse {
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod tests {
+    /// Protocol compat: old /cancel URLs without att must still parse —
+    /// the stop degrades to unscoped instead of 422.
+    #[test]
+    fn idparam_att_optional_for_old_cancel_urls() {
+        let p: super::IdParam =
+            serde_json::from_value(serde_json::json!({ "id": "c-redteam-1-2-abc" }))
+                .expect("old shape parses");
+        assert!(p.att.is_none());
+    }
+}

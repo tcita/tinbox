@@ -14,6 +14,10 @@ use std::sync::{Mutex, OnceLock};
 /// so every caller (logger, catalog) can assume the root exists; subdirs
 /// (inbox) are still created by their owners.
 pub(crate) fn data_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = test_data_root() {
+        return p;
+    }
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
         #[cfg(windows)]
@@ -40,6 +44,26 @@ fn log_path() -> PathBuf {
 }
 
 static F: Mutex<()> = Mutex::new(());
+
+/// Hermetic-test override for the data root (catalog.json, log). Tests must
+/// never touch the real %LOCALAPPDATA%\tinbox. Compiled out in release.
+#[cfg(test)]
+static TEST_DATA_ROOT: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn set_test_data_root(dir: Option<PathBuf>) {
+    *TEST_DATA_ROOT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = dir;
+}
+
+#[cfg(test)]
+fn test_data_root() -> Option<PathBuf> {
+    TEST_DATA_ROOT
+        .get()
+        .and_then(|m| m.lock().unwrap_or_else(|e| e.into_inner()).clone())
+}
 
 fn write_line(line: &str) {
     let line = format!(

@@ -84,6 +84,12 @@ pub fn effective_inbox_dir() -> PathBuf {
         .unwrap_or_else(default_inbox_dir)
 }
 
+/// Hermetic-test override for the inbox dir. See logger::set_test_data_root.
+#[cfg(test)]
+pub(crate) fn set_test_inbox_dir(dir: Option<PathBuf>) {
+    *memo().lock().unwrap_or_else(|e| e.into_inner()) = dir;
+}
+
 /// True when the effective directory is the default (for the UI hint).
 pub fn is_default() -> bool {
     memo()

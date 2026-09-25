@@ -1019,4 +1019,56 @@ mod tests {
         assert_eq!(out, "demo (3).txt");
         assert!(!taken(&out));
     }
+
+    #[test]
+    fn red_row_monotonic_and_bump() {
+        // S1: pending -> ready is one-way; S4: concurrent same-name
+        // graduations bump instead of overwriting.
+        let env = crate::test_support::TestEnv::setup("row-mono");
+        let pa = env.inbox().join("pending__c-red7tm-2-x9q4__dup.bin");
+        add_remote_pending("guest", "c-red7tm-2-x9q4", &pa, "dup.bin", 5);
+        let (ta, na) = resolve_graduation_target("c-red7tm-2-x9q4").expect("target");
+        assert_eq!(na, "dup.bin");
+        assert!(ta.ends_with("dup.bin"));
+        let pb = env.inbox().join("pending__c-blue8ab-3-z7k2__dup.bin");
+        add_remote_pending("guest", "c-blue8ab-3-z7k2", &pb, "dup.bin", 5);
+        let (_tb, nb) = resolve_graduation_target("c-blue8ab-3-z7k2").expect("target");
+        assert_eq!(nb, "dup (1).bin", "S4: bump, never overwrite");
+        assert!(mark_remote_ready("c-red7tm-2-x9q4", &ta));
+        assert!(!find("c-red7tm-2-x9q4").unwrap().pending, "S1: graduated");
+        assert!(
+            !mark_remote_ready("c-red7tm-2-x9q4", &ta),
+            "S1: ready never re-flips"
+        );
+        assert!(resolve_graduation_target("c-red7tm-2-x9q4").is_none());
+    }
+
+    #[test]
+    fn red_reconcile_kills_sentinels_adopts_files() {
+        // S3: sentinel residue is deleted, never adopted; ordinary files
+        // (including near-miss names) are adopted as complete.
+        let env = crate::test_support::TestEnv::setup("reconcile");
+        std::fs::write(
+            env.inbox().join("pending__c-red7tm-2-x9q4__x.bin"),
+            b"partial",
+        )
+        .unwrap();
+        std::fs::write(env.inbox().join("keep.txt"), b"real").unwrap();
+        std::fs::write(env.inbox().join("pending__notes.txt"), b"user file").unwrap();
+        reconcile();
+        assert!(
+            !env.inbox().join("pending__c-red7tm-2-x9q4__x.bin").exists(),
+            "S3: sentinel deleted"
+        );
+        let items = all_items();
+        let keep = items.iter().find(|i| i.name == "keep.txt").expect("adopted");
+        assert!(!keep.pending, "S3: adopted as complete");
+        assert!(
+            env.inbox().join("pending__notes.txt").exists(),
+            "S3: near-miss name kept"
+        );
+        assert!(items
+            .iter()
+            .any(|i| i.name == "pending__notes.txt" && !i.pending));
+    }
 }

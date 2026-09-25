@@ -9,6 +9,8 @@ mod pairing;
 mod presence;
 mod server;
 mod settings;
+#[cfg(test)]
+mod test_support;
 mod transfer;
 
 use tauri::{window::Color, Manager, WebviewUrl, WebviewWindowBuilder};
