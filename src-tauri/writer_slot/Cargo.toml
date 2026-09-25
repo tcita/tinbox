@@ -1,0 +1,15 @@
+[package]
+name = "writer-slot"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Loom is only pulled in for the model-checker run; a normal build of the app
+# (which depends on this crate by path) never compiles it:
+#   RUSTFLAGS="--cfg loom" cargo test
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

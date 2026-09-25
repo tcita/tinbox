@@ -75,62 +75,35 @@ fn touch_entry(e: &mut DlProg) {
 /// lives — it is removed when the writer exits, so nothing is recorded for
 /// a later retry to trip over. Only uploads can be stopped: pulls are the
 /// puller's business.
-#[derive(Default)]
-struct Writer {
-    /// Attempt token from `?att=`; `None` for writers started without one
-    /// (hand-rolled clients). Compared verbatim against the stop's token.
-    tag: Option<String>,
-    stopped: bool,
-}
+///
+/// The state machine itself lives in the `writer-slot` crate so its loom
+/// model can run without compiling this crate under `--cfg loom` (which
+/// breaks tauri/axum/tokio). Here it only gets a process-wide lock.
+use writer_slot::WriterTable;
 
-static WRITERS: OnceLock<Mutex<std::collections::HashMap<String, Writer>>> = OnceLock::new();
+static WRITERS: OnceLock<Mutex<WriterTable>> = OnceLock::new();
 
-fn writers() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, Writer>> {
+fn writers() -> std::sync::MutexGuard<'static, WriterTable> {
     WRITERS
-        .get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+        .get_or_init(|| Mutex::new(WriterTable::default()))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
 }
 
-/// Register the writer for `id`. `None` if the previous writer has not exited
-/// yet — /cancel removes the catalog row before the writer notices, so a
-/// retry in that window must not open a second handle on the same sentinel.
 fn begin_writer(id: &str, tag: Option<String>) -> bool {
-    let mut g = writers();
-    if g.contains_key(id) {
-        return false;
-    }
-    g.insert(
-        id.to_string(),
-        Writer {
-            tag,
-            stopped: false,
-        },
-    );
-    true
+    writers().begin(id, tag)
 }
 
-/// Signal the live writer for `id`, if one exists. A stop names the attempt
-/// it was issued for: `att=None` (explicit/hand-rolled stop) matches the
-/// live writer; `att=Some` only matches a writer holding the same token.
-/// A delayed stop from a previous attempt is ignored instead of killing the
-/// retry. A missing or finished attempt is a no-op.
 fn stop_writer(id: &str, att: Option<&str>) -> bool {
-    let mut g = writers();
-    let Some(e) = g.get_mut(id) else { return false };
-    if att.is_some() && e.tag.as_deref() != att {
-        return false;
-    }
-    e.stopped = true;
-    true
+    writers().stop(id, att)
 }
 
 fn writer_stopped(id: &str) -> bool {
-    writers().get(id).is_some_and(|e| e.stopped)
+    writers().stopped(id)
 }
 
 fn end_writer(id: &str) {
-    writers().remove(id);
+    writers().end(id);
 }
 
 /// Drops the writer registration on every exit path, including panic. Safe:
