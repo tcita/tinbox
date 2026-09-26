@@ -357,6 +357,10 @@
     display: flex; align-items: center; gap: 11px; min-width: 210px; cursor: pointer;
     border-radius: 12px; transition: transform 0.15s ease;
   }
+  /* Guest non-media cards are real <a> links (native link menu on long-press):
+     kill the browser's default link paint — the card already is the visual. */
+  a.file-card { color: inherit; text-decoration: none; }
+  a.file-card:hover { text-decoration: none; }
   .file-card:active { transform: scale(0.98); }
   /* Corner action button: a persistent 30px disc in the card's top-right on
      BOTH ends, each pointing at what that end can do with the file — the
@@ -473,6 +477,11 @@
     display: block; width: 100%; max-height: 240px; object-fit: cover;
     border-radius: 12px; background: rgba(0,0,0,0.06);
   }
+  /* Poster tiles are decoration, not content: pointer-transparent so no
+     browser can offer "save image" on the thumbnail (wrong bytes — the
+     video lives behind the card tap, which opens the fullscreen preview).
+     Hit-testing, lazy-load and onerror are untouched. */
+  .file-card.has-preview img.poster { pointer-events: none; }
   .msg.me .file-card.has-preview img { background: rgba(0, 0, 0, 0.08); }
   .file-card.has-preview .fc-info { width: 100%; }
   .file-card.has-preview .fc-name { max-width: none; }
@@ -798,6 +807,7 @@
     display: flex; align-items: center; gap: 8px; width: 100%; border: none;
     background: transparent; color: var(--text); cursor: pointer;
     padding: 8px 12px; border-radius: 9px; font-size: 13.5px; font-weight: 500; text-align: left;
+    white-space: nowrap;
     transition: background 0.12s ease;
   }
   .ctx-menu button:hover { background: var(--accent-bg); color: var(--accent); }
@@ -820,8 +830,8 @@
       <span class="qr-alert" aria-hidden="true"></span>
     </button>
     <span class="head-sep"></span>
-    <button id="inboxBtn" title="打开收件箱">
-      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+    <button id="inboxBtn" title="打开收件箱文件夹">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>
     </button>
     <button id="settingsBtn" title="设置">
       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -1190,18 +1200,23 @@ function showCtxMenu(x, y, it, bubble){
 
   const copyIco = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>`;
   const delIco = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>`;
+  const openIco = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>`;
+  const folderIco = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/></svg>`;
+  const saveIco = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>`;
 
-  // The context menu is a PC affordance only (right-click), unified to
-  // Copy + Delete for every card. The corner folder button owns "open the
-  // folder", so Reveal has no menu seat. The phone's long-press belongs to
-  // the browser everywhere — media gets the native image menu, text gets
-  // native selection + the system copy callout — so the app paints no menu
-  // of its own there.
+  // The context menu is a PC affordance only (right-click). File cards carry
+  // the mailbox set: Open / Reveal / Save As / Copy / Delete — the corner
+  // folder button stays as the fast path, the menu as the discoverable one.
+  // The phone's long-press belongs to the browser everywhere, so the app
+  // paints no menu of its own there.
   let any = false;
   if(isOwner){
     if(it.kind === 'text'){
       add('复制', copyIco, '', () => copyText(it));
     } else {
+      add('用默认应用打开', openIco, '', () => openDefault(it));
+      add('在文件夹中显示', folderIco, '', () => revealItem(it));
+      add('另存为…', saveIco, '', () => saveAsFile(it));
       add('复制', copyIco, '', () => copyFile(it));
     }
     add('删除此' + (it.kind === 'text' ? '消息' : '文件'), delIco, 'danger', () => delItem(it));
@@ -1209,7 +1224,9 @@ function showCtxMenu(x, y, it, bubble){
   }
   if(!any) return;
 
-  const w = 160, h = 90;
+  // Clamp to the viewport by the real item count: a fixed h=90 clips the
+  // 5-item file menu near the bottom edge.
+  const w = 190, h = m.childElementCount * 36 + 12;
   const left = Math.min(x, window.innerWidth - w - 12);
   const top = Math.min(y, window.innerHeight - h - 12);
   m.style.left = Math.max(8, left) + 'px';
@@ -1269,6 +1286,28 @@ async function delItem(it){
 async function revealItem(it){
   const res = await serverFetch('/reveal', { method:'POST', query:{ id: it.id } });
   if(!res.ok) failToast('文件不存在');
+}
+// Save As: native save dialog on the PC (default name = timeline name, so
+// rename happens there per Windows convention), then a server-side copy.
+// "cancelled" is silent — closing the dialog is not an error. Server-driven
+// like pick-dir, so the webview and a loopback desktop browser share it.
+async function saveAsFile(it){
+  let res;
+  try {
+    res = await serverFetch('/save-as', { method:'POST', query:{ id: it.id } });
+  } catch { failToast('保存失败'); return; }
+  if(res.ok){
+    let t = '';
+    try { t = (await res.text()).trim(); } catch {}
+    if(t === 'cancelled') return;
+    toast('已保存');
+  } else if(res.status === 404){
+    failToast('文件不存在');
+  } else if(res.status === 409){
+    failToast('文件还在传输中，稍后再试');
+  } else {
+    failToast('保存失败');
+  }
 }
 function hideCtxMenu(){ $('ctxMenu').classList.remove('show'); }
 
@@ -1419,12 +1458,23 @@ function buildMsg(it, animate){
       // every iOS version, so the native gesture IS the feature.
       if(isOwner) attachMenu(bubble, it, null);
     } else {
-      const card = document.createElement('div');
-      card.className = 'file-card';
-      if(it.pending){ card.dataset.pending = '1'; card.classList.add('pending'); }
-      if(it.failed) card.classList.add('failed');
       const isImg = !it.pending && isImgName(it.name);
       const isVid = !it.pending && isVidName(it.name);
+      // Guest cards ARE links (Gmail attachment-chip posture): long-press
+      // falls into the browser's native menu with correct bytes everywhere
+      // — photos hit-test the img itself (image menu on the original),
+      // videos hit-test the anchor through the pointer-transparent poster
+      // (link menu on the video), non-media hit-test the anchor. Tap never
+      // navigates for media (the handler below preventDefaults into the
+      // in-app preview); non-media taps navigate like a plain file link.
+      // Owner cards stay divs (their action shells out, it does not
+      // navigate); pending/failed keep inert/retry taps.
+      const cardIsLink = !isOwner && !it.pending && !it.failed;
+      const card = document.createElement(cardIsLink ? 'a' : 'div');
+      card.className = 'file-card';
+      if(cardIsLink) card.href = '/view?id=' + encodeURIComponent(it.id) + '&ctx=nav';
+      if(it.pending){ card.dataset.pending = '1'; card.classList.add('pending'); }
+      if(it.failed) card.classList.add('failed');
 
       // Preview bytes follow the long-press contract: the native media menu
       // (Safari loupe + 存储图像) saves img.src, so IMAGE cards pull the
@@ -1462,6 +1512,15 @@ function buildMsg(it, animate){
         // stopPropagation: the card below also opens the preview (padding
         // taps), without it one tap would stack two overlays.
         img.onclick = (e) => { e.stopPropagation(); openPreview(it); };
+        // Video tiles paint the server-extracted poster JPEG, not the video:
+        // a native "save image" there would store the wrong bytes, and
+        // contextmenu-prevention does NOT hold on iOS (its callout is not
+        // driven by that event). So the poster opts out of hit-testing
+        // entirely: touches land on the card div below, which offers no
+        // image menu anywhere — tap still previews via the card handler,
+        // PC right-click still bubbles to the card's own menu. Real photos
+        // keep their target (their src IS the original).
+        if(isVid){ img.classList.add('poster'); card.title = it.name; }
         card.appendChild(img);
       } else if(isVid){
         const ico = document.createElement('div');
@@ -1515,7 +1574,11 @@ function buildMsg(it, animate){
       const btn = document.createElement('button');
       btn.className = 'dlcardbtn hidden';
       btn.type = 'button';
-      btn.onclick = (e) => { e.stopPropagation(); transferClick(it); };
+      // preventDefault: the guest non-media card is an <a>, and a <button>
+      // inside it must never trigger the ancestor's navigation (browsers
+      // normally consume it, this makes it certain) — on div cards it is a
+      // no-op.
+      btn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); transferClick(it); };
       card.appendChild(btn);
       const ring = document.createElement('div');
       ring.className = 'cardring';
@@ -1538,10 +1601,21 @@ function buildMsg(it, animate){
       // button for the full viewer; other file types still shell out
       // directly since no in-app viewer beats their native app.
       if(isImg || isVid){
-        card.onclick = () => {
+        card.onclick = (e) => {
+          // Link cards (guests): tap stays in the in-app preview, never
+          // navigates — preventDefault wins the race against the anchor.
+          // Long-press stays the browser's (photo img / anchor-behind-poster,
+          // per the cardIsLink contract above).
+          if(e && e.preventDefault) e.preventDefault();
           if(it.pending) return;                          // still uploading
           if(isEmptyFile(it)){ toast('空文件，无法打开'); return; }
           openPreview(it);
+        };
+      } else if(cardIsLink){
+        // The anchor navigates natively (tap == the old location.href);
+        // only the empty-file guard stays on click.
+        card.onclick = (e) => {
+          if(isEmptyFile(it)){ e.preventDefault(); toast('空文件，无法打开'); }
         };
       } else if(isOwner){
         card.onclick = () => {
@@ -1550,15 +1624,8 @@ function buildMsg(it, animate){
           openDefault(it);
         };
       } else {
-        card.onclick = () => {
-          if(it.pending) return;                          // still uploading
-          if(isEmptyFile(it)){ toast('空文件，无法打开'); return; }
-          // Phone tap = "show it", exactly like tapping a file link on an
-          // ordinary webpage: the browser decides — its inline viewer for
-          // PDF/text, its own download flow (with its own progress UI) for
-          // anything else. The corner button stays the explicit download.
-          location.href = '/view?id=' + encodeURIComponent(it.id) + '&ctx=nav';
-        };
+        // Pending guest non-media div (cardIsLink excludes pending): inert.
+        card.onclick = () => {};
       }
       // A failed upload's card is a retry button: tapping anywhere on it
       // re-sends the same File under the same cid (no silent retries; the user
@@ -1567,10 +1634,11 @@ function buildMsg(it, animate){
         card.onclick = () => retryUpload(it.id);
       }
       // The app's long-press menu is a PC affordance only (right-click). On
-      // the phone the long-press gesture is handed to the browser's native
-      // media menu on cards, and is simply dead on non-media files (their one
-      // action, Download, lives on the corner button) — no 450ms timer, no
-      // custom items, no suppression fighting the platform.
+      // the phone every gesture belongs to the browser: media keeps its
+      // native image menu (real photos only — video posters suppress it
+      // above), non-media cards are real links so long-press is the system
+      // link menu — no 450ms timer, no custom items, no suppression
+      // fighting the platform.
       if(isOwner) attachMenu(card, it, bubble);
       bubble.appendChild(card);
     }
@@ -2038,7 +2106,7 @@ function paintCorner(id){
       if(isOwner){
         btn.classList.remove('hidden');
         btn.innerHTML = BTN_FOLDER;
-        btn.title = '在资源管理器中显示';
+        btn.title = '在文件夹中显示';
       } else {
         btn.classList.remove('hidden');
         btn.innerHTML = BTN_DL;

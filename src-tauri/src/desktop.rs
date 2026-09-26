@@ -6,7 +6,7 @@ use crate::catalog;
 use crate::logger::{loge, logw};
 use crate::server::{from_by_peer, IdParam};
 use axum::{
-    extract::{ConnectInfo, Query},
+    extract::{ConnectInfo, Query, State},
     http::StatusCode,
     response::IntoResponse,
 };
@@ -151,6 +151,74 @@ pub(crate) async fn copy_file(
             logw(&format!("copy-file: write failed: {e:?}"));
             (StatusCode::INTERNAL_SERVER_ERROR, "copy failed").into_response()
         }
+    }
+}
+
+/// "Save as" a file to an arbitrary location: opens the native save dialog
+/// (default name = the timeline name, so renaming happens there — Windows
+/// convention) and copies the bytes. PC-only like /open and /reveal: the
+/// dialog pops on the PC and reads PC-local paths.
+/// Answers "saved" / "cancelled" as plain text; missing/still-uploading ids
+/// are 404/409 so the menu can surface them.
+pub(crate) async fn save_as(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(app): State<tauri::AppHandle>,
+    Query(p): Query<IdParam>,
+) -> impl IntoResponse {
+    use crate::logger::{loge, logf};
+    if from_by_peer(peer) != "owner" {
+        logw("save-as: rejected from guest (would pop a save dialog on the PC)");
+        return (StatusCode::FORBIDDEN, "guest cannot save PC files").into_response();
+    }
+    let Some(entry) = catalog::find(&p.id) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    if entry.pending {
+        return (StatusCode::CONFLICT, "still uploading").into_response();
+    }
+    let (src, default_name) = match &entry.body {
+        catalog::MsgBody::File { source, name, .. } => (source.path().to_string(), name.clone()),
+        catalog::MsgBody::Text { .. } => {
+            return (StatusCode::BAD_REQUEST, "not a file").into_response();
+        }
+    };
+    if !Path::new(&src).exists() {
+        return (StatusCode::NOT_FOUND, "file missing").into_response();
+    }
+    // blocking_* must never run on the main thread; the axum worker is
+    // already off it, and spawn_blocking keeps the async runtime free while
+    // the modal sits open — same posture as settings::pick_dir. Dialog +
+    // copy share one blocking task so the copy never blocks the runtime.
+    let outcome = tokio::task::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        let dest = app
+            .dialog()
+            .file()
+            .set_title("另存为")
+            .set_file_name(&default_name)
+            .blocking_save_file();
+        let Some(fp) = dest else {
+            return Ok::<_, String>(None);
+        };
+        let Some(dest_path) = fp.as_path() else {
+            return Err("unsupported save location".to_string());
+        };
+        std::fs::copy(&src, dest_path)
+            .map_err(|e| format!("copy failed: {e}"))
+            .map(|_| Some(dest_path.to_path_buf()))
+    })
+    .await;
+    match outcome {
+        Ok(Ok(None)) => (StatusCode::OK, "cancelled").into_response(),
+        Ok(Ok(Some(dest))) => {
+            logf(&format!("save-as: {} -> {}", p.id, dest.display()));
+            (StatusCode::OK, "saved").into_response()
+        }
+        Ok(Err(msg)) => {
+            loge(&format!("save-as {}: {msg}", p.id));
+            (StatusCode::INTERNAL_SERVER_ERROR, "save failed").into_response()
+        }
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "task failed").into_response(),
     }
 }
 

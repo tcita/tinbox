@@ -8,7 +8,7 @@
 //   netinfo  - LAN IP selection and the QR code
 
 use crate::catalog;
-use crate::desktop::{copy_file, open_dir, open_file, reveal};
+use crate::desktop::{copy_file, open_dir, open_file, reveal, save_as};
 use crate::logger::{loge, logf, logw};
 use crate::netinfo::{collect_ips, qr};
 use crate::pairing::{request_token, require_token, UNPAIRED_MARKER};
@@ -375,6 +375,7 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 .route("/open-dir", post(open_dir))
                 .route("/reveal", post(reveal))
                 .route("/copy-file", post(copy_file))
+                .route("/save-as", post(save_as))
                 .route("/events", get(events))
                 .route("/repair", post(repair))
                 .route("/quit", post(quit))
