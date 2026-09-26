@@ -1,43 +1,13 @@
 // LAN topology: pick the IP the QR code points at (wireless-first, virtual
-// adapters excluded), the QR PNG itself, and the foreign-subnet diagnostic
-// for the access log.
+// adapters excluded) and the QR PNG itself.
 
 use crate::logger::{loge, logf};
 use axum::{
     http::{header, StatusCode},
     response::IntoResponse,
 };
-use std::net::SocketAddr;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Mutex, OnceLock};
-/// Peers already warned about coming from a different subnet than the QR IP.
-static SUBNET_WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
-
-
-/// A LAN peer whose /24 differs from the address the QR code points at is the
-/// classic "phone joined the guest network / the other band" symptom: packets
-/// still arrive but the user thinks they scanned the right URL. Warn once per
-/// peer.
-pub(crate) fn note_foreign_subnet(peer: &SocketAddr) {
-    let IpAddr::V4(peer_v4) = peer.ip() else { return };
-    let Some(qr_ip) = collect_ips().first().cloned() else { return };
-    let Ok(qr_v4) = qr_ip.parse::<Ipv4Addr>() else { return };
-    let same = qr_v4.octets()[..3] == peer_v4.octets()[..3];
-    if same {
-        return;
-    }
-    let key = peer.ip().to_string();
-    let set = SUBNET_WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
-    let mut set = set.lock().unwrap_or_else(|e| e.into_inner());
-    if set.contains(&key) {
-        return;
-    }
-    set.insert(key);
-    logf(&format!(
-        "warning: request from {} is in a different subnet than the QR IP {} (phone may be on a guest network or another WiFi band)",
-        peer.ip(), qr_ip
-    ));
-}
 
 /// Cached QR PNG for the last URL the monitor rendered. Opening the lightbox
 /// used to go blank for seconds after a network switch: the handler computed
@@ -69,8 +39,13 @@ fn render_qr(url: &str) -> Option<Vec<u8>> {
     let mut img = image::GrayImage::new(size, size);
     for y in 0..size {
         for x in 0..size {
-            let mx = (x as i64 - border as i64) / scale as i64;
-            let my = (y as i64 - border as i64) / scale as i64;
+            // div_euclid (not `/`): negative offsets must floor to a negative
+            // module index, not truncate to 0. Plain `/` maps the last ~one
+            // module of the left/top quiet zone onto module row/column 0 and
+            // smears the finder pattern outward, shrinking the mandatory
+            // 4-module quiet zone. See qr_quiet_zone_is_white.
+            let mx = (x as i64 - border as i64).div_euclid(scale as i64);
+            let my = (y as i64 - border as i64).div_euclid(scale as i64);
             let dark = mx >= 0
                 && my >= 0
                 && (mx as usize) < modules
@@ -157,35 +132,47 @@ fn cand_key(wireless: bool, name: &str) -> (bool, &str) {
 /// ordering note in the body) — there is no gateway probe: it would measure
 /// "PC -> gateway", not "phone -> PC", and misorder exactly the machines where
 /// the choice matters.
-pub(crate) fn collect_ips() -> Vec<String> {
-    // All private IPv4s with their interface names, deduplicated. Only
-    // adapters that are actually connected are considered (see
-    // local_private_v4): this is what stops a disconnected Wi-Fi adapter's
-    // stale DHCP address from keeping the QR alive.
-    // The (desc, wireless) metadata rides the same GetAdaptersAddresses pass,
-    // so it is fresh every call (~1/s) with no cache and no powershell.
-    let mut cands: Vec<(String, Ipv4Addr, String, bool)> = Vec::new();
-    for (name, v4, desc, wireless) in local_private_v4() {
-        if !cands.iter().any(|(_, v, _, _)| *v == v4) {
-            cands.push((name, v4, desc, wireless));
-        }
-    }
-    if cands.is_empty() {
-        return vec![];
-    }
-
-    // Filter 1: known virtual adapters out. Name matching always applies;
-    // description matching adds the adapter's type.
+/// Split enumerated candidates into real adapters and dropped-virtual ones,
+/// keeping every virtual address for the fallback guard. Virtual filtering runs
+/// BEFORE the by-IP dedup: a virtual adapter enumerated ahead of a real one that
+/// shares its address must not consume the IP (the virtual filter would then
+/// drop it, losing the real adapter). Pure, so the ordering is unit-testable
+/// without Win32.
+fn split_virtual(
+    cands: Vec<(String, Ipv4Addr, String, bool)>,
+) -> (
+    Vec<(String, Ipv4Addr, String, bool)>,
+    Vec<String>,
+    std::collections::HashSet<Ipv4Addr>,
+) {
     let mut real: Vec<(String, Ipv4Addr, String, bool)> = Vec::new();
     let mut dropped_virtual: Vec<String> = Vec::new();
     let mut virtual_ips: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::new();
-    for (name, v4, desc, _wireless) in &cands {
-        if virtual_adapter(name) || virtual_adapter(desc) {
+    for (name, v4, desc, wireless) in cands {
+        if virtual_adapter(&name) || virtual_adapter(&desc) {
             dropped_virtual.push(format!("{name} {v4}"));
-            virtual_ips.insert(*v4);
-        } else {
-            real.push((name.clone(), *v4, desc.clone(), *_wireless));
+            virtual_ips.insert(v4);
+            continue;
         }
+        // Dedup AFTER the virtual filter, so a real adapter sharing an address
+        // with a virtual one still wins.
+        if !real.iter().any(|(_, v, _, _)| *v == v4) {
+            real.push((name, v4, desc, wireless));
+        }
+    }
+    (real, dropped_virtual, virtual_ips)
+}
+
+pub(crate) fn collect_ips() -> Vec<String> {
+    // Private IPv4 candidates from connected adapters, virtual ones already
+    // split out (see split_virtual). Only adapters that are actually connected
+    // are considered (see local_private_v4): this is what stops a disconnected
+    // Wi-Fi adapter's stale DHCP address from keeping the QR alive. The
+    // (desc, wireless) metadata rides the same GetAdaptersAddresses pass, so it
+    // is fresh every call (~1/s) with no cache and no powershell.
+    let (real, dropped_virtual, virtual_ips) = split_virtual(local_private_v4());
+    if real.is_empty() && dropped_virtual.is_empty() {
+        return vec![];
     }
 
     // Nothing real survived (an all-virtual machine). Never emit a vswitch/TUN
@@ -403,9 +390,10 @@ fn connected_private_v4() -> Option<Vec<(String, Ipv4Addr, String, bool)>> {
                     if !sa.is_null() && (*sa).sa_family == AF_INET {
                         let sin = &*sa.cast::<SOCKADDR_IN>();
                         let v4 = Ipv4Addr::from(sin.sin_addr.S_un.S_addr.to_ne_bytes());
-                        if is_private(v4)
-                            && !out.iter().any(|(_, v, _, _)| *v == v4)
-                        {
+                        // No by-IP dedup here: collect_ips owns that and must run
+                        // it AFTER the virtual filter, so a virtual adapter that
+                        // shares a real one's address cannot consume the entry.
+                        if is_private(v4) {
                             out.push((name.clone(), v4, desc.clone(), wireless));
                         }
                     }
@@ -465,6 +453,36 @@ mod tests {
         }
     }
 
+    /// A real adapter sharing its address with a virtual one must survive:
+    /// virtual filtering runs before the by-IP dedup. (Regression: the old
+    /// dedup-first order let the virtual entry consume the IP, then the filter
+    /// dropped it, losing the real adapter.)
+    #[test]
+    fn virtual_filtered_before_dedup_keeps_real_adapter() {
+        let v = "192.168.1.5".parse().unwrap();
+        let cands = vec![
+            ("vEthernet (WSL)".to_string(), v, String::new(), true),
+            ("Wi-Fi".to_string(), v, String::new(), true),
+            ("Ethernet".to_string(), v, String::new(), false),
+        ];
+        let (real, dropped, virtual_ips) = split_virtual(cands);
+        // Only the first real adapter for that IP survives the dedup.
+        assert_eq!(real.len(), 1);
+        assert_eq!(real[0].0, "Wi-Fi");
+        // The virtual entry is recorded and its address blocked for the fallback.
+        assert_eq!(dropped.len(), 1);
+        assert!(virtual_ips.contains(&v));
+
+        // Distinct addresses each survive.
+        let a: Ipv4Addr = "192.168.1.10".parse().unwrap();
+        let b: Ipv4Addr = "192.168.1.11".parse().unwrap();
+        let (real, _, _) = split_virtual(vec![
+            ("Wi-Fi".to_string(), a, String::new(), true),
+            ("Ethernet".to_string(), b, String::new(), false),
+        ]);
+        assert_eq!(real.len(), 2);
+    }
+
     #[test]
     fn wireless_first_then_name() {
         // Wireless beats wired no matter the names.
@@ -485,6 +503,33 @@ mod tests {
             "Ethernet",
             "Realtek PCIe GbE Family Controller"
         ));
+    }
+
+    /// Regression: plain `/` truncates a negative offset toward zero, mapping
+    /// the last ~module of the left/top quiet zone onto module column/row 0.
+    /// That smeared the finder pattern outward and shrank the mandatory
+    /// 4-module quiet zone. The margin must be pure white on every side.
+    #[test]
+    fn qr_quiet_zone_is_white() {
+        let png = render_qr("http://192.168.1.2:7765/?t=abcdefgh").expect("render");
+        let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+            .expect("decode png")
+            .to_luma8();
+        let (w, h) = img.dimensions();
+        let quiet = 4 * 10u32; // render_qr's border: 4 modules at scale 10
+        assert!(w > quiet * 2 && h > quiet * 2, "image too small: {w}x{h}");
+        for y in 0..h {
+            for x in 0..w {
+                let in_quiet = x < quiet || y < quiet || x >= w - quiet || y >= h - quiet;
+                if in_quiet {
+                    assert_eq!(
+                        img.get_pixel(x, y).0[0],
+                        255,
+                        "non-white quiet-zone pixel at ({x},{y})"
+                    );
+                }
+            }
+        }
     }
 }
 

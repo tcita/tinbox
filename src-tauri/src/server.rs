@@ -10,7 +10,7 @@
 use crate::catalog;
 use crate::desktop::{copy_file, open_dir, open_file, reveal};
 use crate::logger::{loge, logf, logw};
-use crate::netinfo::{collect_ips, note_foreign_subnet, qr};
+use crate::netinfo::{collect_ips, qr};
 use crate::pairing::{request_token, require_token, UNPAIRED_MARKER};
 use crate::settings::{get_settings, open_data_dir, pick_dir, set_close_behavior, set_inbox_dir};
 use crate::presence::{
@@ -152,9 +152,6 @@ async fn log_requests(
     next: Next,
 ) -> Response {
     let is_lan = !peer.ip().is_loopback();
-    if is_lan {
-        note_foreign_subnet(&peer);
-    }
     let method = req.method().clone();
     let path = req.uri().path().to_string();
     // High-frequency endpoints would otherwise log a line every second
@@ -404,15 +401,16 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 }
             };
             let _ = BOUND_PORT.set(actual);
-            // IP encoded in the QR code: take the first candidate. The ordering
-            // (wireless first, then name) lives in netinfo::collect_ips. If the
-            // phone cannot connect, compare this IP with the machine's actual
-            // subnet.
-            let ips = collect_ips();
-            let ip = ips.first().cloned().unwrap_or_else(|| "127.0.0.1".to_string());
+            // Seed the URL snapshot once, before the monitor's first tick, so
+            // current_url() is populated from the start. The QR IP selection
+            // (wireless first, then name) lives in netinfo::collect_ips and is
+            // logged there whenever it changes; the monitor re-samples every
+            // second, and nothing else enumerates. If the phone cannot connect,
+            // compare this IP with the machine's actual subnet.
+            let url = refresh_url();
             logf(&format!(
-                "listening on 0.0.0.0:{}; QR code points at http://{}:{}; candidate IPs={:?}",
-                actual, ip, actual, ips
+                "listening on 0.0.0.0:{}; QR code points at {}",
+                actual, url
             ));
             logf(&format!("pairing token: {} (changes every app restart)", request_token()));
             logf(
