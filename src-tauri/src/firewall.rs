@@ -11,18 +11,20 @@
 //      (~100ms per pass, 500ms cadence) and emits a line only when the state
 //      changes, judged against an EXACT invariant: the app maintains exactly
 //      one rule (tinbox_Allow_Inbound — enabled, Allow, Any profile) and
-//      accepts NOTHING else pointing at the exe. Anything else — the Windows
-//      dialog's Query rules, hand-made blocks, duplicates, disabled strays —
-//      is 'dirty' and gets flagged; the repair wipes every rule pointing at
-//      the exe and recreates the canonical one, so the rule table stays
-//      readable and the judgment is a simple equality, not coverage math.
+//      accepts NOTHING else pointing at the exe. Anything else — zero rules,
+//      the Windows dialog's Query rules, hand-made blocks, duplicates,
+//      disabled strays — is 'dirty' and gets flagged; the repair wipes every
+//      rule pointing at the exe and recreates the canonical one, so the rule
+//      table stays readable and the judgment is a simple equality, not
+//      coverage math. Zero rules is 'dirty:empty', flagged immediately like
+//      any other deviation — there is no 'none' hold-fire state (the OS
+//      dialog's answer is never canonical, so waiting on it only delays the
+//      one-time repair, and a late dialog answer after the repair is just
+//      another dirty the next repair converges).
 //      The invariant being met clears the flag and retires the worker
 //      (rules cannot change by themselves — nothing left to watch). The
 //      script self-exits when its parent dies (an app quit never leaks the
-//      child), and an unexpected child death respawns after 5s. The one
-//      long-lived case is the fresh-install window where the Windows dialog
-//      is still unanswered — the OS gets the first chance (its answer is
-//      never canonical, so the overlay then demands the one-time repair).
+//      child), and an unexpected child death respawns after 5s.
 //   2. The flag is pushed over the SSE channel as an `fw` event; the
 //      frontend shows the HTML repair overlay (Allow / Quit, no dismiss —
 //      the flag means the phone would be blocked on some network) and the
@@ -66,6 +68,16 @@ fn exe_path() -> Option<String> {
 #[cfg(windows)]
 fn data_dir() -> PathBuf {
     std::env::temp_dir()
+}
+
+/// Quote a string for embedding in a PowerShell single-quoted literal: `'`
+/// escapes as `''`. Paths with apostrophes (e.g. `D:\Bob's Tools\...`) would
+/// otherwise terminate the literal early and break the generated script —
+/// silently misdirecting both the worker's rule query and the repair's rule
+/// edit at once.
+#[cfg(windows)]
+fn ps_quote(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 /// Windows process creation flag: CREATE_NO_WINDOW, so launching powershell
@@ -156,10 +168,10 @@ static ATTEMPT_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// Entry point: run the firewall check in the background, without blocking
 /// setup/window creation (otherwise a cold powershell start can hang for
-/// seconds). A detected Block -> flag PENDING_REPAIR and bring the window to
-/// the front; the server pushes the repair flag over /events so the frontend
-/// shows the HTML repair overlay. No Block but missing Allow -> poll after
-/// startup (wait for the Windows dialog to be answered).
+/// seconds). Any deviation from the canonical exactly-one-Allow (block,
+/// stray, duplicate, or zero rules) -> flag PENDING_REPAIR and bring the
+/// window to the front; the server pushes the repair flag over /events so
+/// the frontend shows the HTML repair overlay.
 pub fn ensure_background(app: AppHandle) {
     #[cfg(windows)]
     {
@@ -211,13 +223,11 @@ pub fn ensure_background(app: AppHandle) {
 /// loops IN-PROCESS and emits one line only when the state changes:
 ///   'ok'                 — CANONICAL state: exactly one inbound rule for
 ///                          the exe, and it is our enabled all-profile Allow
-///   'dirty:<detail>'     — anything else (dialog Query rules, hand-made
-///                          blocks, duplicates, disabled strays); detail is
-///                          'block' when an applicable block is the reason,
-///                          'shape' otherwise
-///   'none'               — no inbound rules at all: the Windows dialog is
-///                          pending, so hold fire and let the OS have its
-///                          chance first
+///   'dirty:<detail>'     — anything else (zero rules, dialog Query rules,
+///                          hand-made blocks, duplicates, disabled strays);
+///                          detail is 'block' when an applicable block is the
+///                          reason, 'empty' when no inbound rule exists at
+///                          all, 'shape' otherwise
 ///
 /// The invariant is deliberately EXACT: the app maintains exactly one rule
 /// (tinbox_Allow_Inbound, Any profile, enabled) and accepts nothing else.
@@ -235,6 +245,7 @@ pub fn ensure_background(app: AppHandle) {
 fn spawn_fw_worker(app: AppHandle, exe: String) {
     std::thread::spawn(move || {
         let ppid = std::process::id();
+        let exe = ps_quote(&exe);
         let script = format!(
             r#"$exe = '{exe}'
 $ppid = {ppid}
@@ -245,7 +256,7 @@ while ($true) {{
   $rules = @(Get-NetFirewallApplicationFilter -Program $exe -ErrorAction SilentlyContinue | Get-NetFirewallRule -ErrorAction SilentlyContinue | Where-Object {{ $_.Direction -eq 'Inbound' }})
   $s = ''
   if ($rules.Count -eq 0) {{
-    $s = 'none'
+    $s = 'dirty:empty'
   }} elseif ($rules.Count -eq 1 -and $rules[0].Enabled -eq 'True' -and $rules[0].Action -eq 'Allow' -and $rules[0].Profile -eq 'Any' -and $rules[0].DisplayName -eq 'tinbox_Allow_Inbound') {{
     $s = 'ok'
   }} else {{
@@ -343,16 +354,6 @@ while ($true) {{
                             // change by themselves, so there is nothing left
                             // to watch this session.
                             policy_dead = true;
-                        }
-                        "none" => {
-                            if PENDING_REPAIR.load(Ordering::SeqCst) {
-                                logf("firewall worker: applicable Block rule gone, clearing repair flag");
-                                clear_need_repair();
-                            }
-                            // No rules at all: the Windows dialog is pending.
-                            // Hold fire — the OS gets the first chance to
-                            // satisfy the invariant, the worker re-judges on
-                            // the next pass.
                         }
                         // Table line from the dirty-transition dump above —
                         // WHAT the rules look like, not just the verdict.
@@ -580,9 +581,8 @@ fn repair_as_admin(exe: &str, id: &str) -> bool {
     // localized Windows errors are non-ASCII and WinPS 5.1 defaults to ANSI.
     // Note: Get-NetFirewallRule's -DisplayName cannot be combined with
     // -Direction/-Action (different parameter sets).
-    let res = attempt_result_path(id)
-        .to_string_lossy()
-        .replace('\'', "''");
+    let res = ps_quote(&attempt_result_path(id).to_string_lossy());
+    let exe = ps_quote(exe);
     let script = format!(
         r#"$exe = '{exe}'
 $res = '{res}'
@@ -592,9 +592,10 @@ $res = '{res}'
 Set-Content -LiteralPath $res -Value 'STARTED' -Encoding UTF8 -ErrorAction SilentlyContinue
 # Serialize the rule edit across concurrent repair attempts: two scripts racing
 # their create-then-delete-others would delete each other's fresh rule and can
-# leave ZERO rules — and the worker's 'none' verdict would then close the
-# overlay with the phone still blocked. A session-local named mutex makes each
-# attempt's edit atomic, so N attempts converge to exactly one canonical rule.
+# leave ZERO rules — the worker reports that as 'dirty:empty' and the overlay
+# stays up until the next repair converges. A session-local named mutex makes
+# each attempt's edit atomic, so N attempts converge to exactly one canonical
+# rule.
 # Bounded wait: if a previous holder is wedged, fail rather than edit
 # unsynchronized.
 $mtx = $null
@@ -663,13 +664,20 @@ Remove-Item $MyInvocation.MyCommand.Path -ErrorAction SilentlyContinue"#
         Ok(mut child) => {
             // The launcher exits once the UAC prompt is answered, but its exit
             // code does NOT say which answer — Shell.Application's ShellExecute
-            // returns success even when the user cancels. So this watcher only
-            // records WHEN it exited, for the log; the "granted" signal is the
-            // elevated script's STARTED marker (see watch_repair_result). A
-            // cancel is therefore explained by the log alone (launcher exited
-            // with no "elevated script started" line), with no frontend event.
-            // Detached, never the /repair handler, so a prompt left open cannot
-            // freeze the UI; the poll is bounded so it cannot leak.
+            // returns success even when the user cancels. So "granted" comes
+            // from the elevated script's STARTED marker (see
+            // watch_repair_result), and "cancelled" is launcher-exited plus a
+            // 3s grace with still no marker: the elevated run never started.
+            // The grace covers the STARTED write racing the launcher exit
+            // (consent → both happen within ~a second). A still-alive launcher
+            // means the prompt is still open — keep the button locked, never
+            // time out into a second stacked UAC. Detached, never the /repair
+            // handler, so a prompt left open cannot freeze the UI; the poll is
+            // bounded so it cannot leak. A late STARTED landing just after the
+            // grace may re-arm the button while the first repair runs — safe
+            // by construction (per-attempt files + the mutex), at worst one
+            // redundant UAC.
+            let result_path = attempt_result_path(id);
             std::thread::spawn(move || {
                 use std::time::{Duration, Instant};
                 let deadline = Instant::now() + Duration::from_secs(180);
@@ -677,6 +685,23 @@ Remove-Item $MyInvocation.MyCommand.Path -ErrorAction SilentlyContinue"#
                     match child.try_wait() {
                         Ok(Some(status)) => {
                             logf(&format!("firewall repair: launcher exited ({status})"));
+                            std::thread::sleep(Duration::from_secs(3));
+                            let started = std::fs::read(&result_path)
+                                .ok()
+                                .map(|b| {
+                                    let s = String::from_utf8_lossy(&b)
+                                        .trim_start_matches('\u{FEFF}')
+                                        .trim()
+                                        .to_string();
+                                    s == "STARTED" || s == "OK" || s.starts_with("FAIL:")
+                                })
+                                .unwrap_or(false);
+                            if !started {
+                                logf("firewall repair: no elevated start after launcher exit — UAC was cancelled, re-arming repair button");
+                                let _ = crate::server::notifier().send(
+                                    crate::server::PushEvent::FwRepair("cancelled"),
+                                );
+                            }
                             return;
                         }
                         Ok(None) => {

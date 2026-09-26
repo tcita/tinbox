@@ -58,12 +58,14 @@ pub(crate) enum PushEvent {
     Progress { id: String, total: u64, sent: u64 },
     /// Firewall repair flag changed.
     Fw(bool),
-    /// Firewall repair phase. Currently only "granted" is sent: it means the
-    /// elevated script's STARTED marker proved UAC was accepted and the script
-    /// is running. The frontend cannot observe UAC itself, so it freezes the
-    /// overlay on "granted" (no duplicate UAC, no bail-out mid-apply). A
-    /// cancelled prompt sends nothing — the rules never changed and the log
-    /// (launcher exited, no "elevated script started") explains it.
+    /// Firewall repair phase. "granted" means the elevated script's STARTED
+    /// marker proved UAC was accepted and the script is running; "cancelled"
+    /// means the launcher exited with still no marker after a short grace
+    /// (UAC was dismissed — the repair button may be re-armed). The frontend
+    /// cannot observe UAC itself, so it freezes the overlay on "granted" (no
+    /// duplicate UAC, no bail-out mid-apply) and re-arms on "cancelled" (only
+    /// while no grant has been seen — a late STARTED after the grace keeps
+    /// the lock).
     FwRepair(&'static str),
     /// A LAN device connected/disconnected, or the server address changed.
     /// Consumers: the PC arrival toast + URL display, and

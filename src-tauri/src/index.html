@@ -3263,14 +3263,24 @@ function fwBusy(on){ $('fwHint').classList.toggle('busy', !!on); }
 // ShellExecute succeeds even on cancel). From then on 允许 stays disabled for
 // good: a second run would not fix what the first could not. 退出 is never
 // disabled — quitting is safe, since the elevated repair is an independent
-// process that finishes on its own. A cancelled prompt sends nothing, so 允许
-// stays disabled too; retrying means a relaunch.
+// process that finishes on its own. 'cancelled' (launcher exited, still no
+// marker after a short grace) re-arms 允许 — but never past 'granted': a
+// STARTED landing just after the grace keeps the lock, the extra click then
+// just converges server-side.
 function applyFwPhase(phase){
   if(!isOwner || !$('fwOverlay').classList.contains('show')) return;
-  if(phase !== 'granted') return;
-  fwPhase = 'granted';
-  fwBusy(true);
-  fwButtons(true, false, '已授权,正在应用规则…');
+  if(phase === 'granted'){
+    fwPhase = 'granted';
+    fwBusy(true);
+    fwButtons(true, false, '已授权,正在应用规则…');
+    return;
+  }
+  if(phase === 'cancelled'){
+    if(fwPhase === 'granted') return;
+    fwPhase = null;
+    fwBusy(false);
+    fwButtons(false, false, '已取消授权，请点击“允许”重试。');
+  }
 }
 function applyFw(needRepair){
   // Owner-only overlay: the repair flow raises a UAC prompt on the PC and the
@@ -3297,8 +3307,9 @@ function applyFw(needRepair){
   fwWasShown = show;
 }
 $('fwRepair').onclick = async () => {
-  // The click disables 允许 and it is never re-enabled by a timer: from here
-  // the only exits are the worker closing the overlay (success) or 退出.
+  // The click disables 允许 immediately (double-click guard): from here the
+  // exits are the worker closing the overlay (success), 退出, or 'cancelled'
+  // re-arming 允许 when the UAC prompt was dismissed.
   fwBusy(false);
   fwButtons(true, false, '请在“用户帐户控制”窗口中确认授权…');
   try {
