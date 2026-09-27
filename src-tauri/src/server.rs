@@ -12,7 +12,7 @@ use crate::desktop::{copy_file, open_dir, open_file, reveal, save_as};
 use crate::logger::{loge, logf, logw};
 use crate::netinfo::{collect_ips, qr};
 use crate::pairing::{request_token, require_token, UNPAIRED_MARKER};
-use crate::settings::{get_settings, open_data_dir, pick_dir, set_close_behavior, set_inbox_dir};
+use crate::settings::{get_settings, open_data_dir, pick_dir, restart_now, set_close_behavior, set_inbox_dir};
 use crate::presence::{
     lan_peer_connected, monitor_loop, now_mono, LAST_PAIRED_ACT, LAN_EVENTS_OPEN,
     SSE_HEARTBEAT_SECS,
@@ -387,6 +387,7 @@ pub fn spawn(app_handle: tauri::AppHandle) -> tokio::sync::oneshot::Receiver<Opt
                 .route("/settings/open-data-dir", post(open_data_dir))
                 .route("/settings/close-behavior", post(set_close_behavior))
                 .route("/settings/inbox-dir", post(set_inbox_dir))
+                .route("/settings/restart", post(restart_now))
                 // Inner-to-outer: token gate first, access log outermost (the
                 // log must also see refused requests).
                 .layer(from_fn(require_token))

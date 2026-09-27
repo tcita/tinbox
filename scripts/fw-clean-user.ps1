@@ -1,14 +1,15 @@
 # User-side helper: remove ONLY the inbound firewall rules pointing at ONE
-# tinbox.exe — the copy one level above this scripts\ folder (i.e. next to the
-# scripts\ folder itself), or -Exe <path> — so a portable install can be wiped
-# without touching any other copy's rules.
+# explicitly given tinbox.exe, so a portable install can be wiped without
+# touching any other copy's rules.
+# The -Exe path is REQUIRED: there is no auto-detection (no parent-folder or
+# cwd fallback), because guessing the exe is how the wrong copy gets wiped.
 # It deliberately never deletes by bare DisplayName: that would nuke another
 # path's tinbox_Allow_Inbound (each copy owns only its own rules; see the
 # per-path isolation note in src-tauri/src/firewall.rs).
 #
 # Usage (auto-elevates when needed; output lands in the elevated console):
-#   scripts\fw-clean-user.bat ["path\to\tinbox.exe"]
-#   powershell -ExecutionPolicy Bypass -File scripts\fw-clean-user.ps1 -Exe <path>
+#   scripts\fw-clean-user.bat "path\to\tinbox.exe"
+#   powershell -ExecutionPolicy Bypass -File scripts\fw-clean-user.ps1 -Exe "path\to\tinbox.exe"
 # Close tinbox first if it is running, then relaunch to re-trigger the dialog.
 
 param(
@@ -24,19 +25,20 @@ trap {
     break
 }
 
-# --- resolve the single exe to clean up after ---
-# Default is the tinbox.exe in the PowerShell's current directory; the bat
-# shim always passes an explicit path (one level above the scripts\ folder),
-# so this fallback only matters for direct ps1 runs.
+# --- the single exe to clean up after: explicit, no guessing ---
 if (-not $Exe) {
-    $Exe = Join-Path (Get-Location) 'tinbox.exe'
+    Write-Host '[ERROR] -Exe is required.'
+    Write-Host 'Usage: fw-clean-user.ps1 -Exe "path\to\tinbox.exe"'
+    Write-Host 'Example: fw-clean-user.ps1 -Exe "D:\tinbox.exe"'
+    Read-Host 'Press Enter to close'
+    exit 1
 }
 if (-not (Test-Path -LiteralPath $Exe)) {
     # Pause before bailing: the elevated launcher runs this script directly, so
     # without this the console (a right-click "Run as administrator" window,
     # whose cwd is System32) would flash closed before the error is readable.
     Write-Host "tinbox.exe not found: $Exe"
-    Write-Host 'Put the scripts\ folder next to tinbox.exe, or pass -Exe <path>.'
+    Write-Host 'Pass the full path, e.g. -Exe "D:\tinbox.exe".'
     Read-Host 'Press Enter to close'
     exit 1
 }

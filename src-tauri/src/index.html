@@ -113,6 +113,9 @@
   .st-section-title { margin: 0 0 7px; font-size: 12px; font-weight: 650; color: var(--sub); letter-spacing: .15px; }
   .st-panel { border: 1px solid var(--line); border-radius: 14px; background: var(--card-subtle); overflow: hidden; }
   .st-location { padding: 13px; }
+  .st-location-label { margin-bottom: 7px; font-size: 11px; font-weight: 650; color: var(--sub); }
+  .st-location-status { margin-left: 6px; color: var(--accent); }
+  .st-location-status[hidden] { display: none; }
   .st-path {
     font-family: ui-monospace, Consolas, monospace; font-size: 12px; line-height: 1.35; color: var(--text);
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0;
@@ -125,9 +128,20 @@
     cursor: pointer; transition: all .15s ease;
   }
   .st-change:hover { border-color: var(--accent); background: var(--accent-bg); }
-  .st-impact { display: flex; align-items: flex-start; gap: 7px; margin-top: 11px; font-size: 12px; color: var(--sub); line-height: 1.4; }
+  .st-impact { display: flex; align-items: flex-start; gap: 7px; margin-top: 10px; font-size: 12px; color: var(--sub); line-height: 1.4; }
   .st-impact svg { color: var(--accent); flex: none; margin-top: 1px; }
   .st-error { margin-top: 9px; font-size: 12px; color: var(--danger); line-height: 1.5; }
+  .st-pending { margin-top: 13px; padding: 12px; border: 1px solid var(--line-strong); border-radius: 11px; background: var(--accent-bg); }
+  .st-pending[hidden] { display: none; }
+  .st-pending-title { font-size: 12px; font-weight: 700; color: var(--text); }
+  .st-pending-copy { margin-top: 4px; font-size: 12px; color: var(--sub); line-height: 1.45; }
+  .st-pending-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 11px; }
+  .st-pending-later, .st-pending-restart { border-radius: 9px; padding: 8px 11px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; transition: all .15s ease; }
+  .st-pending-later { border: 1px solid var(--line-strong); background: var(--card); color: var(--sub); }
+  .st-pending-later:hover { color: var(--text); border-color: var(--sub); }
+  .st-pending-restart { border: 1px solid var(--accent); background: var(--accent); color: #fff; }
+  .st-pending-restart:hover { filter: brightness(1.06); }
+  .st-pending-restart:disabled { opacity: .65; cursor: wait; }
   .radio-row { display: block; }
   .radio-row button {
     position: relative; display: block; width: 100%; min-height: 0; padding: 13px 42px 13px 44px;
@@ -909,8 +923,14 @@
       <section class="st-section">
         <h2 class="st-section-title">收件箱位置</h2>
         <div class="st-panel st-location">
-          <div class="st-path-row"><div class="st-path" id="stPath">…</div><button class="st-change" id="stChange">更改位置</button></div>
-          <div class="st-impact"><span>更改目录后，收件箱中的文件不会自动转移，请手动将其移动到新目录，重启后生效。</span></div>
+          <div class="st-location-label"><span id="stLocationLabel">当前收件箱</span><span class="st-location-status" id="stLocationStatus" hidden>待应用</span></div>
+          <div class="st-path-row"><div class="st-path" id="stPath">…</div><button class="st-change" id="stChange">选择位置</button></div>
+          <div class="st-impact"><span>会在所选路径下创建 inbox 文件夹；原收件箱中的文件不会自动迁移。</span></div>
+          <div class="st-pending" id="stPending" hidden>
+            <div class="st-pending-title">重启以应用新位置</div>
+            <div class="st-pending-copy">重启后手机需重新扫码。</div>
+            <div class="st-pending-actions"><button class="st-pending-later" id="stRestartLater">稍后</button><button class="st-pending-restart" id="stRestart">重启应用</button></div>
+          </div>
           <div class="st-error" id="stError" hidden></div>
         </div>
       </section>
@@ -2717,10 +2737,9 @@ $('inboxBtn').onclick = () => {
 $('clearBtn').onclick = () => { $('clearOverlay').classList.add('show'); };
 $('clearCancel').onclick = () => { $('clearOverlay').classList.remove('show'); };
 // Settings (PC, owner-only like inbox/clear — guests have no .head at all).
-// The directory switch applies on restart: in-flight uploads and the in-memory
-// catalog hold the old absolute paths, so live-switching would split one
-// session across two folders. Save records the path; the card keeps showing
-// it until the user quits via the tray and relaunches.
+// Inbox changes are saved immediately but only applied on process restart.
+// The server reports both its configured path and its active process path, so
+// the pending state survives closing/reopening settings or refreshing a tab.
 $('settingsBtn').onclick = openSettings;
 $('stClose').onclick = () => { $('settingsOverlay').classList.remove('show'); };
 $('stOpenData').onclick = async () => {
@@ -2729,6 +2748,7 @@ $('stOpenData').onclick = async () => {
     if(!r.ok) throw 0;
   } catch { failToast('打开失败'); }
 };
+let pendingInboxDir = null;
 async function openSettings(){
   $('settingsOverlay').classList.add('show');
   $('stPath').textContent = '…';
@@ -2737,9 +2757,18 @@ async function openSettings(){
     const r = await serverFetch('/settings');
     if(!r.ok) throw 0;
     const s = await r.json();
+    pendingInboxDir = s.restart_required ? s.inbox_dir : null;
     $('stPath').textContent = s.inbox_dir;
+    $('stPath').title = s.inbox_dir;
+    renderInboxPending();
     paintCloseRadio(s.close_behavior || 'tray');
   } catch { $('stPath').textContent = '读取失败'; clientLog('ui-fail: 读取设置失败'); }
+}
+function renderInboxPending(){
+  const pending = !!pendingInboxDir;
+  $('stLocationLabel').textContent = pending ? '待应用的收件箱位置' : '当前收件箱';
+  $('stLocationStatus').hidden = !pending;
+  $('stPending').hidden = !pending;
 }
 function paintCloseRadio(v){
   document.querySelectorAll('#stCloseRadio button').forEach(b =>
@@ -2764,7 +2793,6 @@ $('stChange').onclick = async () => {
     dir = (await r.json()).path;
   } catch { failToast('打开选择器失败'); return; }
   if(!dir) return;
-  const before = $('stPath').textContent;
   const err = $('stError');
   if(err){ err.hidden = true; err.textContent = ''; }
   try {
@@ -2778,13 +2806,25 @@ $('stChange').onclick = async () => {
       return;
     }
     const s = await r.json();
+    pendingInboxDir = s.restart_required ? s.inbox_dir : null;
     $('stPath').textContent = s.inbox_dir;
-    // A no-op (the same base re-confirmed) says nothing: a "no change" toast
-    // reads like a null/error fallback, and the panel already shows the live
-    // path. Only a real change announces itself.
-    if(!(s.inbox_dir && before && s.inbox_dir.toLowerCase() === before.toLowerCase()))
-      toast('收件箱位置已更换，重启后生效');
+    $('stPath').title = s.inbox_dir;
+    renderInboxPending();
   } catch { failToast('保存失败'); }
+};
+// “Later” leaves the saved path pending and closes settings; reopening it
+// surfaces the apply choice again. It is not a cancel/rollback action.
+$('stRestartLater').onclick = () => { $('settingsOverlay').classList.remove('show'); };
+// Inbox changes apply only after restart, and the default close hides to the
+// tray. Apply explicitly; the phone must rescan because the pairing token
+// rotates. The POST answers before the delayed restart; a dropped connection
+// counts as success too. In a loopback desktop browser tab, reload back onto
+// the same port after the process restarts.
+$('stRestart').onclick = async () => {
+  const b = $('stRestart');
+  b.disabled = true; b.textContent = '正在重启…';
+  try { await serverFetch('/settings/restart', { method:'POST' }); } catch {}
+  if(!isWebview) setTimeout(() => location.reload(), 2500);
 };
 $('clearConfirm').onclick = async () => {
   $('clearOverlay').classList.remove('show');

@@ -33,8 +33,8 @@ struct SettingsFile {
     close_behavior: Option<String>,
 }
 
-/// Memoized custom inbox directory (None = default). Loaded once at startup
-/// before inbox_dir() is first used; refreshed by the save handler.
+/// Active process inbox directory (None = default). Loaded once at startup;
+/// changing the configured directory does not mutate it before restart.
 static MEMO: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
 /// Memoized close behavior (true = minimize to tray). Read live on every
@@ -73,9 +73,8 @@ pub fn default_inbox_dir() -> PathBuf {
     crate::logger::data_root().join("inbox")
 }
 
-/// The effective inbox directory: the custom override when one is stored,
-/// otherwise the default. Every caller (catalog, transfer, desktop) goes
-/// through here so a switch moves ALL of them together.
+/// The active inbox directory for this process. Every caller (catalog,
+/// transfer, desktop) goes through here; it changes only at process startup.
 pub fn effective_inbox_dir() -> PathBuf {
     memo()
         .lock()
@@ -84,18 +83,32 @@ pub fn effective_inbox_dir() -> PathBuf {
         .unwrap_or_else(default_inbox_dir)
 }
 
+/// The directory configured on disk, which may differ from the active
+/// process directory while a saved change is waiting for restart.
+fn configured_inbox_dir() -> PathBuf {
+    read_settings_file()
+        .inbox_dir
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(default_inbox_dir)
+}
+
+fn same_location(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy()),
+    }
+}
+
 /// Hermetic-test override for the inbox dir. See logger::set_test_data_root.
 #[cfg(test)]
 pub(crate) fn set_test_inbox_dir(dir: Option<PathBuf>) {
     *memo().lock().unwrap_or_else(|e| e.into_inner()) = dir;
 }
 
-/// True when the effective directory is the default (for the UI hint).
+/// True when the configured directory is the default.
 pub fn is_default() -> bool {
-    memo()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_none()
+    same_location(&configured_inbox_dir(), &default_inbox_dir())
 }
 
 /// True when closing the window should minimize to the tray (the default);
@@ -154,19 +167,18 @@ pub fn load() {
 /// deletes files) — so the chosen location is NEVER used directly. The
 /// effective inbox is ALWAYS an `inbox` child inside it, meaning picking
 /// Desktop (or any lived-in folder, or even a drive root) cannot swallow the
-/// user's own files. The child is created here and is always fresh: if
-/// `base/inbox` already exists and is not the current effective path, the pick
-/// is rejected rather than adopted (tinbox never merges or reuses a
-/// pre-existing inbox it did not create). No sentinel marker is needed —
-/// ownership is enforced by "create it fresh or refuse", not by inspecting
-/// contents.
+/// user's own files. If `base/inbox` already exists and is neither the active
+/// nor configured inbox, the pick is rejected rather than adopted (tinbox
+/// never merges or reuses a pre-existing inbox it did not create). No sentinel
+/// marker is needed — ownership is enforced by "create it fresh or refuse",
+/// not by inspecting contents.
 /// Picking a directory already named `inbox` therefore yields `inbox/inbox`,
 /// accepted on purpose rather than risking someone else's folder.
 ///
 /// Creates the directory (with a write probe, so a read-only or bogus
 /// location fails HERE with a message instead of failing uploads later).
-/// Does NOT move existing files and does NOT touch the running state — the
-/// caller restarts.
+/// Does NOT move existing files or change the active process directory — the
+/// caller restarts to apply it.
 pub fn save_inbox_dir(raw: &str) -> Result<PathBuf, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -192,20 +204,12 @@ pub fn save_inbox_dir(raw: &str) -> Result<PathBuf, String> {
     let final_path = base.join("inbox");
     // tinbox only ever uses an inbox it created itself: refuse to adopt a
     // pre-existing `inbox` folder, which would merge someone else's files into
-    // the timeline (and let /rm delete them). The sole exception is the CURRENT
-    // effective path — re-picking it is a no-op and it is by definition ours.
+    // the timeline (and let /rm delete them). Current/configured paths are
+    // exceptions: re-picking either is safe, including a pending saved path.
     if final_path.exists() {
-        let current = effective_inbox_dir();
-        let same = match (
-            std::fs::canonicalize(&final_path),
-            std::fs::canonicalize(&current),
-        ) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => final_path
-                .to_string_lossy()
-                .eq_ignore_ascii_case(&current.to_string_lossy()),
-        };
-        if !same {
+        if !same_location(&final_path, &effective_inbox_dir())
+            && !same_location(&final_path, &configured_inbox_dir())
+        {
             return Err(
                 "该位置已有 inbox 文件夹，请另选位置或先移除它".to_string(),
             );
@@ -225,7 +229,6 @@ pub fn save_inbox_dir(raw: &str) -> Result<PathBuf, String> {
     let mut file = read_settings_file();
     file.inbox_dir = Some(final_path.to_string_lossy().into_owned());
     persist(&file)?;
-    *memo().lock().unwrap_or_else(|e| e.into_inner()) = Some(final_path.clone());
     logf(&format!("settings: inbox_dir set to {} (restart to take effect)", final_path.display()));
     Ok(final_path)
 }
@@ -253,7 +256,9 @@ pub(crate) async fn get_settings(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> 
         return (StatusCode::FORBIDDEN, "guest cannot read settings").into_response();
     }
     Json(serde_json::json!({
-        "inbox_dir": effective_inbox_dir().to_string_lossy(),
+        "inbox_dir": configured_inbox_dir().to_string_lossy(),
+        "active_inbox_dir": effective_inbox_dir().to_string_lossy(),
+        "restart_required": !same_location(&configured_inbox_dir(), &effective_inbox_dir()),
         "is_default": is_default(),
         "default_dir": default_inbox_dir().to_string_lossy(),
         "data_root": crate::logger::data_root().to_string_lossy(),
@@ -299,7 +304,8 @@ pub(crate) async fn set_inbox_dir(
         Ok(p) => Json(serde_json::json!({
             "ok": true,
             "inbox_dir": p.to_string_lossy(),
-            "restart_required": true,
+            "active_inbox_dir": effective_inbox_dir().to_string_lossy(),
+            "restart_required": !same_location(&p, &effective_inbox_dir()),
         }))
         .into_response(),
         Err(msg) => {
@@ -307,6 +313,29 @@ pub(crate) async fn set_inbox_dir(
             (StatusCode::BAD_REQUEST, msg).into_response()
         }
     }
+}
+
+/// Apply a saved inbox-dir switch now: restart the process so the new
+/// directory takes effect without hunting the tray icon (the default close
+/// hides to the tray, so "close and reopen" never restarts). PC-only like
+/// every other settings write — a guest must not reboot the owner's app.
+/// Delayed ~800ms so this POST can answer ok first; the frontend treats even
+/// a dropped connection as success. The pairing token rotates on restart, so
+/// the phone must rescan — the button says so up front, and the phone's next
+/// request lands on the unpaired page regardless.
+pub(crate) async fn restart_now(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(app): State<tauri::AppHandle>,
+) -> impl IntoResponse {
+    if from_by_peer(peer) != "owner" {
+        return (StatusCode::FORBIDDEN, "guest cannot restart").into_response();
+    }
+    logf("settings: restarting to apply new inbox_dir (pairing token rotates, phone must rescan)");
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        app.restart();
+    });
+    Json(serde_json::json!({ "ok": true })).into_response()
 }
 
 /// Open the data directory (log/index/settings) in Explorer. PC-only: a guest
@@ -340,18 +369,18 @@ pub(crate) async fn pick_dir(
     // blocking_* must never run on the main thread (deadlock with the event
     // loop); the axum worker is already off it, and spawn_blocking keeps the
     // async runtime free while the modal sits open — same posture as /repair.
-    // Start at the BASE (the parent of the active inbox, e.g. ...\foo for
+    // Start at the BASE (the parent of the configured inbox, e.g. ...\foo for
     // ...\foo\inbox), NOT the inbox itself: the effective path is always
     // base/inbox, so opening inside it would make a plain re-confirm nest
     // inbox/inbox. Starting one level up keeps "pick the same spot" a no-op.
-    let start = effective_inbox_dir();
+    let start = configured_inbox_dir();
     let start = start.parent().map(|p| p.to_path_buf()).unwrap_or(start);
     let picked = tokio::task::spawn_blocking(move || {
         use tauri_plugin_dialog::DialogExt;
         app.dialog()
             .file()
             .set_title("选择收件箱位置（将创建 inbox 文件夹）")
-            // Starting from the active base preserves the user's context;
+            // Starting from the configured base preserves the user's context;
             // without an explicit directory Windows commonly opens Downloads.
             .set_directory(start)
             .blocking_pick_folder()
