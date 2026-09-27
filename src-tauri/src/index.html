@@ -131,15 +131,13 @@
   .st-impact { display: flex; align-items: flex-start; gap: 7px; margin-top: 10px; font-size: 12px; color: var(--sub); line-height: 1.4; }
   .st-impact svg { color: var(--accent); flex: none; margin-top: 1px; }
   .st-error { margin-top: 9px; font-size: 12px; color: var(--danger); line-height: 1.5; }
-  .st-pending { margin-top: 13px; padding: 12px; border: 1px solid var(--line-strong); border-radius: 11px; background: var(--accent-bg); }
+  /* One row: the copy explains the cost, the button sits beside it. A third
+     line for a lone button just left dead space under it. */
+  .st-pending { display: flex; align-items: center; gap: 12px; margin-top: 13px; padding: 12px; border: 1px solid var(--line-strong); border-radius: 11px; background: var(--accent-bg); }
   .st-pending[hidden] { display: none; }
-  .st-pending-title { font-size: 12px; font-weight: 700; color: var(--text); }
-  .st-pending-copy { margin-top: 4px; font-size: 12px; color: var(--sub); line-height: 1.45; }
-  .st-pending-actions { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 11px; }
-  .st-pending-later, .st-pending-restart { border-radius: 9px; padding: 8px 11px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; transition: all .15s ease; }
-  .st-pending-later { border: 1px solid var(--line-strong); background: var(--card); color: var(--sub); }
-  .st-pending-later:hover { color: var(--text); border-color: var(--sub); }
-  .st-pending-restart { border: 1px solid var(--accent); background: var(--accent); color: #fff; }
+  .st-pending-copy { flex: 1; min-width: 0; font-size: 12px; color: var(--sub); line-height: 1.45; }
+  .st-pending-copy b { display: block; margin-bottom: 2px; font-size: 12px; font-weight: 700; color: var(--text); }
+  .st-pending-restart { flex: none; border: 1px solid var(--accent); background: var(--accent); color: #fff; border-radius: 9px; padding: 8px 11px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; transition: all .15s ease; }
   .st-pending-restart:hover { filter: brightness(1.06); }
   .st-pending-restart:disabled { opacity: .65; cursor: wait; }
   .radio-row { display: block; }
@@ -927,9 +925,8 @@
           <div class="st-path-row"><div class="st-path" id="stPath">…</div><button class="st-change" id="stChange">选择位置</button></div>
           <div class="st-impact"><span>会在所选路径下创建 inbox 文件夹；原收件箱中的文件不会自动迁移。</span></div>
           <div class="st-pending" id="stPending" hidden>
-            <div class="st-pending-title">重启以应用新位置</div>
-            <div class="st-pending-copy">重启后手机需重新扫码。</div>
-            <div class="st-pending-actions"><button class="st-pending-later" id="stRestartLater">稍后</button><button class="st-pending-restart" id="stRestart">重启应用</button></div>
+            <div class="st-pending-copy"><b>重启以应用新位置</b>重启后手机需重新扫码。</div>
+            <button class="st-pending-restart" id="stRestart">重启应用</button>
           </div>
           <div class="st-error" id="stError" hidden></div>
         </div>
@@ -2812,9 +2809,6 @@ $('stChange').onclick = async () => {
     renderInboxPending();
   } catch { failToast('保存失败'); }
 };
-// “Later” leaves the saved path pending and closes settings; reopening it
-// surfaces the apply choice again. It is not a cancel/rollback action.
-$('stRestartLater').onclick = () => { $('settingsOverlay').classList.remove('show'); };
 // Inbox changes apply only after restart, and the default close hides to the
 // tray. Apply explicitly; the phone must rescan because the pairing token
 // rotates. The POST answers before the delayed restart; a dropped connection
