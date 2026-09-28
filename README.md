@@ -7,6 +7,12 @@
 - 单层收件箱，没有文件夹树和版本历史
 - Windows 电脑 + 手机浏览器
 
+## 系统要求
+
+- **电脑**：Windows 10 / 11（64 位）
+- **运行时**：需要 Microsoft Edge WebView2 Runtime。Windows 11 自带；Windows 10 通常随 Edge 已安装。若双击后窗口打不开或报 WebView2 相关错误，请[单独安装 WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)。
+- **手机**：扫码后用浏览器打开即可。
+
 ## 连接条件
 
 手机和电脑必须在**同一个路由器**下面：
