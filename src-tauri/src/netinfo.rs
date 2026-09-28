@@ -149,8 +149,10 @@ fn split_virtual(
     let mut dropped_virtual: Vec<String> = Vec::new();
     let mut virtual_ips: std::collections::HashSet<Ipv4Addr> = std::collections::HashSet::new();
     for (name, v4, desc, wireless) in cands {
-        if virtual_adapter(&name) || virtual_adapter(&desc) {
-            dropped_virtual.push(format!("{name} {v4}"));
+        if let Some((field, keyword)) = virtual_reason(&name, &desc) {
+            dropped_virtual.push(format!(
+                "name={name:?} ip={v4} excluded because {field} matched {keyword:?}"
+            ));
             virtual_ips.insert(v4);
             continue;
         }
@@ -271,14 +273,23 @@ fn is_private(v4: Ipv4Addr) -> bool {
     }
 }
 
-fn virtual_adapter(s: &str) -> bool {
+fn virtual_keyword(s: &str) -> Option<&'static str> {
     const KW: &[&str] = &[
-        "tun", "tap", "vpn", "docker", "wsl", "vmware", "virtual", "hyper-v", "vethernet",
+        "tun", "tap", "vpn", "docker", "wsl", "vmware", "hyper-v", "vethernet", "virtual",
         "loopback", "clash", "xray", "sing-box", "singbox", "wireguard", "zerotier", "tailscale",
         "wi-fi direct", "bluetooth",
     ];
     let l = s.to_lowercase();
-    KW.iter().any(|k| l.contains(k))
+    KW.iter().copied().find(|k| l.contains(k))
+}
+
+/// Explain which adapter field caused a candidate to be excluded, without
+/// logging the full adapter description (which can contain machine-specific
+/// details). Prefer the friendly name when both fields match.
+fn virtual_reason(name: &str, desc: &str) -> Option<(&'static str, &'static str)> {
+    virtual_keyword(name)
+        .map(|keyword| ("name", keyword))
+        .or_else(|| virtual_keyword(desc).map(|keyword| ("description", keyword)))
 }
 
 /// Private IPv4 candidates for the QR, preferring a status-filtered Windows
@@ -441,7 +452,7 @@ mod tests {
             "TAP-Windows Adapter",
             "ZeroTier One",
         ] {
-            assert!(virtual_adapter(name), "{name}");
+            assert!(virtual_keyword(name).is_some(), "{name}");
         }
         for name in [
             "WLAN",
@@ -449,8 +460,21 @@ mod tests {
             "Realtek PCIe GbE Family Controller",
             "Wi-Fi",
         ] {
-            assert!(!virtual_adapter(name), "{name}");
+            assert!(virtual_keyword(name).is_none(), "{name}");
         }
+    }
+
+    #[test]
+    fn virtual_exclusion_reason_identifies_matching_field_and_keyword() {
+        assert_eq!(
+            virtual_reason("以太网", "Microsoft Hyper-V Virtual Ethernet Adapter"),
+            Some(("description", "hyper-v"))
+        );
+        assert_eq!(
+            virtual_reason("vEthernet (WSL)", "Microsoft Network Adapter"),
+            Some(("name", "wsl"))
+        );
+        assert_eq!(virtual_reason("Wi-Fi", "Intel Wireless Adapter"), None);
     }
 
     /// A real adapter sharing its address with a virtual one must survive:
@@ -532,4 +556,3 @@ mod tests {
         }
     }
 }
-
