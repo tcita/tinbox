@@ -557,6 +557,15 @@
     max-width: 100%; max-height: 100%; border-radius: 8px;
     box-shadow: 0 8px 40px rgba(0,0,0,0.5);
   }
+  /* Image zoom (desktop only in practice: the state is reachable via wheel).
+     The transition smooths wheel steps and is killed while dragging so a pan
+     tracks the cursor 1:1. -webkit-user-drag stops the native image drag from
+     competing with the pan; it does not touch the iOS long-press callout.
+     Per-corners: while zoomed the image can reach the screen edges, where a
+     rounded corner reads as a notch cut out of the photo. */
+  .media-ov img { transition: transform .12s ease-out; -webkit-user-drag: none; }
+  .media-ov img.zoomed { cursor: grab; border-radius: 0; }
+  .media-ov img.grabbing { cursor: grabbing; transition: none; }
   .mo-close {
     position: absolute; top: calc(10px + env(safe-area-inset-top, 0px));
     right: calc(10px + env(safe-area-inset-right, 0px));
@@ -2251,6 +2260,79 @@ function checkUploadGone(items){
   }
 }
 
+// Wheel zoom + drag-pan for the image preview (desktop in practice: the zoom
+// state is only reachable through a wheel, so touch keeps the browser's native
+// pinch-zoom and video is never wired). 1x-8x, anchored at the cursor so the
+// point under the pointer stays put; pan is clamped to the scaled image edges.
+// Dismissal is the overlay's ONE rule, shared with video: only the backdrop,
+// the ✕ or Escape closes — the content itself never is a dismiss target. For a
+// zoomed image that is forced (a click there is a grab/pan); at 1x it is the
+// deliberate choice, because a click that does nothing is recoverable while a
+// click that closes a photo you were still looking at is not.
+function wireImageZoom(ov, img){
+  const MAX = 8;
+  let s = 1, tx = 0, ty = 0;
+  let dragging = false, moved = false;
+  let sx = 0, sy = 0, stx = 0, sty = 0;
+  let panEnd = 0;   // self-expiring: only the click that ends a pan is muted
+  const apply = () => { img.style.transform = `translate(${tx}px, ${ty}px) scale(${s})`; };
+  const clampPan = () => {
+    // offsetWidth/Height are LAYOUT sizes, so they ignore the transform.
+    const mx = Math.max(0, (img.offsetWidth * s - ov.clientWidth) / 2);
+    const my = Math.max(0, (img.offsetHeight * s - ov.clientHeight) / 2);
+    tx = Math.min(mx, Math.max(-mx, tx));
+    ty = Math.min(my, Math.max(-my, ty));
+  };
+  ov.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    // deltaMode 1 = lines (Firefox); normalize to pixels before scaling.
+    const dy = e.deltaY * (e.deltaMode === 1 ? 16 : 1);
+    const next = Math.min(MAX, Math.max(1, s * Math.exp(-dy * 0.0015)));
+    if(next === s) return;
+    // t' = k*t + (1-k)*d keeps the cursor's point fixed: d is the cursor offset
+    // from the layer centre, k the scale ratio.
+    const r = ov.getBoundingClientRect();
+    const dx = e.clientX - (r.left + r.width / 2);
+    const dyc = e.clientY - (r.top + r.height / 2);
+    const k = next / s;
+    tx = k * tx + (1 - k) * dx;
+    ty = k * ty + (1 - k) * dyc;
+    s = next;
+    clampPan();
+    apply();
+    img.classList.toggle('zoomed', s > 1);
+  }, { passive: false });
+  img.addEventListener('pointerdown', (e) => {
+    if(s <= 1 || e.button !== 0) return;   // pan is a left-button drag
+    dragging = true; moved = false;
+    sx = e.clientX; sy = e.clientY; stx = tx; sty = ty;
+    img.classList.add('grabbing');
+    try { img.setPointerCapture(e.pointerId); } catch {}
+  });
+  img.addEventListener('pointermove', (e) => {
+    if(!dragging) return;
+    const dx = e.clientX - sx, dy = e.clientY - sy;
+    if(Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true;
+    tx = stx + dx; ty = sty + dy;
+    clampPan();
+    apply();
+  });
+  const endDrag = (e) => {
+    if(!dragging) return;
+    dragging = false;
+    if(moved) panEnd = Date.now();
+    img.classList.remove('grabbing');
+    try { img.releasePointerCapture(e.pointerId); } catch {}
+  };
+  img.addEventListener('pointerup', endDrag);
+  img.addEventListener('pointercancel', endDrag);
+  ov.onclick = (e) => {
+    if(dragging || Date.now() - panEnd < 350) return;   // the click that ends a pan
+    if(e.target !== ov) return;   // content is not a dismiss target (image at any zoom)
+    ov.remove();
+  };
+}
+
 // Fullscreen media preview for image/video, both ends: the bytes are already
 // at hand (the card pulled /view), so this is instant where ShellExecuteing
 // an external viewer costs a cold start. The fullscreen layer deliberately
@@ -2276,10 +2358,15 @@ function openPreview(it){
     + '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
     + '</button>'
     + (isOwner ? '<button class="mo-open">用默认应用打开</button>' : '');
-  // Image: any tap dismisses (the whole layer IS the photo). Video: only the
-  // backdrop or the ✕ dismisses — taps on the video itself must reach the
-  // native controls (play/pause/seek), not close the layer under the finger.
-  ov.onclick = (e) => { if(!isVid || e.target === ov) ov.remove(); };
+  // Both media types close the same way: backdrop, ✕ or Escape. The content is
+  // never a dismiss target — for video that keeps taps on the native controls
+  // (play/pause/seek) from closing the layer under the finger, and wireImageZoom
+  // carries the identical rule for the image (at 1x, and while panning).
+  if(isVid){
+    ov.onclick = (e) => { if(e.target === ov) ov.remove(); };
+  } else {
+    wireImageZoom(ov, ov.querySelector('img'));
+  }
   ov.querySelector('.mo-close').onclick = (e) => { e.stopPropagation(); ov.remove(); };
   if(isOwner) ov.querySelector('.mo-open').onclick = (e) => { e.stopPropagation(); openDefault(it); };
   document.body.appendChild(ov);
@@ -3409,7 +3496,15 @@ $('qlClose').onclick = closeQrLightbox;
 // fetches fresh — this only removes the blank first frame).
 if(isOwner && lanUsable) $('qrImg').src = '/qr';
 document.addEventListener('keydown', e => {
-  if(e.key === 'Escape'){ closeQrLightbox(); $('clearOverlay').classList.remove('show'); $('settingsOverlay').classList.remove('show'); }
+  if(e.key === 'Escape'){
+    closeQrLightbox();
+    $('clearOverlay').classList.remove('show');
+    $('settingsOverlay').classList.remove('show');
+    // The media preview joins the same Escape contract as every other layer
+    // (and every viewer's: "click outside or press Escape"). It is the only
+    // dismiss that works identically while zoomed, where image clicks are inert.
+    document.querySelectorAll('.media-ov').forEach(o => o.remove());
+  }
 });
 
 if(isOwner){
