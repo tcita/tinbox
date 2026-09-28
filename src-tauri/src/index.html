@@ -1538,9 +1538,18 @@ function buildMsg(it, animate){
         // card's padding (not the image) cannot click-through into the
         // preview on release — on an ordinary webpage the padding is dead
         // too. Long-press ON the image is the browser's native menu.
+        // preventDefault is load-bearing on the guest (phone) card, which is
+        // an <a href="/view?...&ctx=nav">: stopPropagation below keeps the
+        // card's own onclick (the one that DOES preventDefault) from running,
+        // so without it here the anchor's default NAVIGATION still fires and
+        // the photo tap leaves the app for the native image page — with the
+        // freshly built overlay captured into the back-restored document, the
+        // "碎掉" after 返回. Cancelling here makes the photo tap behave exactly
+        // like the padding tap (and like video, whose poster is
+        // pointer-events:none): one in-app overlay, no navigation.
         // stopPropagation: the card below also opens the preview (padding
         // taps), without it one tap would stack two overlays.
-        img.onclick = (e) => { e.stopPropagation(); openPreview(it); };
+        img.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openPreview(it); };
         // Video tiles paint the server-extracted poster JPEG, not the video:
         // a native "save image" there would store the wrong bytes, and
         // contextmenu-prevention does NOT hold on iOS (its callout is not
