@@ -78,6 +78,7 @@ impl Drop for TestEnv {
     fn drop(&mut self) {
         let _ = crate::catalog::take_all();
         crate::settings::set_test_inbox_dir(None);
+        crate::settings::clear_test_fallback();
         crate::logger::set_test_data_root(None);
         let _ = std::fs::remove_dir_all(&self.base);
     }

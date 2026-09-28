@@ -131,6 +131,8 @@
   .st-impact { display: flex; align-items: flex-start; gap: 7px; margin-top: 10px; font-size: 12px; color: var(--sub); line-height: 1.4; }
   .st-impact svg { color: var(--accent); flex: none; margin-top: 1px; }
   .st-error { margin-top: 9px; font-size: 12px; color: var(--danger); line-height: 1.5; }
+  .st-fallback { margin-top: 9px; font-size: 12px; color: var(--danger); line-height: 1.45; }
+  .st-fallback[hidden] { display: none; }
   /* One row: the copy explains the cost, the button sits beside it. A third
      line for a lone button just left dead space under it. */
   .st-pending { display: flex; align-items: center; gap: 12px; margin-top: 13px; padding: 12px; border: 1px solid var(--line-strong); border-radius: 11px; background: var(--accent-bg); }
@@ -932,11 +934,12 @@
         <div class="st-panel st-location">
           <div class="st-location-label"><span id="stLocationLabel">当前收件箱</span><span class="st-location-status" id="stLocationStatus" hidden>待应用</span></div>
           <div class="st-path-row"><div class="st-path" id="stPath">…</div><button class="st-change" id="stChange">选择位置</button></div>
-          <div class="st-impact"><span>会在所选路径下创建 inbox 文件夹；原收件箱中的文件不会自动迁移。</span></div>
+          <div class="st-impact"><span>更改后请手动迁移旧收件箱中的个人文件。</span></div>
           <div class="st-pending" id="stPending" hidden>
             <div class="st-pending-copy"><b>重启以应用新位置</b>重启后手机需重新扫码。</div>
             <button class="st-pending-restart" id="stRestart">重启应用</button>
           </div>
+          <div class="st-fallback" id="stInboxFallback" hidden>自定义位置不可用，已切回默认收件箱（原文件保留）。</div>
           <div class="st-error" id="stError" hidden></div>
         </div>
       </section>
@@ -2816,8 +2819,9 @@ $('inboxBtn').onclick = () => {
 };
 
 // Clear-all lives in the owner-only settings panel; the backend enforces the
-// same owner boundary again like /rm. Double-submit is harmless by construction:
-// the second POST finds an empty index and answers "nothing to delete".
+// same owner boundary again like /rm. The backend sweeps the inbox even when
+// the index is empty, so repeated requests still clear unindexed hand-dropped
+// files.
 $('clearBtn').onclick = () => { $('clearOverlay').classList.add('show'); };
 $('clearCancel').onclick = () => { $('clearOverlay').classList.remove('show'); };
 // Settings (PC, owner-only like inbox/clear — guests have no .head at all).
@@ -2844,6 +2848,7 @@ async function openSettings(){
     pendingInboxDir = s.restart_required ? s.inbox_dir : null;
     $('stPath').textContent = s.inbox_dir;
     $('stPath').title = s.inbox_dir;
+    $('stInboxFallback').hidden = !s.inbox_fallback;
     renderInboxPending();
     paintCloseRadio(s.close_behavior || 'tray');
   } catch { $('stPath').textContent = '读取失败'; clientLog('ui-fail: 读取设置失败'); }
@@ -2893,6 +2898,7 @@ $('stChange').onclick = async () => {
     pendingInboxDir = s.restart_required ? s.inbox_dir : null;
     $('stPath').textContent = s.inbox_dir;
     $('stPath').title = s.inbox_dir;
+    $('stInboxFallback').hidden = true;
     renderInboxPending();
   } catch { failToast('保存失败'); }
 };

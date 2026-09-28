@@ -125,7 +125,8 @@ impl Drop for WriterGuard {
 /// counters with no cross-field invariant, so recovering the guard is safe:
 /// the partial write is a stale progress value at worst, healed by the next
 /// push or resync.
-pub(crate) fn dl_lock() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, DlProg>> {
+pub(crate) fn dl_lock() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, DlProg>>
+{
     dl_progress().lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -215,7 +216,9 @@ pub(crate) async fn upload(
         .await
         {
             Err(_) => {
-                logw(&format!("upload rejected: stalled before first field from {peer}"));
+                logw(&format!(
+                    "upload rejected: stalled before first field from {peer}"
+                ));
                 return (StatusCode::BAD_REQUEST, "stalled").into_response();
             }
             Ok(Ok(Some(f))) => f,
@@ -224,7 +227,10 @@ pub(crate) async fn upload(
             // or the next silent 400 is undebuggable (e.g. pasted clipboard
             // images once arrived with empty filenames).
             Ok(Ok(None)) => {
-                logw(&format!("upload rejected: no file field from {peer} (?size={:?})", q.size));
+                logw(&format!(
+                    "upload rejected: no file field from {peer} (?size={:?})",
+                    q.size
+                ));
                 return (StatusCode::BAD_REQUEST, "no file field").into_response();
             }
             Ok(Err(e)) => {
@@ -237,7 +243,10 @@ pub(crate) async fn upload(
         }
         let filename = safe_name(field.file_name().unwrap_or("unnamed"));
         if filename.is_empty() {
-            logw(&format!("upload rejected: empty filename from {peer} (?size={:?})", q.size));
+            logw(&format!(
+                "upload rejected: empty filename from {peer} (?size={:?})",
+                q.size
+            ));
             return (StatusCode::BAD_REQUEST, "bad filename").into_response();
         }
         // Dedupe before building paths so display, storage (`{id}__{name}`),
@@ -265,7 +274,9 @@ pub(crate) async fn upload(
             None => catalog::new_id(),
         };
         if catalog::find(&id).is_some() {
-            logw(&format!("upload rejected: duplicate client id {id} from {peer}"));
+            logw(&format!(
+                "upload rejected: duplicate client id {id} from {peer}"
+            ));
             return (StatusCode::CONFLICT, "duplicate cid").into_response();
         }
         // Hold the writer slot before the row exists: /cancel deletes the row
@@ -274,7 +285,9 @@ pub(crate) async fn upload(
         // The slot carries this attempt's token: a stop naming another
         // attempt is ignored instead of killing this one.
         if !begin_writer(&id, q.att.clone()) {
-            logw(&format!("upload rejected: previous writer still closing {id} from {peer}"));
+            logw(&format!(
+                "upload rejected: previous writer still closing {id} from {peer}"
+            ));
             return (StatusCode::CONFLICT, "writer busy").into_response();
         }
         let _writer = WriterGuard { id: id.clone() };
@@ -306,8 +319,7 @@ pub(crate) async fn upload(
                 catalog::remove(&id);
                 dl_lock().remove(&id);
                 let _ = notifier().send(PushEvent::List(catalog::all_items()));
-                return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}"))
-                    .into_response();
+                return (StatusCode::INTERNAL_SERVER_ERROR, format!("write: {e}")).into_response();
             }
         };
         let mut file = file;
@@ -333,11 +345,7 @@ pub(crate) async fn upload(
             // actively awaits the body — unlike the download body stream,
             // which backpressure stops polling, so its cleanup rides the
             // monitor's prune instead.
-            match tokio::time::timeout(
-                Duration::from_secs(UPLOAD_SILENCE_SECS),
-                field.next(),
-            )
-            .await
+            match tokio::time::timeout(Duration::from_secs(UPLOAD_SILENCE_SECS), field.next()).await
             {
                 Ok(Some(Ok(chunk))) => {
                     let n = chunk.len() as u64;
@@ -375,9 +383,9 @@ pub(crate) async fn upload(
             // so a truncation surfaces as "传输失败" instead of a
             // normal-looking but short card. size == 0 means unknown (old
             // client), skip the check rather than fail everything.
-            Ok(()) if size > 0 && total != size => Err(format!(
-                "size mismatch: got {total} expected {size}"
-            )),
+            Ok(()) if size > 0 && total != size => {
+                Err(format!("size mismatch: got {total} expected {size}"))
+            }
             Ok(()) => {
                 // Graduate to the bare display name (no id prefix): resolve
                 // bumps (` (N)`) and repoints the row when another file/row
@@ -421,11 +429,16 @@ pub(crate) async fn upload(
                     let _ = std::fs::remove_file(&final_path);
                     dl_lock().remove(&id);
                     let _ = notifier().send(PushEvent::List(catalog::all_items()));
-                    logw(&format!("upload failed {final_name}: row deleted during graduation"));
+                    logw(&format!(
+                        "upload failed {final_name}: row deleted during graduation"
+                    ));
                     return (StatusCode::BAD_REQUEST, "row gone").into_response();
                 }
                 crate::poster::request(&id, &final_path, &final_name);
-                logf(&format!("upload done: {} ({} bytes) -> inbox", final_name, total));
+                logf(&format!(
+                    "upload done: {} ({} bytes) -> inbox",
+                    final_name, total
+                ));
                 if total >= 4 * 1024 * 1024 {
                     let secs = t0.elapsed().as_secs_f64();
                     if secs > 0.0 {
@@ -462,7 +475,10 @@ pub(crate) async fn upload(
                 let _ = std::fs::remove_file(&stored);
                 dl_lock().remove(&id);
                 let _ = notifier().send(PushEvent::List(catalog::all_items()));
-                logw(&format!("upload failed {} after {} bytes: {}", filename, total, e));
+                logw(&format!(
+                    "upload failed {} after {} bytes: {}",
+                    filename, total, e
+                ));
                 return (StatusCode::BAD_REQUEST, e).into_response();
             }
         }
@@ -657,8 +673,9 @@ fn mime_for(name: &str) -> String {
         .unwrap_or("")
         .to_lowercase();
     let m = match ext.as_str() {
-        "txt" | "md" | "log" | "csv" | "yml" | "yaml" | "toml" | "ini" | "srt" | "vtt"
-        | "lrc" => "text/plain; charset=utf-8",
+        "txt" | "md" | "log" | "csv" | "yml" | "yaml" | "toml" | "ini" | "srt" | "vtt" | "lrc" => {
+            "text/plain; charset=utf-8"
+        }
         "css" => "text/css; charset=utf-8",
         "js" => "text/javascript; charset=utf-8",
         "json" => "application/json",
@@ -749,7 +766,12 @@ impl Drop for StreamCutGuard {
 /// One shared-file dispatch: inline=true previews in the browser (/view), false
 /// forces a download (/dl). Looks up the message by id; only File messages can
 /// be dispatched, Text returns 400.
-async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: Uri) -> impl IntoResponse {
+async fn serve(
+    Query(p): Query<IdParam>,
+    inline: bool,
+    headers: HeaderMap,
+    uri: Uri,
+) -> impl IntoResponse {
     let Some(entry) = catalog::find(&p.id) else {
         logw(&format!("serve: id {} not found", p.id));
         // no-store on every error arm: a 404 is heuristically cacheable, and
@@ -821,7 +843,11 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
     // bytes with no shared cache in the path anyway. Downloads stay
     // `no-store`: an explicit pull owns its bytes via the download manager,
     // nothing should linger past it.
-    let cc: &str = if inline { "private, no-cache" } else { "no-store" };
+    let cc: &str = if inline {
+        "private, no-cache"
+    } else {
+        "no-store"
+    };
     // Conditional reuse, previews only: a client holding cached bytes sends
     // If-None-Match (`*` or the echoed ETag) and gets an empty 304 instead of
     // megabytes re-read and re-sent. Placement is load-bearing: this sits
@@ -837,7 +863,11 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
                 inm.trim() == "*" || inm.split(',').any(|t| t.trim() == etag)
             });
         if fresh {
-            logf(&format!("serve {} ctx={} -> 304 (revalidated)", p.id, p.ctx.as_deref().unwrap_or("-")));
+            logf(&format!(
+                "serve {} ctx={} -> 304 (revalidated)",
+                p.id,
+                p.ctx.as_deref().unwrap_or("-")
+            ));
             return (
                 StatusCode::NOT_MODIFIED,
                 [
@@ -859,9 +889,15 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
         uri.query(),
         headers.get(header::RANGE).and_then(|v| v.to_str().ok()),
         if_range_ok,
-        headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok()),
+        headers
+            .get(header::USER_AGENT)
+            .and_then(|v| v.to_str().ok()),
     ));
-    let range_hdr = if if_range_ok { headers.get(header::RANGE) } else { None };
+    let range_hdr = if if_range_ok {
+        headers.get(header::RANGE)
+    } else {
+        None
+    };
     let (start, end, partial) = match range_hdr
         .and_then(|v| v.to_str().ok())
         .and_then(|r| parse_range(r, len))
@@ -921,7 +957,10 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
             e.start_ms = now_ms();
             touch_entry(e);
         }
-        logf(&format!("download start {id}: {name} [{start}-{end}]/{len}{}", if len == 0 { " (empty file)" } else { "" }));
+        logf(&format!(
+            "download start {id}: {name} [{start}-{end}]/{len}{}",
+            if len == 0 { " (empty file)" } else { "" }
+        ));
         // NOTE: no ledger teardown here. The prog-block guard above still lives
         // until the end of this `if let` (named bindings drop at scope end, not
         // last use) — a second dl_lock() on this thread would self-deadlock a
@@ -946,7 +985,10 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
             let name = name.to_string();
             // Held for the stream's whole life: on drop (peer gone mid-transfer)
             // it reaps this transfer's counter and logs the outcome.
-            let cut = StreamCutGuard { tid: tid.clone(), name: name.clone() };
+            let cut = StreamCutGuard {
+                tid: tid.clone(),
+                name: name.clone(),
+            };
             // Stream-local byte count: this pull's authoritative sent figure,
             // independent of the shared counter's lifetime. The monitor reaps a
             // counter after 5s of silence (a paused puller reaped too); the
@@ -1056,7 +1098,7 @@ async fn serve(Query(p): Query<IdParam>, inline: bool, headers: HeaderMap, uri: 
         ],
         body,
     )
-    .into_response();
+        .into_response();
     // Inline responses get navigated to directly now (a tapped card hands the
     // file to the browser). A sandboxed document can never execute scripts on
     // this app's origin — but the sandbox ALSO disables WebKit's built-in
@@ -1240,7 +1282,10 @@ pub(crate) async fn cancel(
         match catalog::find(&p.id) {
             Some(e) if e.pending && e.from == "guest" => {}
             Some(_) => {
-                logw(&format!("cancel: rejected stop request from guest id={}", p.id));
+                logw(&format!(
+                    "cancel: rejected stop request from guest id={}",
+                    p.id
+                ));
                 return (StatusCode::FORBIDDEN, "guest cannot stop transfers").into_response();
             }
             None => {
@@ -1310,12 +1355,12 @@ pub(crate) async fn cancel(
 fn recycle_delete(path: &str) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL,
-        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+        COINIT_DISABLE_OLE1DDE,
     };
     use windows::Win32::UI::Shell::{
-        FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName,
-        FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_SILENT,
+        FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName, FOF_ALLOWUNDO,
+        FOF_NOCONFIRMATION, FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_SILENT,
     };
     struct Guard;
     impl Drop for Guard {
@@ -1372,8 +1417,11 @@ pub(crate) async fn remove(
     // guest deletes one entry, the owner's chat history disappears with it,
     // irreversibly. Enforced on the backend to prevent bypassing the frontend.
     if from_by_peer(peer) != "owner" {
-    logw(&format!("remove: rejected delete request from guest id={}", p.id));
-    return (StatusCode::FORBIDDEN, "guest cannot delete").into_response();
+        logw(&format!(
+            "remove: rejected delete request from guest id={}",
+            p.id
+        ));
+        return (StatusCode::FORBIDDEN, "guest cannot delete").into_response();
     }
     // Resolve the entry first so a materialized inbox file can be deleted before
     // the record is dropped.
@@ -1399,10 +1447,7 @@ pub(crate) async fn remove(
                     let detail = match std::fs::remove_file(path) {
                         Ok(()) => "inbox partial deleted",
                         Err(e) => {
-                            logw(&format!(
-                                "remove: could not delete partial {}: {}",
-                                path, e
-                            ));
+                            logw(&format!("remove: could not delete partial {}: {}", path, e));
                             "inbox partial left on disk (delete failed)"
                         }
                     };
@@ -1468,15 +1513,14 @@ pub(crate) async fn remove(
 /// bulk-deleting unknown trees is out of scope.
 /// PC-only like /rm (same rationale, amplified — a guest must not be able to
 /// vaporize the owner's history). One List push for the whole sweep, not N.
+/// The directory sweep still runs when the catalog is empty, so unindexed
+/// hand-dropped files are not skipped on an empty or repeated clear.
 pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> impl IntoResponse {
     if from_by_peer(peer) != "owner" {
         logw("remove-all: rejected delete request from guest");
         return (StatusCode::FORBIDDEN, "guest cannot delete").into_response();
     }
     let all = catalog::take_all();
-    if all.is_empty() {
-        return (StatusCode::OK, "nothing to delete").into_response();
-    }
     let mut texts = 0usize;
     let mut files = 0usize;
     let mut binned = 0usize;
@@ -1497,10 +1541,12 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
             texts += 1;
         }
     }
-    // Disk truth, not index truth: wipe every top-level file in the inbox —
-    // indexed copies and mid-session hand-drops the index never saw alike.
-    // Sentinel partials are hard-deleted (garbage); the rest ride the Recycle
-    // Bin so a bulk clear stays recoverable. Subdirectories are left alone
+    // Disk truth, not index truth: wipe every managed top-level file in the
+    // inbox — indexed copies and mid-session hand-drops the index never saw
+    // alike. Dotfiles are outside the inbox contract (reconcile ignores them)
+    // and include the ownership marker, so never sweep them. Sentinel partials
+    // are hard-deleted (garbage); the rest ride the Recycle Bin so a bulk clear
+    // stays recoverable. Subdirectories are left alone
     // and reported. On Windows an in-use file cannot be deleted out from
     // under a live writer, so a concurrent upload racing this sweep either
     // keeps its file (its row survives too — consistent) or fails loudly; no
@@ -1513,6 +1559,12 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
                     left += 1;
                     continue;
                 };
+                if p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map_or(false, |n| n.starts_with('.'))
+                {
+                    continue;
+                }
                 if !meta.is_file() {
                     logw(&format!("remove-all: left subdirectory {}", p.display()));
                     left += 1;
@@ -1525,7 +1577,10 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
                     .map_or(false, crate::catalog::is_sentinel_name);
                 if is_partial {
                     if std::fs::remove_file(&p).is_err() {
-                        logw(&format!("remove-all: could not delete partial {}", p.display()));
+                        logw(&format!(
+                            "remove-all: could not delete partial {}",
+                            p.display()
+                        ));
                         left += 1;
                     }
                     continue;
@@ -1544,6 +1599,7 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
             }
         }
         Err(e) => {
+            left += 1;
             logw(&format!(
                 "remove-all: cannot list inbox ({}); index already dropped",
                 e
@@ -1555,11 +1611,7 @@ pub(crate) async fn remove_all(ConnectInfo(peer): ConnectInfo<SocketAddr>) -> im
         "remove-all: cleared {} entries ({} files, {} texts, {} binned, {} left on disk)",
         total, files, texts, binned, left
     ));
-    (
-        StatusCode::OK,
-        format!("cleared:{}:{}", total, left),
-    )
-        .into_response()
+    (StatusCode::OK, format!("cleared:{}:{}", total, left)).into_response()
 }
 
 #[cfg(test)]
@@ -1592,7 +1644,9 @@ mod tests {
     /// clean download.
     #[test]
     fn risky_and_unplayable_fall_back_to_download() {
-        for name in ["a.html", "a.exe", "a.zip", "a.avi", "a.opus", "a.amr", "noext"] {
+        for name in [
+            "a.html", "a.exe", "a.zip", "a.avi", "a.opus", "a.amr", "noext",
+        ] {
             assert_eq!(mime_for(name), "application/octet-stream", "{name}");
         }
     }
@@ -1708,9 +1762,7 @@ mod tests {
         .into_response()
     }
 
-    async fn resp_parts(
-        resp: axum::response::Response,
-    ) -> (axum::http::StatusCode, String) {
+    async fn resp_parts(resp: axum::response::Response) -> (axum::http::StatusCode, String) {
         let status = resp.status();
         let bytes = axum::body::to_bytes(resp.into_body(), 256 * 1024)
             .await
@@ -1755,14 +1807,28 @@ mod tests {
     async fn red_upload_duplicate_cid_409() {
         let env = crate::test_support::TestEnv::setup("upload-dup");
         let (s, b) = resp_parts(
-            post_upload(guest_peer(), Some(3), "c-redteam-dup-1", "1", "red-dup.bin", b"aaa")
-                .await,
+            post_upload(
+                guest_peer(),
+                Some(3),
+                "c-redteam-dup-1",
+                "1",
+                "red-dup.bin",
+                b"aaa",
+            )
+            .await,
         )
         .await;
         assert_eq!(s, axum::http::StatusCode::OK, "{b}");
         let (s, b) = resp_parts(
-            post_upload(guest_peer(), Some(3), "c-redteam-dup-1", "2", "red-dup.bin", b"bbb")
-                .await,
+            post_upload(
+                guest_peer(),
+                Some(3),
+                "c-redteam-dup-1",
+                "2",
+                "red-dup.bin",
+                b"bbb",
+            )
+            .await,
         )
         .await;
         assert_eq!(s, axum::http::StatusCode::CONFLICT, "{b}");
@@ -1860,6 +1926,33 @@ mod tests {
         assert_eq!(s, axum::http::StatusCode::OK);
         assert!(crate::catalog::find(id2).is_none());
         super::end_writer(id2);
+    }
+
+    #[tokio::test]
+    async fn clear_all_sweeps_unindexed_files_with_empty_catalog() {
+        use axum::response::IntoResponse;
+        let env = crate::test_support::TestEnv::setup("clear-empty-index");
+        let stray = env.inbox().join("hand-dropped.bin");
+        let hidden = env.inbox().join(".tinbox-managed");
+        std::fs::write(&stray, b"not indexed").unwrap();
+        std::fs::write(&hidden, b"preserve hidden metadata").unwrap();
+        assert!(crate::catalog::all_items().is_empty());
+
+        let owner = std::net::SocketAddr::from(([127, 0, 0, 1], 40102));
+        let response = super::remove_all(axum::extract::ConnectInfo(owner))
+            .await
+            .into_response();
+        let (status, body) = resp_parts(response).await;
+
+        assert_eq!(status, axum::http::StatusCode::OK);
+        assert!(
+            body.starts_with("cleared:0:"),
+            "unexpected response: {body}"
+        );
+        assert!(hidden.exists(), "dotfiles are outside the managed inbox");
+        // A recycle-bin refusal is reported as one leftover; it must not turn
+        // the operation into the old early-return response.
+        assert!(!stray.exists() || body.ends_with(":1"));
     }
 
     #[test]

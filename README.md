@@ -36,6 +36,7 @@ tinbox 要在局域网建立起端口，第一次打开会经过两层系统确�
 ## 文件与日志
 
 - 收件箱默认位置 `%LOCALAPPDATA%\tinbox\inbox`，可以在设置里更改（重启生效）。
+- 切换收件箱不会搬迁旧文件；重启后旧文件仍留在原处，但不再显示在时间线或由 tinbox 管理，文字历史保留。
 - 日志位置 `%LOCALAPPDATA%\tinbox\inbox.log`
 
 ## 开发

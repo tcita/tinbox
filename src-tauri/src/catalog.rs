@@ -11,9 +11,9 @@
 // runtime) and Tauri commands (main runtime) use the same instance. The entry
 // count is small and critical sections are short, so std Mutex + full
 // persistence is enough.
+use crate::media::MediaMeta;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use crate::media::MediaMeta;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -69,7 +69,9 @@ pub enum MsgBody {
         #[serde(default, skip_serializing_if = "is_false")]
         poster: bool,
     },
-    Text { text: String },
+    Text {
+        text: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -147,6 +149,7 @@ impl Entry {
 }
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
+static SAVE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 /// Zero-dependency id: nanoseconds + incrementing counter, avoiding collisions
 /// within the same millisecond.
@@ -169,8 +172,12 @@ pub fn new_id() -> String {
 /// satisfies every rule, so both id kinds stay interchangeable in the catalog.
 pub fn valid_client_id(s: &str) -> bool {
     let b = s.as_bytes();
-    if b.len() < 6 || b.len() > 48 { return false; }
-    if b[0] == b'-' || b[b.len() - 1] == b'-' { return false; }
+    if b.len() < 6 || b.len() > 48 {
+        return false;
+    }
+    if b[0] == b'-' || b[b.len() - 1] == b'-' {
+        return false;
+    }
     b.iter()
         .all(|&c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
@@ -280,23 +287,23 @@ pub fn load() {
                     ));
                 }
             }
-        Err(e) => {
-            // Corrupt index: quarantine the file so the empty in-memory
-            // catalog cannot overwrite it on the next save (the records
-            // would be lost for good). The startup reconcile pass then
-            // re-adopts every file from inbox, so nothing but text history
-            // is lost.
-            let bad = catalog_path().with_extension("json.bad");
-            let renamed = std::fs::rename(catalog_path(), &bad);
-            crate::logger::loge(&format!(
-                "catalog: corrupt index ({}); quarantined to {}: {e}",
-                catalog_path().display(),
-                bad.display()
-            ));
-            if renamed.is_err() {
-                crate::logger::loge("catalog: quarantine rename failed — the corrupt file may be overwritten by the next save");
+            Err(e) => {
+                // Corrupt index: quarantine the file so the empty in-memory
+                // catalog cannot overwrite it on the next save (the records
+                // would be lost for good). The startup reconcile pass then
+                // re-adopts every file from inbox, so nothing but text history
+                // is lost.
+                let bad = catalog_path().with_extension("json.bad");
+                let renamed = std::fs::rename(catalog_path(), &bad);
+                crate::logger::loge(&format!(
+                    "catalog: corrupt index ({}); quarantined to {}: {e}",
+                    catalog_path().display(),
+                    bad.display()
+                ));
+                if renamed.is_err() {
+                    crate::logger::loge("catalog: quarantine rename failed — the corrupt file may be overwritten by the next save");
+                }
             }
-        }
         },
         // A missing index on first run is normal, not an error.
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => crate::logger::loge(&format!(
@@ -312,10 +319,11 @@ pub fn save() {
     let v = cat_lock();
     match serde_json::to_string_pretty(&*v) {
         Ok(json) => {
-            if let Err(e) = std::fs::write(catalog_path(), json) {
+            let path = catalog_path();
+            if let Err(e) = write_catalog_atomically(&path, json.as_bytes()) {
                 crate::logger::loge(&format!(
                     "catalog: could not save index {}: {}",
-                    catalog_path().display(),
+                    path.display(),
                     e
                 ));
             }
@@ -324,12 +332,98 @@ pub fn save() {
     }
 }
 
-/// Startup reconciliation: the inbox directory is the disk truth, the catalog
-/// is its index. Three divergences are repaired, both bounded to startup so the
-/// runtime keeps its single-writer simplicity:
+/// Persist one complete index snapshot without exposing a truncated destination
+/// if the process exits during the write. The temporary file is a sibling so
+/// replacement stays on the same volume; on Windows MoveFileExW is used because
+/// std::fs::rename does not replace an existing destination there.
+fn write_catalog_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let (tmp_path, mut file) = loop {
+        let sequence = SAVE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(
+            ".{file_name}.tmp-{}-{sequence}",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        replace_catalog_file(&tmp_path, path)?;
+        // Make the directory entry durable on Unix as well as the file data.
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
+}
+
+#[cfg(windows)]
+fn replace_catalog_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+    let from: Vec<u16> = from.as_os_str().encode_wide().chain([0]).collect();
+    let to: Vec<u16> = to.as_os_str().encode_wide().chain([0]).collect();
+    unsafe {
+        MoveFileExW(
+            windows::core::PCWSTR(from.as_ptr()),
+            windows::core::PCWSTR(to.as_ptr()),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|e| std::io::Error::other(e.to_string()))
+}
+
+#[cfg(not(windows))]
+fn replace_catalog_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::rename(from, to)
+}
+
+fn same_directory(a: &Path, b: &Path) -> bool {
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy()),
+    }
+}
+
+/// Inbox-owned file records are scoped to the active inbox. When the user
+/// switches inboxes, old bytes stay where they are but are no longer indexed
+/// or managed by tinbox. Legacy Local references are intentionally unaffected.
+fn is_in_active_inbox(path: &Path, inbox: &Path) -> bool {
+    path.parent()
+        .map(|parent| same_directory(parent, inbox))
+        .unwrap_or(false)
+}
+
+/// Startup reconciliation: the active inbox directory is the disk truth, the
+/// catalog is its index. Divergences are repaired here, bounded to startup so
+/// the runtime keeps its single-writer simplicity:
 ///   - orphan files (on disk, no record) are ADOPTED as from="owner" entries.
 ///     This is also the self-heal path after a lost or quarantined index:
 ///     every file becomes manageable again, only text history is lost.
+///   - records for tinbox-owned files outside the active inbox are DROPPED
+///     without touching their files. Switching inboxes does not migrate old
+///     files; they remain on disk but are no longer managed or shown.
 ///   - dangling records (indexed, file gone — the user deleted or moved the
 ///     file via Explorer) are DROPPED, matching that intent; keeping them
 ///     would leave dead "file missing" bubbles.
@@ -374,7 +468,9 @@ pub fn reconcile() {
                 // debug instead of eating a user file.
                 debug_assert!(is_sentinel_name(&name));
                 match std::fs::remove_file(&p) {
-                    Ok(()) => crate::logger::logf(&format!("catalog: deleted partial upload {name}")),
+                    Ok(()) => {
+                        crate::logger::logf(&format!("catalog: deleted partial upload {name}"))
+                    }
                     Err(err) => crate::logger::logw(&format!(
                         "catalog: partial upload {name} still locked, retry next startup: {err}"
                     )),
@@ -383,6 +479,23 @@ pub fn reconcile() {
             }
             on_disk.push((e.path(), name));
         }
+    }
+    let released = {
+        let mut v = cat_lock();
+        let before = v.len();
+        v.retain(|e| match &e.body {
+            MsgBody::File {
+                source: Source::Remote { path },
+                ..
+            } => is_in_active_inbox(Path::new(path), &dir),
+            _ => true,
+        });
+        before - v.len()
+    };
+    if released > 0 {
+        crate::logger::logf(&format!(
+            "catalog: released {released} file record(s) outside active inbox; files left untouched"
+        ));
     }
     let known: std::collections::HashSet<String> = cat_lock()
         .iter()
@@ -412,7 +525,10 @@ pub fn reconcile() {
             }
         }
         adopted += 1;
-        crate::logger::logf(&format!("catalog: adopted orphan file {name} (id {})", entry.id));
+        crate::logger::logf(&format!(
+            "catalog: adopted orphan file {name} (id {})",
+            entry.id
+        ));
     }
 
     let dropped;
@@ -458,9 +574,9 @@ pub fn reconcile() {
         ));
         save();
     }
-    if adopted > 0 || dropped > 0 {
+    if adopted > 0 || dropped > 0 || released > 0 {
         crate::logger::logf(&format!(
-            "catalog: reconciled with inbox — {adopted} adopted, {dropped} dangling record(s) dropped"
+            "catalog: reconciled with inbox — {adopted} adopted, {dropped} dangling and {released} outside-inbox record(s) dropped"
         ));
         save();
     }
@@ -473,7 +589,9 @@ pub fn reconcile() {
 }
 
 fn base36_group(p: &str) -> bool {
-    !p.is_empty() && p.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    !p.is_empty()
+        && p.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
 }
 
 /// Whether `head` is a storage id in either minted shape: the server's
@@ -540,7 +658,12 @@ pub(crate) fn is_sentinel_name(name: &str) -> bool {
 /// old in the timeline.
 fn file_mtime_secs(p: &Path) -> Option<String> {
     let t = std::fs::metadata(p).ok()?.modified().ok()?;
-    Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs().to_string())
+    Some(
+        t.duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs()
+            .to_string(),
+    )
 }
 
 /// Recursively collect every file under a directory into `out`.
@@ -720,7 +843,13 @@ pub fn add_remote(from: &str, id: &str, inbox_path: &Path, display_name: &str) -
 /// desktop's own paste-to-send, which has no real path and rides /upload).
 /// `size` is the declared total (sent in the query string); it is corrected to
 /// the on-disk length when the upload finishes.
-pub fn add_remote_pending(from: &str, id: &str, inbox_path: &Path, display_name: &str, size: u64) -> Entry {
+pub fn add_remote_pending(
+    from: &str,
+    id: &str,
+    inbox_path: &Path,
+    display_name: &str,
+    size: u64,
+) -> Entry {
     let entry = Entry {
         id: id.to_string(),
         ts: now_ts(),
@@ -756,7 +885,13 @@ pub fn mark_remote_ready(id: &str, final_path: &Path) -> bool {
         return false;
     };
     let is_pending_remote_file = e.pending
-        && matches!(&e.body, MsgBody::File { source: Source::Remote { .. }, .. });
+        && matches!(
+            &e.body,
+            MsgBody::File {
+                source: Source::Remote { .. },
+                ..
+            }
+        );
     if !is_pending_remote_file {
         return false;
     }
@@ -770,7 +905,9 @@ pub fn mark_remote_ready(id: &str, final_path: &Path) -> bool {
     } = &mut e.body
     {
         *path = final_path.to_string_lossy().to_string();
-        *size = std::fs::metadata(final_path).map(|m| m.len()).unwrap_or(*size);
+        *size = std::fs::metadata(final_path)
+            .map(|m| m.len())
+            .unwrap_or(*size);
         // Graduation probe: the bytes are complete and the sentinel is gone,
         // so this is the first moment moov is trustworthy.
         *media = crate::media::probe_for(name, final_path);
@@ -789,7 +926,11 @@ pub fn purge_pending() {
     let before = v.len();
     v.retain(|e| {
         if e.pending {
-            if let MsgBody::File { source: Source::Remote { path }, .. } = &e.body {
+            if let MsgBody::File {
+                source: Source::Remote { path },
+                ..
+            } = &e.body
+            {
                 let _ = std::fs::remove_file(path);
             }
             false
@@ -891,6 +1032,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn catalog_snapshot_replaces_existing_file_atomically() {
+        let env = crate::test_support::TestEnv::setup("catalog-atomic");
+        let path = catalog_path();
+        write_catalog_atomically(&path, b"old snapshot").unwrap();
+        write_catalog_atomically(&path, b"new snapshot").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new snapshot");
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("catalog.json.tmp-")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "temporary snapshots are cleaned up");
+        drop(env);
+    }
+
+    #[test]
+    fn switching_inbox_releases_old_files_but_keeps_text_history() {
+        let env = crate::test_support::TestEnv::setup("catalog-inbox-switch");
+        let old_dir = env.inbox().parent().unwrap().join("old-inbox");
+        let new_dir = env.inbox().parent().unwrap().join("new-inbox");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let old_file = old_dir.join("kept.bin");
+        std::fs::write(&old_file, b"old inbox bytes").unwrap();
+        add_remote("owner", "old-file-id", &old_file, "kept.bin");
+        add_text("owner", "text history");
+
+        crate::settings::set_test_inbox_dir(Some(new_dir));
+        reconcile();
+
+        assert!(
+            find("old-file-id").is_none(),
+            "old inbox file is no longer managed"
+        );
+        assert_eq!(std::fs::read(&old_file).unwrap(), b"old inbox bytes");
+        let items = all_items();
+        assert!(items
+            .iter()
+            .any(|item| item.kind == "text" && item.text == "text history"));
+    }
+
+    #[test]
     fn client_id_accepts_frontend_shape_and_server_ids() {
         // The exact shape index.html's newCid() emits.
         assert!(valid_client_id("c-m1abcdefg-1-9z4q"));
@@ -925,7 +1112,9 @@ mod tests {
     #[test]
     fn sentinel_gate_needs_full_shape() {
         // Genuine residue, both id shapes.
-        assert!(is_sentinel_name("pending__1789779057050381500-4__test100m.png"));
+        assert!(is_sentinel_name(
+            "pending__1789779057050381500-4__test100m.png"
+        ));
         assert!(is_sentinel_name("pending__c-muaei6w7-2-coxi__test500m.bin"));
         // A user file that merely starts with the word is NOT residue.
         assert!(!is_sentinel_name("pending__notes.txt"));
@@ -938,11 +1127,10 @@ mod tests {
     #[test]
     fn dedupe_appends_windows_suffix() {
         use std::collections::HashSet;
-        let taken: HashSet<String> =
-            ["demo.txt", "demo (1).txt", "README", "Demo.TXT"]
-                .iter()
-                .map(|s| s.to_lowercase())
-                .collect();
+        let taken: HashSet<String> = ["demo.txt", "demo (1).txt", "README", "Demo.TXT"]
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect();
         assert_eq!(dedupe_against("other.bin", &taken), "other.bin");
         assert_eq!(dedupe_against("demo.txt", &taken), "demo (2).txt");
         assert_eq!(dedupe_against("DEMO.txt", &taken), "DEMO (2).txt");
@@ -1061,7 +1249,10 @@ mod tests {
             "S3: sentinel deleted"
         );
         let items = all_items();
-        let keep = items.iter().find(|i| i.name == "keep.txt").expect("adopted");
+        let keep = items
+            .iter()
+            .find(|i| i.name == "keep.txt")
+            .expect("adopted");
         assert!(!keep.pending, "S3: adopted as complete");
         assert!(
             env.inbox().join("pending__notes.txt").exists(),
